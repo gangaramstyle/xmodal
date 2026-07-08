@@ -57,6 +57,11 @@ class TrainConfig:
     wandb: str | None = None          # W&B project name (None = off)
     wandb_run: str | None = None      # W&B run name
     log_every: int = 50
+    # cross / latent phase
+    cross_weight: float = 1.0         # weight on the cross-modal decoder loss (added to encoder objectives)
+    match_weight: float = 1.0         # matching vs pixel weight inside forward_cross
+    anchor_frac: float = 0.05
+    pairs_per_patient: int = 6
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -156,3 +161,128 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
     if wb:
         wb.finish()
     return hist
+
+
+def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, phases,
+                 device="cuda", log=print):
+    """One continuous run: self -> cross -> latent. `phases` = [(name, steps), ...] with name in
+    {'self','cross','latent'}. A frozen teacher is snapshotted at the first non-self phase and gives
+    the decoder its stable per-prism series-CLS conditioning (+ latent targets). Encoder objectives
+    (self-MAE + view-CLS + series-CLS) train in EVERY phase; the cross/latent decoder loss is added
+    on top in those phases. wandb throughout, phase-tagged. `train_source` = bundles list or cache."""
+    import copy
+    import os
+    torch.manual_seed(cfg.seed)
+    spec_list = list(specs.values())
+    is_cache = hasattr(train_source, "resident")
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+                            betas=(0.9, 0.95), fused=(device == "cuda"))
+    teacher = copy.deepcopy(model).eval()                 # created BEFORE compile (clean); weights loaded at transition
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher_ready = False
+    if cfg.compile:
+        try:
+            model.encode = torch.compile(model.encode, dynamic=True)
+        except Exception as e:
+            log(f"[compile] skipped: {e}")
+    wb = None
+    if cfg.wandb:
+        try:
+            import wandb as wb
+            wb.init(project=cfg.wandb, name=cfg.wandb_run, config={**cfg.__dict__, "phases": phases})
+        except Exception as e:
+            log(f"[wandb] disabled: {e}"); wb = None
+    rng = np.random.default_rng(cfg.seed)
+    amp = dict(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.amp_bf16 and device == "cuda")
+    total = sum(s for _, s in phases)
+    warmup = int(cfg.warmup_frac * total)
+
+    def pool():
+        return train_source.resident() if is_cache else train_source
+
+    def paired(bnd):
+        sp = spec_list[rng.integers(len(spec_list))]
+        prism = tuple(float(x) for x in rng.uniform(cfg.prism_lo, cfg.prism_hi, size=3))
+        return S.sample_paired_batch(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
+                                     patch_spec=sp, prism_mm=prism, rng=rng, device=device), sp
+
+    def crossb(bnd):
+        sp = spec_list[rng.integers(len(spec_list))]
+        prism = tuple(float(x) for x in rng.uniform(cfg.prism_lo, cfg.prism_hi, size=3))
+        return S.sample_cross_batch_vec(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
+                                        patch_spec=sp, prism_mm=prism, rng=rng, device=device,
+                                        pairs_per_patient=cfg.pairs_per_patient), sp
+
+    def teach(b, sp, want_latent=False):
+        with torch.no_grad(), torch.autocast(**amp):
+            s_scls, _ = teacher.teacher_readout(b["source"], b["coords"], sp)
+            t_scls, t_lat = teacher.teacher_readout(b["target"], b["coords"], sp)
+        return s_scls.float(), t_scls.float(), (t_lat.float() if want_latent else None)
+
+    def phase0(b, sp):
+        return model.forward_phase0(b, sp, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
+                                    series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
+                                    rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
+
+    @torch.no_grad()
+    def validate():
+        model.eval(); maes = []; accs = []
+        for _ in range(cfg.val_iters):
+            b, sp = paired(val_bundles)
+            with torch.autocast(**amp):
+                o = phase0(b, sp)
+            maes.append(float(o["mae"])); accs.append(o["rel_acc"])
+        model.train(); return float(np.mean(maes)), float(np.mean(accs))
+
+    log(f"phased run: {phases} | total {total} steps"); t0 = time.time()
+    gstep = 0
+    for pname, psteps in phases:
+        if pname != "self" and not teacher_ready:
+            teacher.load_state_dict(model.state_dict()); teacher.eval(); teacher_ready = True
+            log(f"[{pname}] snapshotted frozen teacher from step {gstep}")
+        for _ in range(psteps):
+            gstep += 1
+            lr = _cosine_warmup(gstep, total, cfg.lr, warmup)
+            for g in opt.param_groups:
+                g["lr"] = lr
+            with torch.autocast(**amp):
+                b0, sp0 = paired(pool())
+                out0 = phase0(b0, sp0)
+                loss = out0["loss"]
+                m = dict(mae=float(out0["mae"]), series=float(out0["series"]),
+                         rel_acc=out0["rel_acc"], series_viol=out0["series_viol"])
+                if pname == "cross":
+                    bc, spc = crossb(pool()); s_scls, t_scls, _ = teach(bc, spc)
+                    outc = model.forward_cross(bc["source"], bc["target"], bc["coords"], spc, s_scls, t_scls,
+                                               objective="both", anchor_frac=cfg.anchor_frac, match_weight=cfg.match_weight)
+                    loss = loss + cfg.cross_weight * outc["loss"]
+                    m.update(cross_mae=float(outc["mae"]), match_acc=outc["match_acc"])
+                elif pname == "latent":
+                    bc, spc = crossb(pool()); s_scls, t_scls, t_lat = teach(bc, spc, want_latent=True)
+                    outc = model.forward_cross_latent(bc["source"], bc["target"], bc["coords"], spc,
+                                                      s_scls, t_scls, t_lat, anchor_frac=cfg.anchor_frac)
+                    loss = loss + cfg.cross_weight * outc["loss"]
+                    m.update(latent_cos=outc["cos"])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            opt.step()
+            if is_cache:
+                train_source.step()
+            if wb and gstep % cfg.log_every == 0:
+                wb.log({"phase": {"self": 0, "cross": 1, "latent": 2}[pname], "lr": lr,
+                        **{f"train/{k}": v for k, v in m.items()}}, step=gstep)
+            if gstep % cfg.val_every == 0:
+                vm, va = validate()
+                log(f"[{pname}] {gstep:>6} loss {float(loss):.4f} | "
+                    + " ".join(f"{k} {v:.3f}" for k, v in m.items()) + f" | val_mae {vm:.4f} val_rel {va:.3f}")
+                if wb:
+                    wb.log({"val/mae": vm, "val/rel_acc": va}, step=gstep)
+            if cfg.ckpt_dir and gstep % cfg.ckpt_every == 0:
+                os.makedirs(cfg.ckpt_dir, exist_ok=True)
+                torch.save({"model": model.state_dict(), "step": gstep, "phase": pname, "cfg": cfg.__dict__},
+                           f"{cfg.ckpt_dir}/step_{gstep:06d}.pt")
+    if wb:
+        wb.finish()
+    log(f"phased run done: {gstep} steps in {time.time()-t0:.0f}s")
