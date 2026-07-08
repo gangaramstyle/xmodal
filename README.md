@@ -48,16 +48,30 @@ not memorization. 35 steps/s.
 LAS (affine/world-mm driven so correct), geometry patch-center=direct-voxel 0.06. NOTE the brightest
 t1c voxels are physiologic (label 0), not tumor — the project's premise, not a loading bug.
 
-**Not yet pulled from the best runs (port faithfully — see audit):**
-1. **series-CLS** — `rank_hinge_xmod_loss` (`brats2026/losses/contrastive.py`), weight 1.0, the
-   largest phase-0 term; needs scan-mate + cross-patient same-modality positives.
-2. **view-CLS** — 8-way BCE (3 spatial-ordering + 2 window + 3 rotation signs); needs
-   **paired-prism sampling** with rel_targets (`draw_paired_centers_prism_gpu`, window/rotation jitter).
-3. **Rotating GPU cache** + prefetch (scale beyond what fits resident); per-modality normalization
-   (MR z-score / CT HU windows) + window-jitter aug; brain-mask foreground; NaN/4D sanitize.
+**Done — full faithful phase-0 objective (ported, not approximated):**
+- **series-CLS** — `rank_hinge_xmod_loss` (`losses.py`, verbatim), same-sequence-different-patient
+  positives, weight 1.0.
+- **view-CLS** — 5-way BCE (3 spatial-ordering + 2 window; rotation dropped per decision) over
+  **paired-prism sampling** (`sample_paired_batch`) with window jitter + rel_targets.
+- `model.forward_phase0` (paired views → MAE + series-CLS + view-CLS). Validated: MAE 0.60→0.11,
+  series viol 0.78→0.34, view-CLS rel_acc 0.49→0.72.
 
-**Then:** `eval/` (ET-from-T1 specificity probe + held-out ladder + ablate_source), CT/NLST loader,
-BraTS-MET for physiologic-enhancement specificity, longer runs on Betty/CUBIC.
+**Done — efficiency, validated on the Blackwell (transfers to A40, which is slower → more
+compute-bound → higher util):**
+- **GPU util scales with batch:** bs 24→256 = 61%→**92%** util (MAE), **74%** util full-objective;
+  bf16+compile+fused = **1.64×** throughput. Threading-prefetch is the wrong tool (GIL) — feed the
+  GPU a bigger batch instead.
+- **Rotating GPU cache** (`data.py`) — CPU-decode in bg prefetch threads, GPU-place on the main
+  thread; validated **65% util (p90 80%) while swapping** a bounded 16/20 resident set. Bounds VRAM
+  for PMBB / combined datasets that exceed the card.
+- **A40 memory:** bs=256 full objective = **21.9 GB** (fits 48 GB with headroom); cache bounds it further.
+
+**Done — end-to-end** (`scripts/run_phase0.py`): cache → full objective → bf16/compile/fused →
+held-out val → checkpoint. Converges (val MAE 0.60→0.11, view-CLS 0.50→0.62). **Ready for a CUBIC A40 run.**
+
+**Per-dataset refinements deferred (needed when we add CT/PMBB, not BraTS):** CT HU windows /
+MR z-score normalization, brain-mask (largest-CC) foreground. **Then:** `eval/` (ET-from-T1
+specificity probe + held-out ladder + ablate_source), CT/NLST loader, BraTS-MET specificity.
 
 **Dropped (documented dead ends):** Sinkhorn / band matching (`band_ce`/`band_ot`/`dustbin`).
 
