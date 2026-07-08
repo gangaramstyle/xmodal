@@ -64,8 +64,11 @@ def _cosine_warmup(step, total, base_lr, warmup):
 
 
 def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, device="cuda", log=print):
-    """Run phase-0 training. `specs` is a dict name->PatchSpec (mixed across steps)."""
+    """Run phase-0 training. `specs` is a dict name->PatchSpec (mixed across steps).
+    `train_bundles` may be a list of bundles OR a JitteredRotatingCache (anything with
+    .resident()/.step()) for datasets that exceed VRAM."""
     torch.manual_seed(cfg.seed)
+    _is_cache = hasattr(train_bundles, "resident")
     spec_list = list(specs.values())
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
                             betas=(0.9, 0.95), fused=(device == "cuda"))
@@ -110,7 +113,7 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
-        b, spec = draw(train_bundles)
+        b, spec = draw(train_bundles.resident() if _is_cache else train_bundles)
         with torch.autocast(**amp):
             out = phase0(b, spec)
             total = out["loss"]
@@ -118,6 +121,8 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
+        if _is_cache:
+            train_bundles.step()
         hist.append(dict(step=step, total=float(total), mae=float(out["mae"]),
                          series=float(out["series"]), rel_acc=out["rel_acc"]))
         if step % cfg.val_every == 0:
