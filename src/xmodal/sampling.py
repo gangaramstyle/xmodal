@@ -229,3 +229,57 @@ def sample_cross_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm
         source_series=torch.tensor(ssrc[:batch_size], device=device, dtype=torch.long),
         target_series=torch.tensor(stgt[:batch_size], device=device, dtype=torch.long),
     )
+
+
+def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device,
+                           pairs_per_patient=1):
+    """Vectorized `sample_cross_batch`: items sharing a (bundle, source, target) are drawn and
+    gathered together — one batched anchor/center draw and ONE `grid_sample` per group per
+    modality, instead of per-item kernels. Same output contract as `sample_cross_batch`."""
+    import torch
+    from collections import defaultdict
+    prism = tuple(prism_mm) if not np.isscalar(prism_mm) else (float(prism_mm),) * 3
+    half = torch.as_tensor(prism, device=device, dtype=torch.float32) / 2.0
+    n = token_count
+
+    items = []                                     # (bundle_idx, src_mod, tgt_mod)
+    while len(items) < batch_size:
+        bi = int(rng.integers(len(bundles))); mods = list(bundles[bi].keys())
+        if len(mods) < 2:
+            continue
+        for _ in range(pairs_per_patient):
+            if len(items) >= batch_size:
+                break
+            i, j = rng.choice(len(mods), size=2, replace=False)
+            items.append((bi, mods[i], mods[j]))
+    items = items[:batch_size]
+
+    groups = defaultdict(list)
+    for k, it in enumerate(items):
+        groups[it].append(k)
+
+    src_p = [None] * batch_size; tgt_p = [None] * batch_size; coord_l = [None] * batch_size
+    ssrc = [0] * batch_size; stgt = [0] * batch_size
+    for (bi, sm, tm), ks in groups.items():
+        s = bundles[bi][sm]; t = bundles[bi][tm]; G = len(ks)
+        off_s = patch_offsets_tensor(patch_spec, thick_axis=s.thick_axis, device=device)
+        off_t = patch_offsets_tensor(patch_spec, thick_axis=t.thick_axis, device=device)
+        M = s.foreground_mm.shape[0]
+        anchors = s.foreground_mm[torch.randint(M, (G,), device=device)]                 # [G,3]
+        centers = anchors[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half  # [G,n,3]
+        coords = centers - anchors[:, None]
+        # grouped world-mm -> voxel: [G,n,v0,v1,v2,3]
+        vox_s = (off_s[None, None] + centers[:, :, None, None, None, :] - s.affine_trans) @ s.affine_inv.T
+        vox_t = (off_t[None, None] + centers[:, :, None, None, None, :] - t.affine_trans) @ t.affine_inv.T
+        ps = sample_patches_group(s.volume, vox_s)                                        # [G,n,v0,v1,v2]
+        pt = sample_patches_group(t.volume, vox_t)
+        for gi, k in enumerate(ks):
+            src_p[k], tgt_p[k], coord_l[k] = ps[gi], pt[gi], coords[gi]
+            ssrc[k], stgt[k] = s.series_idx, t.series_idx
+    return dict(
+        source=torch.stack(src_p).float(),
+        target=torch.stack(tgt_p).float(),
+        coords=torch.stack(coord_l).float(),
+        source_series=torch.tensor(ssrc, device=device, dtype=torch.long),
+        target_series=torch.tensor(stgt, device=device, dtype=torch.long),
+    )
