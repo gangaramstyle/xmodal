@@ -226,7 +226,7 @@ class Phase0Encoder(nn.Module):
         n_held = max(1, min(n - 1, int(round(n * mask_ratio))))
         held, vis = perm[:, :n_held], perm[:, n_held:]
         tok = self.embed(patches, spec.key)
-        tok = tok.scatter(1, held[..., None].expand(-1, -1, W), self.mask_token.expand(B, n_held, W))
+        tok = tok.scatter(1, held[..., None].expand(-1, -1, W), self.mask_token.to(tok.dtype).expand(B, n_held, W))
         x = self.encode(*self._context([tok], [coords], dev, B))
         patch_enc = x[:, nreg:]
         vis_ctx = self._gather(patch_enc, vis, W); vis_coords = self._gather(coords, vis, 3)
