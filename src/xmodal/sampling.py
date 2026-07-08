@@ -231,6 +231,38 @@ def sample_cross_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm
     )
 
 
+def sample_self_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device):
+    """Phase-0 (self) batch: one bag of patches per item from a single random scan. Vectorized
+    (grouped by scan). `prism_mm` may be non-cubic (variable aspect ratio); `patch_spec` may be
+    a 2.5D slab. Returns patches [B,n,v0,v1,v2], coords [B,n,3], series [B]."""
+    import torch
+    from collections import defaultdict
+    prism = tuple(prism_mm) if not np.isscalar(prism_mm) else (float(prism_mm),) * 3
+    half = torch.as_tensor(prism, device=device, dtype=torch.float32) / 2.0
+    n = token_count
+    refs = []
+    while len(refs) < batch_size:
+        bi = int(rng.integers(len(bundles))); mods = list(bundles[bi].keys())
+        refs.append((bi, mods[int(rng.integers(len(mods)))]))
+    groups = defaultdict(list)
+    for k, r in enumerate(refs):
+        groups[r].append(k)
+    patch_l = [None] * batch_size; coord_l = [None] * batch_size; ser = [0] * batch_size
+    for (bi, m), ks in groups.items():
+        sc = bundles[bi][m]; G = len(ks)
+        off = patch_offsets_tensor(patch_spec, thick_axis=sc.thick_axis, device=device)
+        M = sc.foreground_mm.shape[0]
+        anchors = sc.foreground_mm[torch.randint(M, (G,), device=device)]
+        centers = anchors[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
+        coords = centers - anchors[:, None]
+        vox = (off[None, None] + centers[:, :, None, None, None, :] - sc.affine_trans) @ sc.affine_inv.T
+        p = sample_patches_group(sc.volume, vox)
+        for gi, k in enumerate(ks):
+            patch_l[k], coord_l[k], ser[k] = p[gi], coords[gi], sc.series_idx
+    return dict(patches=torch.stack(patch_l).float(), coords=torch.stack(coord_l).float(),
+                series=torch.tensor(ser, device=device, dtype=torch.long))
+
+
 def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device,
                            pairs_per_patient=1):
     """Vectorized `sample_cross_batch`: items sharing a (bundle, source, target) are drawn and
