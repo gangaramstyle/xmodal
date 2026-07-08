@@ -236,12 +236,15 @@ class Phase0Encoder(nn.Module):
         query = self._decode(query, ctx, cc, held_coords)
         pv = int(np.prod(spec.voxels))
         held_patches = self._gather_patches(patches, held)                     # [B,n_held,v,v,v]
-        mae = F.l1_loss(self.dec_pixel_head[spec.key](query), held_patches.reshape(B, n_held, pv))
+        recon = self.dec_pixel_head[spec.key](query)
+        mae = F.l1_loss(recon, held_patches.reshape(B, n_held, pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
         colors = F.normalize(self.color_head[spec.key](held_patches), dim=-1)
         m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
         return dict(mae=mae, match=m_loss, match_acc=m_met["match_acc"],
-                    series_repr=x[:, 0], view_repr=x[:, 1])
+                    series_repr=x[:, 0], view_repr=x[:, 1],
+                    recon=recon.detach(), held_patches=held_patches.detach(),   # viz: predicted vs truth pixels
+                    slots=slots.detach(), colors=colors.detach())               # viz: match assignment
 
     def forward_phase0(self, batch, spec, *, mask_ratio=0.5, mae_weight=0.25, match_weight=1.0,
                        series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
