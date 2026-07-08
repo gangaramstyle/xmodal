@@ -65,6 +65,7 @@ class TrainConfig:
     # mixed-size 2.5D sampling (categorical): per-patch physical size + per-item prism extent (mm)
     patch_sizes: tuple = (4.0, 8.0, 16.0)
     prism_choices: tuple = (32.0, 64.0, 128.0)
+    size_per_bag: bool = False        # ablation: one size per bag (no within-bag scale mixing)
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -206,12 +207,13 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
         # mixed-size 2.5D: per-patch sizes {4,8,16} mm + per-item prism {32,64,128} mm (sampler defaults)
         return S.sample_paired_batch(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
                                      patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
-                                     rng=rng, device=device)
+                                     size_per_bag=cfg.size_per_bag, rng=rng, device=device)
 
     def crossb(bnd):
         return S.sample_cross_batch_vec(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
                                         patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
-                                        rng=rng, device=device, pairs_per_patient=cfg.pairs_per_patient)
+                                        size_per_bag=cfg.size_per_bag, rng=rng, device=device,
+                                        pairs_per_patient=cfg.pairs_per_patient)
 
     def teach(b, want_latent=False):
         with torch.no_grad(), torch.autocast(**amp):

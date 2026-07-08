@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--ckpt-dir", default="runs/phased")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--size-per-bag", action="store_true",
+                    help="ablation: one patch size per bag (no within-bag scale mixing)")
     ap.add_argument("--wandb", default=None)
     ap.add_argument("--wandb-run", default=None)
     args = ap.parse_args()
@@ -64,8 +66,8 @@ def main():
     # (TrainConfig defaults). One shared stem/heads; scale rides in via the per-patch size embedding.
     enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
     cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count,
-                        compile=not args.no_compile, ckpt_dir=args.ckpt_dir,
-                        wandb=args.wandb, wandb_run=args.wandb_run)
+                        compile=not args.no_compile, size_per_bag=args.size_per_bag,
+                        ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)
     T.train_phased(enc, cache, val_bundles, {}, cfg, phases=phases, device=dev)

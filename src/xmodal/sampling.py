@@ -90,10 +90,15 @@ def slab_unit_offsets(thick_axis: int, voxels: int, device):
     return patch_offsets_tensor(slice_spec(1.0, voxels), thick_axis=thick_axis, device=device)
 
 
-def draw_patch_sizes(rng, G: int, n: int, choices, device):
-    """Per-patch physical sizes (mm) [G,n] drawn i.i.d. from `choices` (e.g. (4,8,16))."""
+def draw_patch_sizes(rng, G: int, n: int, choices, device, per_bag: bool = False):
+    """Per-patch physical sizes (mm) [G,n] drawn from `choices` (e.g. (4,8,16)). Default: i.i.d. per
+    patch (mixed within a bag). `per_bag=True` draws ONE size per bag (homogeneous bag; still varies
+    across bags) — the ablation that removes within-bag scale mixing."""
     import torch
     arr = np.asarray(choices, dtype=np.float32)
+    if per_bag:
+        s = arr[rng.integers(len(arr), size=(G, 1))]                 # one size per bag
+        return torch.as_tensor(np.broadcast_to(s, (G, n)).copy(), device=device)
     return torch.as_tensor(arr[rng.integers(len(arr), size=(G, n))], device=device)
 
 
@@ -284,7 +289,7 @@ def apply_window_jitter(patches, *, center_std, width_log_std):
 
 
 def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
-                        prism_choices=(32., 64., 128.), rng, device,
+                        prism_choices=(32., 64., 128.), size_per_bag=False, rng, device,
                         pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1):
     """Phase-0 paired-view batch (for series-CLS + view-CLS). Per item: two prisms (a, b) from one
     scan whose anchors sit ~log-uniform(pair_dist_min,max) apart. MIXED-size patches (per-patch size
@@ -317,8 +322,8 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
         anchors_b = fg[torch.multinomial(band + add, 1)[:, 0]]                           # [G,3]
         ctr_a = anchors_a[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
         ctr_b = anchors_b[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
-        sizes_a = draw_patch_sizes(rng, G, n, patch_sizes, device)                       # [G,n]
-        sizes_b = draw_patch_sizes(rng, G, n, patch_sizes, device)
+        sizes_a = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)                       # [G,n]
+        sizes_b = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)
         pat_a = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_a, sizes_a, unit))
         pat_b = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_b, sizes_b, unit))
         st = (anchors_b - anchors_a > 0).float()                                         # [G,3]
@@ -339,7 +344,7 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
 
 
 def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
-                      prism_choices=(32., 64., 128.), rng, device):
+                      prism_choices=(32., 64., 128.), size_per_bag=False, rng, device):
     """Phase-0 (self) batch: one bag of patches per item from a single random scan. Vectorized
     (grouped by scan). Mixed-size patches + per-item prism scale. Returns patches [B,n,V,V,1],
     coords [B,n,3], sizes [B,n] (mm), series [B]."""
@@ -362,7 +367,7 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 
         anchors = sc.foreground_mm[torch.randint(M, (G,), device=device)]
         centers = anchors[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
         coords = centers - anchors[:, None]
-        sizes = draw_patch_sizes(rng, G, n, patch_sizes, device)                         # [G,n]
+        sizes = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)                         # [G,n]
         p = sample_patches_group(sc.volume, mixed_bag_vox(sc, centers, sizes, unit))
         for gi, k in enumerate(ks):
             patch_l[k], coord_l[k], size_l[k], ser[k] = p[gi], coords[gi], sizes[gi], sc.series_idx
@@ -371,7 +376,7 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 
 
 
 def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
-                           prism_choices=(32., 64., 128.), rng, device, pairs_per_patient=1):
+                           prism_choices=(32., 64., 128.), size_per_bag=False, rng, device, pairs_per_patient=1):
     """Vectorized cross-modal batch: items sharing a (bundle, source, target) are drawn and gathered
     together (one batched draw + ONE grid_sample per group per modality). Mixed-size patches (same
     per-patch sizes + centers for source & target so they stay co-registered), per-item prism scale.
@@ -407,7 +412,7 @@ def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_sizes=(4.,
         anchors = s.foreground_mm[torch.randint(M, (G,), device=device)]                 # [G,3]
         centers = anchors[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half  # [G,n,3]
         coords = centers - anchors[:, None]
-        sizes = draw_patch_sizes(rng, G, n, patch_sizes, device)                         # [G,n] shared src/tgt
+        sizes = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)                         # [G,n] shared src/tgt
         ps = sample_patches_group(s.volume, mixed_bag_vox(s, centers, sizes, unit_s))    # [G,n,V,V,1]
         pt = sample_patches_group(t.volume, mixed_bag_vox(t, centers, sizes, unit_t))
         for gi, k in enumerate(ks):
