@@ -62,8 +62,7 @@ def main():
 
     # 2.5D-only, multi-scale: slabs at 2/4/8/16 mm (fine -> coarse). 2.5D lets us pretrain on far
     # more data (thick-slice / non-isotropic: OpenMIND / FOMO / RSNA) than 3D cubes would.
-    specs = {"slab2": S.slice_spec(2, 16), "slab4": S.slice_spec(4, 16),
-             "slab8": S.slice_spec(8, 16), "slab16": S.slice_spec(16, 16)}
+    specs = {"slab4": S.slice_spec(4, 16), "slab8": S.slice_spec(8, 16), "slab16": S.slice_spec(16, 16)}
     enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8), list(specs.values())).to(dev)
     cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count,
                         compile=not args.no_compile, ckpt_dir=args.ckpt_dir,

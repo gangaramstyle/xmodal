@@ -16,7 +16,7 @@ git pull -q || true
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 .venv/bin/python -u scripts/run_phased.py \
-    --batch-size 128 --token-count 128 --cache-size 64 \
+    --batch-size 256 --token-count 128 --cache-size 40 \
     --self-steps 25000 --cross-steps 25000 --latent-steps 20000 \
     --ckpt-dir runs/phased \
     --wandb xmodal-phased --wandb-run "phased_a40_${SLURM_JOB_ID:-manual}"
