@@ -160,12 +160,14 @@ class Phase0Encoder(nn.Module):
         self.rel_view_head = nn.Sequential(nn.Linear(2 * cfg.width, cfg.width), nn.GELU(),
                                            nn.Linear(cfg.width, 5))
 
-    def embed(self, patches, spec_key, series_idx):
-        """patches [B,n,v0,v1,v2] -> tokens [B,n,W]."""
+    def embed(self, patches, spec_key, series_idx=None):
+        """patches [B,n,v0,v1,v2] -> tokens [B,n,W]. NO series_embed added — series identity is
+        *learned* into the series-CLS token from content, not injected into every patch token
+        (else series-CLS is trivialized). Conditioning happens later via the series-CLS output.
+        `series_idx` kept for call-site compatibility but ignored (see PHASED_DESIGN.md)."""
         B, n = patches.shape[:2]
         fmap = self.stem[spec_key](patches.reshape(B * n, 1, *patches.shape[2:]))
-        tok = fmap.reshape(B, n, self.cfg.width)
-        return tok + self.series_embed(series_idx)[:, None, :]
+        return fmap.reshape(B, n, self.cfg.width)
 
     def encode(self, tokens, coords):
         """tokens [B,T,W] with matching coords [B,T,3] (CLS/regs use coord 0) -> [B,T,W]."""

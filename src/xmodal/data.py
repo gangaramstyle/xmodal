@@ -91,6 +91,86 @@ def load_brats_bundle(pid, *, device, **kw):
 
 
 # ---------------------------------------------------------------------------
+# Local BraTS-style datasets (METS/PED/GoAT unzipped on disk: nii dirs + corrected labels)
+# ---------------------------------------------------------------------------
+
+import glob
+
+LOCAL_SUFFIX = {"t1": "t1n", "t1c": "t1c", "t2": "t2w", "flair": "t2f"}
+LOCAL_SERIES = {"t1": 0, "t1c": 1, "t2": 2, "flair": 3}
+
+
+def _cpu_payload(vol_raw, affine, modality, series_idx, patient, *, fg_thresh=0.02, max_fg=200_000):
+    """Build the CPU payload (normalized volume + world-mm foreground + geometry) for place_bundle."""
+    vol = np.nan_to_num(np.ascontiguousarray(vol_raw, dtype=np.float32), copy=False)
+    affine = np.asarray(affine, np.float32)
+    R, t = affine[:3, :3], affine[:3, 3]
+    thick, plane, spacing = S._thick_and_plane(R, None)
+    hi = float(vol.max()) or 1.0
+    keep = vol > fg_thresh * hi
+    vox = np.argwhere(keep).astype(np.float32)
+    if len(vox) == 0:
+        vox = np.argwhere(np.ones_like(vol)).astype(np.float32)
+    if len(vox) > max_fg:
+        vox = vox[np.random.default_rng(0).choice(len(vox), max_fg, replace=False)]
+    fg = (vox @ R.T + t).astype(np.float32)
+    lo, hiP = np.percentile(vol[keep], [0.5, 99.5]) if keep.any() else (0.0, hi)
+    voln = np.clip((vol - lo) / max(hiP - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    return dict(volume=voln, affine_inv=np.linalg.inv(R).astype(np.float32),
+                affine_trans=t.astype(np.float32), foreground_mm=fg, thick=int(thick),
+                plane=int(plane), series=int(series_idx), patient=patient, spacing=spacing)
+
+
+def find_brats_patients(root, anchor_suffix="t1n"):
+    """Discover BraTS-style patient dirs under `root`: any dir with a `<pid>-<anchor>.nii.gz`.
+    Returns {patient_id: patient_dir}."""
+    out = {}
+    for f in glob.glob(os.path.join(root, "**", f"*-{anchor_suffix}.nii.gz"), recursive=True):
+        pid = os.path.basename(f)[: -len(f"-{anchor_suffix}.nii.gz")]
+        out[pid] = os.path.dirname(f)
+    return out
+
+
+def _find_seg(pid, patient_dir, labels_dir):
+    """Locate a patient's GT seg — prefer `labels_dir` (corrected labels), else the bundled -seg."""
+    if labels_dir:
+        for pat in (f"{pid}*seg*.nii.gz", f"{pid}*.nii.gz"):
+            hits = glob.glob(os.path.join(labels_dir, "**", pat), recursive=True)
+            if hits:
+                return hits[0]
+    p = os.path.join(patient_dir, f"{pid}-seg.nii.gz")
+    return p if os.path.exists(p) else None
+
+
+def load_local_cpu(pid, patient_dir, *, labels_dir=None, suffixes=None, with_seg=False,
+                   fg_thresh=0.02, max_fg=200_000):
+    """CPU decode a local BraTS-style patient (nii dir). Returns (cpu_bundle, seg_np|None). T2 is
+    optional (skipped if missing). Seg (if requested) prefers corrected `labels_dir`."""
+    import nibabel as nib
+    suffixes = suffixes or LOCAL_SUFFIX
+    bundle = {}
+    for m, suf in suffixes.items():
+        p = os.path.join(patient_dir, f"{pid}-{suf}.nii.gz")
+        if not os.path.exists(p):
+            continue
+        img = nib.load(p)
+        bundle[m] = _cpu_payload(img.get_fdata(), img.affine, m, LOCAL_SERIES.get(m, 0), pid,
+                                 fg_thresh=fg_thresh, max_fg=max_fg)
+    seg = None
+    if with_seg:
+        segp = _find_seg(pid, patient_dir, labels_dir)
+        if segp:
+            seg = np.nan_to_num(nib.load(segp).get_fdata(), copy=False).astype(np.int16)
+    return bundle, seg
+
+
+def load_local_bundle(pid, patient_dir, *, device, **kw):
+    """Decode + place a local patient in one call. Returns (gpu_bundle, seg_np|None)."""
+    cpu_bundle, seg = load_local_cpu(pid, patient_dir, **kw)
+    return place_bundle(cpu_bundle, device), seg
+
+
+# ---------------------------------------------------------------------------
 # Rotating GPU cache (CPU-loader / GPU-placer split)
 # ---------------------------------------------------------------------------
 
