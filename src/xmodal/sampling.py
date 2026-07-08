@@ -79,6 +79,41 @@ def patch_offsets_tensor(spec: PatchSpec, *, thick_axis: int, device):
 
 
 # ---------------------------------------------------------------------------
+# Mixed-size 2.5D sampling: per-patch physical size {4,8,16} + per-bag prism {32,64,128}.
+# Every patch is a V×V×1 slab regardless of size (only the mm spacing changes), so a bag of
+# mixed sizes still stacks; physical scale rides along as `sizes` for the model's size embedding.
+# ---------------------------------------------------------------------------
+
+def slab_unit_offsets(thick_axis: int, voxels: int, device):
+    """Unit (1 mm in-plane) 2.5D slab offsets [V,V,1,3], oriented by thick_axis. Scale by a
+    per-patch size (mm) to get that patch's physical footprint."""
+    return patch_offsets_tensor(slice_spec(1.0, voxels), thick_axis=thick_axis, device=device)
+
+
+def draw_patch_sizes(rng, G: int, n: int, choices, device):
+    """Per-patch physical sizes (mm) [G,n] drawn i.i.d. from `choices` (e.g. (4,8,16))."""
+    import torch
+    arr = np.asarray(choices, dtype=np.float32)
+    return torch.as_tensor(arr[rng.integers(len(arr), size=(G, n))], device=device)
+
+
+def draw_prism_half(rng, G: int, choices, device):
+    """Per-item prism half-extent [G,1,1] (mm) drawn from `choices` (e.g. (32,64,128)); a cubic
+    prism per bag. Broadcasts over (n, 3) when placing centers."""
+    import torch
+    arr = np.asarray(choices, dtype=np.float32)
+    return torch.as_tensor(arr[rng.integers(len(arr), size=G)], device=device)[:, None, None] / 2.0
+
+
+def mixed_bag_vox(sc: "CachedScan", centers, sizes, unit_off):
+    """centers [G,n,3], sizes [G,n] (mm), unit_off [V,V,1,3] -> voxel coords [G,n,V,V,1,3].
+    Per-patch offsets = unit_off * size, so each patch samples its own physical footprint."""
+    off_pp = unit_off[None, None] * sizes[:, :, None, None, None, None]        # [G,n,V,V,1,3]
+    phys = off_pp + centers[:, :, None, None, None, :]
+    return (phys - sc.affine_trans) @ sc.affine_inv.T
+
+
+# ---------------------------------------------------------------------------
 # CachedScan: a volume + geometry resident on the GPU
 # ---------------------------------------------------------------------------
 
