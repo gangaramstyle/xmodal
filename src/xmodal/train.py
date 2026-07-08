@@ -1,12 +1,11 @@
-"""Phase-0 trainer: real infra + the objective actually implemented (pixel-MAE).
+"""Phase-0 trainer: full faithful objective + real efficiency infra.
 
-Objective: **pixel-MAE** (mask_ratio 0.35) — masked patch reconstruction.
-NOT YET PORTED (do faithfully, not heuristically): series-CLS (`rank_hinge_xmod_loss` from
-`brats2026/losses/contrastive.py`, weight 1.0) and view-CLS (8-way BCE over relative
-spatial/window/rotation from paired-prism sampling). Both need paired-view sampling first.
+Objective (paired views, weighted): pixel-MAE (0.25) + series-CLS (rank_hinge_xmod_loss, 1.0,
+same-sequence-different-patient positives) + view-CLS (5-way BCE: 3 spatial + 2 window,
+0.25 + 0.25; rotation dropped). See model.forward_phase0 + sampling.sample_paired_batch.
 
 Infra: torch.compile (encode path), bf16 autocast, fused AdamW, grad-clip 1.0, cosine-warmup LR,
-checkpointing, held-out val (MAE + modality-1NN diagnostic on the series-CLS token).
+checkpointing, held-out val (MAE + view-CLS rel_acc).
 """
 from __future__ import annotations
 
@@ -39,6 +38,9 @@ class TrainConfig:
     mask_ratio: float = 0.35
     mae_weight: float = 0.25
     series_weight: float = 1.0
+    rel_spatial_weight: float = 0.25
+    rel_window_weight: float = 0.25
+    n_xmod: int = 1
     lr: float = 3e-4
     weight_decay: float = 0.05
     warmup_frac: float = 0.05
@@ -79,9 +81,14 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
     def draw(bundles):
         spec = spec_list[rng.integers(len(spec_list))]
         prism = tuple(float(x) for x in rng.uniform(cfg.prism_lo, cfg.prism_hi, size=3))
-        b = S.sample_self_batch(bundles, batch_size=cfg.batch_size, token_count=cfg.token_count,
-                                patch_spec=spec, prism_mm=prism, rng=rng, device=device)
+        b = S.sample_paired_batch(bundles, batch_size=cfg.batch_size, token_count=cfg.token_count,
+                                  patch_spec=spec, prism_mm=prism, rng=rng, device=device)
         return b, spec
+
+    def phase0(b, spec):
+        return model.forward_phase0(b, spec, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
+                                    series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
+                                    rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
 
     @torch.no_grad()
     def validate():
@@ -89,33 +96,34 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
         for _ in range(cfg.val_iters):
             b, spec = draw(val_bundles)
             with torch.autocast(**amp):
-                out = model.forward_mae(b["patches"], b["coords"], spec, b["series"], mask_ratio=cfg.mask_ratio)
-            maes.append(float(out["loss"])); accs.append(modality_1nn_acc(out["series_cls"], b["series"]))
+                out = phase0(b, spec)
+            maes.append(float(out["mae"])); accs.append(out["rel_acc"])
         model.train(); return np.mean(maes), np.mean(accs)
 
     hist = []
     torch.cuda.synchronize() if device == "cuda" else None
     t0 = time.time()
     vm, va = validate()
-    log(f"{'step':>6} {'total':>8} {'mae':>7} {'series':>7} {'val_mae':>8} {'val_1nn':>8} {'lr':>8}")
-    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {vm:>8.4f} {va:>8.3f} {'-':>8}")
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'series':>7} {'relacc':>7} {'val_mae':>8} {'val_rel':>8} {'lr':>8}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {'-':>7} {vm:>8.4f} {va:>8.3f} {'-':>8}")
     for step in range(1, cfg.steps + 1):
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
         b, spec = draw(train_bundles)
         with torch.autocast(**amp):
-            out = model.forward_mae(b["patches"], b["coords"], spec, b["series"], mask_ratio=cfg.mask_ratio)
-            total = out["loss"]                       # pixel-MAE only (series/view-CLS not yet ported)
+            out = phase0(b, spec)
+            total = out["loss"]
         opt.zero_grad(set_to_none=True)
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
-        hist.append(dict(step=step, total=float(total), mae=float(out["loss"])))
+        hist.append(dict(step=step, total=float(total), mae=float(out["mae"]),
+                         series=float(out["series"]), rel_acc=out["rel_acc"]))
         if step % cfg.val_every == 0:
             vm, va = validate()
             r = hist[-1]
-            log(f"{step:>6} {r['total']:>8.4f} {r['mae']:>7.4f} {'-':>7} {vm:>8.4f} {va:>8.3f} {lr:>8.2e}")
+            log(f"{step:>6} {r['total']:>8.4f} {r['mae']:>7.4f} {r['series']:>7.4f} {r['rel_acc']:>7.3f} {vm:>8.4f} {va:>8.3f} {lr:>8.2e}")
         if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
             import os
             os.makedirs(cfg.ckpt_dir, exist_ok=True)
