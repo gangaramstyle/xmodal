@@ -54,6 +54,9 @@ class TrainConfig:
     ckpt_every: int = 1000
     ckpt_dir: str | None = None
     seed: int = 0
+    wandb: str | None = None          # W&B project name (None = off)
+    wandb_run: str | None = None      # W&B run name
+    log_every: int = 50
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -80,6 +83,13 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
     rng = np.random.default_rng(cfg.seed)
     warmup = int(cfg.warmup_frac * cfg.steps)
     amp = dict(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.amp_bf16 and device == "cuda")
+    wb = None
+    if cfg.wandb:
+        try:
+            import wandb as wb
+            wb.init(project=cfg.wandb, name=cfg.wandb_run, config=cfg.__dict__)
+        except Exception as e:
+            log(f"[wandb] disabled: {e}"); wb = None
 
     def draw(bundles):
         spec = spec_list[rng.integers(len(spec_list))]
@@ -125,10 +135,17 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
             train_bundles.step()
         hist.append(dict(step=step, total=float(total), mae=float(out["mae"]),
                          series=float(out["series"]), rel_acc=out["rel_acc"]))
+        if wb and step % cfg.log_every == 0:
+            r = hist[-1]
+            wb.log({"train/total": r["total"], "train/mae": r["mae"], "train/series": r["series"],
+                    "train/rel_spatial": float(out["rel_spatial"]), "train/rel_window": float(out["rel_window"]),
+                    "train/rel_acc": r["rel_acc"], "train/series_viol": out["series_viol"], "lr": lr}, step=step)
         if step % cfg.val_every == 0:
             vm, va = validate()
             r = hist[-1]
             log(f"{step:>6} {r['total']:>8.4f} {r['mae']:>7.4f} {r['series']:>7.4f} {r['rel_acc']:>7.3f} {vm:>8.4f} {va:>8.3f} {lr:>8.2e}")
+            if wb:
+                wb.log({"val/mae": vm, "val/rel_acc": va}, step=step)
         if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
             import os
             os.makedirs(cfg.ckpt_dir, exist_ok=True)
@@ -136,4 +153,6 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
                        f"{cfg.ckpt_dir}/step_{step:06d}.pt")
     dt = time.time() - t0
     log(f"done {cfg.steps} steps in {dt:.0f}s ({cfg.steps/dt:.1f} steps/s)")
+    if wb:
+        wb.finish()
     return hist

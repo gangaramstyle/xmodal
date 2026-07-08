@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--ckpt-dir", default="runs/phase0")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--wandb", default=None, help="W&B project name (enables logging)")
+    ap.add_argument("--wandb-run", default=None, help="W&B run name")
     args = ap.parse_args()
     dev = args.device
 
@@ -50,7 +52,8 @@ def main():
     enc_cfg = M.EncoderConfig(width=args.width, depth=args.depth, heads=args.heads, n_series=8)
     enc = M.Phase0Encoder(enc_cfg, list(specs.values())).to(dev)
     cfg = T.TrainConfig(steps=args.steps, batch_size=args.batch_size, token_count=args.token_count,
-                        compile=not args.no_compile, ckpt_dir=args.ckpt_dir)
+                        compile=not args.no_compile, ckpt_dir=args.ckpt_dir,
+                        wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | compile {not args.no_compile}", flush=True)
     T.train_phase0(enc, cache, val_bundles, specs, cfg, device=dev)
     cache.stop_prefetch()
