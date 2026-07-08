@@ -6,8 +6,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
+#SBATCH --propagate=NONE
 #SBATCH --output=/cbica/home/gangarav/xmodal/p0_%j.log
+# --propagate=NONE: do NOT inherit the login shell's CPU-time ulimit (7200s soft / 14400s hard)
+# — that RLIMIT_CPU is what SIGXCPU-killed the first phase-0 run at ~60 min. On the compute node
+# the native limit is unlimited.
 set -euo pipefail
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8   # bound CPU threads (hygiene; sampling stays on GPU)
 
 cd ~/xmodal
 git pull -q || true
