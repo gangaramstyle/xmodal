@@ -231,6 +231,74 @@ def sample_cross_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm
     )
 
 
+def apply_window_jitter(patches, *, center_std, width_log_std):
+    """Per-scan intensity window jitter on a patch bag (ported). Returns (jittered, target[B,2])
+    where target = [center_shift, log_width]."""
+    import torch
+    B = patches.shape[0]
+    if center_std <= 0 and width_log_std <= 0:
+        return patches, patches.new_zeros((B, 2))
+    center = torch.zeros(B, 1, 1, 1, 1, device=patches.device, dtype=patches.dtype)
+    if center_std > 0:
+        center.normal_(mean=0.0, std=float(center_std))
+    log_width = torch.zeros(B, 1, 1, 1, 1, device=patches.device, dtype=patches.dtype)
+    if width_log_std > 0:
+        log_width.normal_(mean=0.0, std=float(width_log_std)).clamp_(min=-3 * width_log_std, max=3 * width_log_std)
+    jittered = (patches - center) / log_width.exp()
+    return jittered, torch.cat([center.flatten(1), log_width.flatten(1)], dim=1)
+
+
+def sample_paired_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device,
+                        pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1):
+    """Phase-0 paired-view batch (for series-CLS + view-CLS). Per item: two prisms (a, b) from
+    one scan whose anchors sit ~log-uniform(pair_dist_min,max) apart. Grouped by scan (one
+    grid_sample per scan per view). Returns patches_a/_b [B,n,...], coords_a/_b [B,n,3],
+    rel_targets [B,5] (3 spatial-sign + 2 window-sign), series [B], patient [B]."""
+    import torch
+    from collections import defaultdict
+    prism = tuple(prism_mm) if not np.isscalar(prism_mm) else (float(prism_mm),) * 3
+    half = torch.as_tensor(prism, device=device, dtype=torch.float32) / 2.0
+    n = token_count
+    refs = []
+    while len(refs) < batch_size:
+        bi = int(rng.integers(len(bundles))); mods = list(bundles[bi].keys())
+        refs.append((bi, mods[int(rng.integers(len(mods)))]))
+    groups = defaultdict(list)
+    for k, r in enumerate(refs):
+        groups[r].append(k)
+    pa = [None] * batch_size; pb = [None] * batch_size; ca = [None] * batch_size; cb = [None] * batch_size
+    spat = [None] * batch_size; ser = [0] * batch_size; pat = [0] * batch_size
+    for (bi, m), ks in groups.items():
+        sc = bundles[bi][m]; G = len(ks); fg = sc.foreground_mm; Mf = fg.shape[0]
+        off = patch_offsets_tensor(patch_spec, thick_axis=sc.thick_axis, device=device)
+        anchors_a = fg[torch.randint(Mf, (G,), device=device)]                          # [G,3]
+        d = np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max), size=G)).astype(np.float32)
+        dt = torch.as_tensor(d, device=device)
+        dvec = (fg[None] - anchors_a[:, None]).norm(dim=-1)                              # [G,M]
+        band = ((dvec >= 0.7 * dt[:, None]) & (dvec <= 1.3 * dt[:, None])).float()
+        near = (dvec - dt[:, None]).abs().argmin(1)
+        add = torch.zeros_like(band); add[torch.arange(G, device=device), near] = (band.sum(1) == 0).float()
+        anchors_b = fg[torch.multinomial(band + add, 1)[:, 0]]                           # [G,3]
+        ctr_a = anchors_a[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
+        ctr_b = anchors_b[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
+        va = (off[None, None] + ctr_a[:, :, None, None, None, :] - sc.affine_trans) @ sc.affine_inv.T
+        vb = (off[None, None] + ctr_b[:, :, None, None, None, :] - sc.affine_trans) @ sc.affine_inv.T
+        pat_a = sample_patches_group(sc.volume, va); pat_b = sample_patches_group(sc.volume, vb)
+        st = (anchors_b - anchors_a > 0).float()                                         # [G,3]
+        for gi, k in enumerate(ks):
+            pa[k], pb[k] = pat_a[gi], pat_b[gi]
+            ca[k] = ctr_a[gi] - anchors_a[gi][None]; cb[k] = ctr_b[gi] - anchors_b[gi][None]
+            spat[k] = st[gi]; ser[k] = sc.series_idx; pat[k] = bi
+    Pa = torch.stack(pa).float(); Pb = torch.stack(pb).float()
+    Pa, ta = apply_window_jitter(Pa, center_std=win_center_std, width_log_std=win_width_log_std)
+    Pb, tb = apply_window_jitter(Pb, center_std=win_center_std, width_log_std=win_width_log_std)
+    win_t = (tb - ta > 0).float()                                                        # [B,2]
+    rel = torch.cat([torch.stack(spat), win_t], dim=1)                                   # [B,5]
+    return dict(patches_a=Pa, patches_b=Pb, coords_a=torch.stack(ca).float(), coords_b=torch.stack(cb).float(),
+                rel_targets=rel, series=torch.tensor(ser, device=device, dtype=torch.long),
+                patient=torch.tensor(pat, device=device, dtype=torch.long))
+
+
 def sample_self_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device):
     """Phase-0 (self) batch: one bag of patches per item from a single random scan. Vectorized
     (grouped by scan). `prism_mm` may be non-cubic (variable aspect ratio); `patch_spec` may be

@@ -156,6 +156,9 @@ class Phase0Encoder(nn.Module):
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
         self.color_head = nn.ModuleDict({s.key: ColorHead(cfg.width, s.voxels) for s in patch_specs})
         self.latent_head = nn.Linear(cfg.width, cfg.width)
+        # view-CLS head: 3 spatial-ordering + 2 window signs (rotation dropped) = 5-way BCE
+        self.rel_view_head = nn.Sequential(nn.Linear(2 * cfg.width, cfg.width), nn.GELU(),
+                                           nn.Linear(cfg.width, 5))
 
     def embed(self, patches, spec_key, series_idx):
         """patches [B,n,v0,v1,v2] -> tokens [B,n,W]."""
@@ -190,6 +193,41 @@ class Phase0Encoder(nn.Module):
         target = patches.reshape(B, n, -1)
         loss = F.l1_loss(recon[mask], target[mask]) if mask.any() else recon.new_zeros(())
         return dict(loss=loss, series_cls=x[:, 0], view_cls=x[:, 1], n_masked=int(mask.sum()))
+
+    # ---- phase-0 paired (MAE + series-CLS + view-CLS) --------------------------------
+    def encode_view(self, patches, coords, spec, series, *, mask_ratio):
+        """Encode one view -> (series_repr[B,W], view_repr[B,W], mae_loss)."""
+        B, n = patches.shape[:2]; dev = patches.device
+        nreg = 2 + self.registers.shape[0]
+        tok = self.embed(patches, spec.key, series)
+        mask = torch.rand(B, n, device=dev) < mask_ratio
+        tok = torch.where(mask[..., None], self.mask_token, tok)
+        toks, ccs = self._context([tok], [coords], dev, B)
+        x = self.encode(toks, ccs)
+        recon = self.pixel_head[spec.key](x[:, nreg:])
+        tgt = patches.reshape(B, n, -1)
+        mae = F.l1_loss(recon[mask], tgt[mask]) if mask.any() else x.new_zeros(())
+        return x[:, 0], x[:, 1], mae
+
+    def forward_phase0(self, batch, spec, *, mask_ratio=0.35, mae_weight=0.25, series_weight=1.0,
+                       rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
+        """Full phase-0: masked-MAE (both views) + series-CLS (rank_hinge_xmod) + view-CLS
+        (5-way BCE: 3 spatial + 2 window)."""
+        from xmodal.losses import rank_hinge_xmod_loss
+        sa, va, mae_a = self.encode_view(batch["patches_a"], batch["coords_a"], spec, batch["series"], mask_ratio=mask_ratio)
+        sb, vb, mae_b = self.encode_view(batch["patches_b"], batch["coords_b"], spec, batch["series"], mask_ratio=mask_ratio)
+        mae = 0.5 * (mae_a + mae_b)
+        series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)
+        rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
+        rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
+        spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()
+        total = (mae_weight * mae + series_weight * series_loss
+                 + rel_spatial_weight * spatial + rel_window_weight * window)
+        with torch.no_grad():
+            rel_acc = ((rel_logits > 0).float() == batch["rel_targets"]).float().mean()
+        return dict(loss=total, mae=mae.detach(), series=series_loss.detach(),
+                    rel_spatial=spatial.detach(), rel_window=window.detach(),
+                    rel_acc=float(rel_acc), series_viol=float(series_viol))
 
     # ---- cross-modal ---------------------------------------------------------------
     def _gather(self, x, idx, d):
