@@ -332,7 +332,8 @@ class Phase0Encoder(nn.Module):
         pv = int(np.prod(spec.voxels))
         tgt_recon = self._gather(target_patches.reshape(B, n, -1), recon, pv)        # disjoint from anchors
         zero = query.new_zeros(())
-        mae = F.l1_loss(self.dec_pixel_head[spec.key](query), tgt_recon) if objective in ("mae", "both") else zero
+        pred = self.dec_pixel_head[spec.key](query)
+        mae = F.l1_loss(pred, tgt_recon) if objective in ("mae", "both") else zero
         match_acc = 0.0
         if objective in ("match", "both"):
             slots = F.normalize(self.match_slot_proj(query), dim=-1)
@@ -342,7 +343,9 @@ class Phase0Encoder(nn.Module):
             loss = mae + match_weight * m_loss if objective == "both" else m_loss
         else:
             loss = mae
-        return dict(loss=loss, mae=mae.detach(), match_acc=match_acc, n_recon=n_recon, n_anchor=int(anchor.shape[1]))
+        src_recon = self._gather(source_patches.reshape(B, n, -1), recon, pv)         # viz: source modality @ predicted positions
+        return dict(loss=loss, mae=mae.detach(), match_acc=match_acc, n_recon=n_recon, n_anchor=int(anchor.shape[1]),
+                    pred=pred.detach(), tgt_recon=tgt_recon.detach(), src_recon=src_recon.detach())
 
     def forward_cross_latent(self, source_patches, target_patches, coords, spec, src_series_cls,
                              tgt_series_cls, tgt_latents, *, anchor_frac=0.05):
