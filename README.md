@@ -18,6 +18,13 @@ map of the old strains and the cleanup plan.
   voxel coords), 2.5D slab shape (16,16,1), throughput **673k patches/s** (vectorized, 1.63×
   the per-item path).
 
+**Done — `xmodal/model.py` (phase-0 mm-RoPE ViT encoder, self-supervised MAE):**
+- ViT-S (27.8M), per-spec patch stems + pixel heads, series/view CLS + register + mask tokens.
+- **Validated in molab** in one mixed training run: 2.5D slabs `(16,16,1)` + 4mm/8mm cubes
+  (variable patch sizes) + random non-cubic prism aspect ratios `(24–48mm)³`, masked-MAE loss
+  **0.57 → 0.23** over 80 steps, 41 steps/s on the Blackwell. mm-RoPE positions tokens by
+  physical-mm coords so any prism shape / patch size / 2.5D orientation just works.
+
 **Next (the cross-modal "both" path):**
 1. `models/` — mm-RoPE ViT encoder + cross-attention decoder + patch stem (lift from
    `brats2026/models/{rope,vit,stem}`).
