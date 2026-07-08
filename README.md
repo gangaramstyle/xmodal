@@ -37,12 +37,27 @@ not memorization. 35 steps/s.
 - **Validated in molab** (35.3M params): cross-MAE **0.65 → 0.12**, match_acc rises to ~3×
   chance and climbing, latent path runs.
 
-**Next:**
-1. `train.py` — a real trainer (rotating patient cache, curriculum over specs/prisms,
-   phase-0 → warm-start cross `both` → phase-4 latent), checkpointing, W&B.
-2. `eval/` — ET-from-T1 specificity probe + held-out ladder + `ablate_source`.
-3. `data/` — factor the BraTS-HF loader out of the notebook + add CT/NLST loader.
-4. Scale data (BraTS-MET for physiologic-enhancement specificity) + longer runs on Betty/CUBIC.
+**Done — `xmodal/train.py` (real phase-0 trainer, efficiency infra):**
+- **Objective: pixel-MAE** (real; series-CLS + view-CLS to be **ported faithfully**, not approximated).
+- Infra: **torch.compile** (encode path) + **bf16 autocast** + **fused AdamW** + grad-clip 1.0 +
+  cosine-warmup LR + checkpointing + held-out val.
+- **Validated in molab:** converges (val MAE 0.607 → 0.076 on held-out patients); throughput A/B
+  on the Blackwell: fp32 37.8 → bf16 43.9 → **bf16+compile 61.9 steps/s (1.64×), 6.7 → 5.2 GB**.
+
+**Loading validated** (real BraTS, HF): all modalities co-registered (identical affines), orientation
+LAS (affine/world-mm driven so correct), geometry patch-center=direct-voxel 0.06. NOTE the brightest
+t1c voxels are physiologic (label 0), not tumor — the project's premise, not a loading bug.
+
+**Not yet pulled from the best runs (port faithfully — see audit):**
+1. **series-CLS** — `rank_hinge_xmod_loss` (`brats2026/losses/contrastive.py`), weight 1.0, the
+   largest phase-0 term; needs scan-mate + cross-patient same-modality positives.
+2. **view-CLS** — 8-way BCE (3 spatial-ordering + 2 window + 3 rotation signs); needs
+   **paired-prism sampling** with rel_targets (`draw_paired_centers_prism_gpu`, window/rotation jitter).
+3. **Rotating GPU cache** + prefetch (scale beyond what fits resident); per-modality normalization
+   (MR z-score / CT HU windows) + window-jitter aug; brain-mask foreground; NaN/4D sanitize.
+
+**Then:** `eval/` (ET-from-T1 specificity probe + held-out ladder + ablate_source), CT/NLST loader,
+BraTS-MET for physiologic-enhancement specificity, longer runs on Betty/CUBIC.
 
 **Dropped (documented dead ends):** Sinkhorn / band matching (`band_ce`/`band_ot`/`dustbin`).
 
