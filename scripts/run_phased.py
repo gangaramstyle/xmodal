@@ -60,16 +60,15 @@ def main():
     cache.start_prefetch(workers=args.prefetch_workers, depth=8)
     val_bundles = [D.load_local_bundle(p, pid2dir[p], device=dev)[0] for p in val_pids[:args.val_patients]]
 
-    # 2.5D-only, multi-scale: slabs at 2/4/8/16 mm (fine -> coarse). 2.5D lets us pretrain on far
-    # more data (thick-slice / non-isotropic: OpenMIND / FOMO / RSNA) than 3D cubes would.
-    specs = {"slab4": S.slice_spec(4, 16), "slab8": S.slice_spec(8, 16), "slab16": S.slice_spec(16, 16)}
-    enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8), list(specs.values())).to(dev)
+    # 2.5D-only, MIXED multi-scale: per-patch physical size {4,8,16} mm + per-item prism {32,64,128} mm
+    # (TrainConfig defaults). One shared stem/heads; scale rides in via the per-patch size embedding.
+    enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
     cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count,
                         compile=not args.no_compile, ckpt_dir=args.ckpt_dir,
                         wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)
-    T.train_phased(enc, cache, val_bundles, specs, cfg, phases=phases, device=dev)
+    T.train_phased(enc, cache, val_bundles, {}, cfg, phases=phases, device=dev)
     cache.stop_prefetch()
 
 

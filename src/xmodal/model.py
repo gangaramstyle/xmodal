@@ -34,6 +34,7 @@ class EncoderConfig:
     n_series: int = 8
     n_registers: int = 4
     decoder_depth: int = 4
+    patch_voxels: int = 16            # 2.5D slab sample grid (V,V,1); physical size is per-patch (size embed)
     rope_lambda_min_mm: float = 2.0
     rope_lambda_max_mm: float = 1024.0
 
@@ -129,17 +130,19 @@ class Phase0Encoder(nn.Module):
     (`forward_mae`), cross-modal recon+matching (`forward_cross`), latent cross-prediction
     (`forward_cross_latent`)."""
 
-    def __init__(self, cfg: EncoderConfig, patch_specs):
+    def __init__(self, cfg: EncoderConfig, patch_specs=None):
         super().__init__()
         self.cfg = cfg
         self.head_dim = cfg.width // cfg.heads
-        # per-spec patch embedding (Conv3d kernel = spec.voxels -> one token) + pixel head
-        self.stem = nn.ModuleDict({
-            s.key: nn.Conv3d(1, cfg.width, tuple(s.voxels), stride=tuple(s.voxels)) for s in patch_specs
-        })
-        self.pixel_head = nn.ModuleDict({
-            s.key: nn.Linear(cfg.width, int(np.prod(s.voxels))) for s in patch_specs
-        })
+        # SINGLE shared stem/heads: every patch is a 2.5D V×V×1 grid regardless of physical size, so
+        # one Conv3d stem + one pixel head + one color head handle all sizes. Physical scale rides
+        # along as a per-patch SIZE EMBEDDING (MLP of size in mm), added to the token + decoder query.
+        V = cfg.patch_voxels
+        self.grid = (V, V, 1)
+        self.pv = V * V
+        self.stem = nn.Conv3d(1, cfg.width, self.grid, stride=self.grid)
+        self.size_embed = nn.Sequential(nn.Linear(1, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
+        self.pixel_head = nn.Linear(cfg.width, self.pv)
         # cross-modal decoder fuses each patch encoding with its (frozen-teacher) series-CLS so the
         # decoder can tell sources apart (no series_embed lookup — series identity is the CLS output).
         self.fuse = nn.Sequential(nn.Linear(2 * cfg.width, cfg.width), nn.GELU(),
@@ -153,24 +156,27 @@ class Phase0Encoder(nn.Module):
         # cross-modal decoder + heads
         self.decoder = nn.ModuleList(CrossAttentionBlock(cfg) for _ in range(cfg.decoder_depth))
         self.query_seed = nn.Parameter(torch.zeros(cfg.width))
-        self.dec_pixel_head = nn.ModuleDict({
-            s.key: nn.Linear(cfg.width, int(np.prod(s.voxels))) for s in patch_specs})
+        self.dec_pixel_head = nn.Linear(cfg.width, self.pv)
         self.match_slot_proj = nn.Linear(cfg.width, cfg.width)
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
-        self.color_head = nn.ModuleDict({s.key: ColorHead(cfg.width, s.voxels) for s in patch_specs})
+        self.color_head = ColorHead(cfg.width, self.grid)
         self.latent_head = nn.Linear(cfg.width, cfg.width)
         # view-CLS head: 3 spatial-ordering + 2 window signs (rotation dropped) = 5-way BCE
         self.rel_view_head = nn.Sequential(nn.Linear(2 * cfg.width, cfg.width), nn.GELU(),
                                            nn.Linear(cfg.width, 5))
 
-    def embed(self, patches, spec_key, series_idx=None):
-        """patches [B,n,v0,v1,v2] -> tokens [B,n,W]. NO series_embed added — series identity is
-        *learned* into the series-CLS token from content, not injected into every patch token
-        (else series-CLS is trivialized). Conditioning happens later via the series-CLS output.
-        `series_idx` kept for call-site compatibility but ignored (see PHASED_DESIGN.md)."""
+    def _size_emb(self, sizes):
+        """Per-patch physical size (mm) [B,k] -> additive size embedding [B,k,W]."""
+        return self.size_embed(sizes[..., None])
+
+    def embed(self, patches, sizes):
+        """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n] -> tokens [B,n,W]. Single stem (all patches
+        are V×V×1 grids regardless of physical size); physical scale rides in via the additive size
+        embedding. NO series_embed — series identity is learned into the series-CLS token, not injected
+        per patch (else series-CLS is trivialized)."""
         B, n = patches.shape[:2]
-        fmap = self.stem[spec_key](patches.reshape(B * n, 1, *patches.shape[2:]))
-        return fmap.reshape(B, n, self.cfg.width)
+        tok = self.stem(patches.reshape(B * n, 1, *patches.shape[2:])).reshape(B, n, self.cfg.width)
+        return tok + self._size_emb(sizes).to(tok.dtype)
 
     def encode(self, tokens, coords):
         """tokens [B,T,W] with matching coords [B,T,3] (CLS/regs use coord 0) -> [B,T,W]."""
@@ -180,11 +186,11 @@ class Phase0Encoder(nn.Module):
             x = blk(x, cos, sin)
         return self.norm(x)
 
-    def forward_mae(self, patches, coords, spec, series_idx, *, mask_ratio=0.5):
-        """Masked patch reconstruction. patches [B,n,v0,v1,v2], coords [B,n,3]."""
+    def forward_mae(self, patches, coords, sizes, *, mask_ratio=0.5):
+        """Masked patch reconstruction (encoder pixel head). patches [B,n,V,V,1], coords/sizes [B,n]."""
         B, n = patches.shape[:2]
         dev = patches.device
-        tok = self.embed(patches, spec.key, series_idx)                       # [B,n,W]
+        tok = self.embed(patches, sizes)                                     # [B,n,W]
         mask = torch.rand(B, n, device=dev) < mask_ratio                      # [B,n] masked positions
         tok = torch.where(mask[..., None], self.mask_token, tok)
         cls = torch.stack([self.series_token, self.view_token])[None].expand(B, -1, -1)
@@ -194,7 +200,7 @@ class Phase0Encoder(nn.Module):
         cc = torch.cat([torch.zeros(B, nreg, 3, device=dev), coords], dim=1)
         x = self.encode(x, cc)
         patch_out = x[:, nreg:]                                               # [B,n,W]
-        recon = self.pixel_head[spec.key](patch_out)                         # [B,n,prod(voxels)]
+        recon = self.pixel_head(patch_out)                                   # [B,n,pv]
         target = patches.reshape(B, n, -1)
         loss = F.l1_loss(recon[mask], target[mask]) if mask.any() else recon.new_zeros(())
         return dict(loss=loss, series_cls=x[:, 0], view_cls=x[:, 1], n_masked=int(mask.sum()))
@@ -205,55 +211,56 @@ class Phase0Encoder(nn.Module):
         rest = patches.shape[2:]
         return patches.gather(1, idx.view(idx.shape[0], idx.shape[1], *([1] * len(rest))).expand(-1, -1, *rest))
 
-    def _readout(self, patches, coords, spec, *, mask_ratio):
+    def _readout(self, patches, coords, sizes, *, mask_ratio):
         """Encode a (masked) prism -> (series_repr[B,W], view_repr[B,W]) for the 2nd view's CLS heads."""
         B, n = patches.shape[:2]; dev = patches.device
-        tok = self.embed(patches, spec.key)
+        tok = self.embed(patches, sizes)
         mask = torch.rand(B, n, device=dev) < mask_ratio
         tok = torch.where(mask[..., None], self.mask_token, tok)
         toks, ccs = self._context([tok], [coords], dev, B)
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, 1]
 
-    def forward_self(self, patches, coords, spec, *, mask_ratio=0.5):
+    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5):
         """Self decoder task: hold out `mask_ratio` of patches; encode with them masked; the DECODER
         predicts the held-out pixels (MAE) AND matches held-out position <-> blind content (matching).
         Context = encoder output at VISIBLE positions only (held carry mask_token -> no content leak);
-        held (colors) are disjoint from the context. Returns mae, match, match_acc + CLS readouts."""
+        held (colors) are disjoint from the context. The query carries the held patch's SIZE (target
+        scale) via the size embedding. Returns mae, match, match_acc + CLS readouts."""
         B, n = patches.shape[:2]; dev = patches.device; W = self.cfg.width
         nreg = 2 + self.registers.shape[0]
         perm = torch.argsort(torch.rand(B, n, device=dev), dim=1)
         n_held = max(1, min(n - 1, int(round(n * mask_ratio))))
         held, vis = perm[:, :n_held], perm[:, n_held:]
-        tok = self.embed(patches, spec.key)
+        tok = self.embed(patches, sizes)
         tok = tok.scatter(1, held[..., None].expand(-1, -1, W), self.mask_token.to(tok.dtype).expand(B, n_held, W))
         x = self.encode(*self._context([tok], [coords], dev, B))
         patch_enc = x[:, nreg:]
         vis_ctx = self._gather(patch_enc, vis, W); vis_coords = self._gather(coords, vis, 3)
         ctx, cc = self._context([vis_ctx], [vis_coords], dev, B)               # decoder context = visible only
         held_coords = self._gather(coords, held, 3)
-        query = self.query_seed[None, None, :].expand(B, n_held, W).contiguous()
+        held_sizes = sizes.gather(1, held)                                     # [B,n_held]
+        query = (self.query_seed[None, None, :] + self._size_emb(held_sizes)).contiguous()   # position + target scale
         query = self._decode(query, ctx, cc, held_coords)
-        pv = int(np.prod(spec.voxels))
-        held_patches = self._gather_patches(patches, held)                     # [B,n_held,v,v,v]
-        recon = self.dec_pixel_head[spec.key](query)
-        mae = F.l1_loss(recon, held_patches.reshape(B, n_held, pv))
+        held_patches = self._gather_patches(patches, held)                     # [B,n_held,V,V,1]
+        recon = self.dec_pixel_head(query)
+        mae = F.l1_loss(recon, held_patches.reshape(B, n_held, self.pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
-        colors = F.normalize(self.color_head[spec.key](held_patches), dim=-1)
+        colors = F.normalize(self.color_head(held_patches), dim=-1)
         m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
         return dict(mae=mae, match=m_loss, match_acc=m_met["match_acc"],
                     series_repr=x[:, 0], view_repr=x[:, 1],
                     recon=recon.detach(), held_patches=held_patches.detach(),   # viz: predicted vs truth pixels
                     slots=slots.detach(), colors=colors.detach())               # viz: match assignment
 
-    def forward_phase0(self, batch, spec, *, mask_ratio=0.5, mae_weight=0.25, match_weight=1.0,
+    def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, mae_weight=0.25, match_weight=1.0,
                        series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
         """Phase-0 self: decoder MAE + matching (view a) + series-CLS (rank_hinge_xmod) + view-CLS
-        (5-way BCE) across views a,b."""
+        (5-way BCE) across views a,b. `spec` is unused (size is per-patch) — kept for call compat."""
         from xmodal.losses import rank_hinge_xmod_loss
-        out = self.forward_self(batch["patches_a"], batch["coords_a"], spec, mask_ratio=mask_ratio)
+        out = self.forward_self(batch["patches_a"], batch["coords_a"], batch["sizes_a"], mask_ratio=mask_ratio)
         sa, va = out["series_repr"], out["view_repr"]
-        sb, vb = self._readout(batch["patches_b"], batch["coords_b"], spec, mask_ratio=mask_ratio)
+        sb, vb = self._readout(batch["patches_b"], batch["coords_b"], batch["sizes_b"], mask_ratio=mask_ratio)
         series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)
         rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
         rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
@@ -285,20 +292,20 @@ class Phase0Encoder(nn.Module):
         ccs = torch.cat([torch.zeros(B, nreg, 3, device=device), *coords_and], dim=1)
         return toks, ccs
 
-    def _encode_prism(self, patches, coords, series, spec):
-        """Teacher encode: full prism of one modality -> per-patch latents [B,n,W]."""
+    def _encode_prism(self, patches, coords, sizes):
+        """Online/teacher encode: full prism of one modality -> per-patch latents [B,n,W]."""
         B, n = patches.shape[:2]
         nreg = 2 + self.registers.shape[0]
-        toks, ccs = self._context([self.embed(patches, spec.key, series)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes)], [coords], patches.device, B)
         return self.encode(toks, ccs)[:, nreg:]
 
-    def teacher_readout(self, patches, coords, spec):
+    def teacher_readout(self, patches, coords, sizes):
         """One (frozen-teacher) encoder pass -> (series_cls [B,W], patch_latents [B,n,W]). The
         series_cls is the stable per-prism series descriptor that conditions the decoder; the
         patch_latents are the target for the latent phase."""
         B = patches.shape[0]
         nreg = 2 + self.registers.shape[0]
-        toks, ccs = self._context([self.embed(patches, spec.key)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes)], [coords], patches.device, B)
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, nreg:]
 
@@ -312,54 +319,55 @@ class Phase0Encoder(nn.Module):
             query = blk(query, ctx, rec_coords, cc)
         return query
 
-    def forward_cross(self, source_patches, target_patches, coords, spec, src_series_cls, tgt_series_cls,
+    def forward_cross(self, source_patches, target_patches, coords, sizes, src_series_cls, tgt_series_cls,
                       *, anchor_frac=0.05, objective="both", match_weight=1.0):
-        """Cross-modal. Online-encode source + target per-series; decoder context = fused(source, its
-        series-CLS) [all positions] + fused(target anchors, its series-CLS) [few, disjoint from the
-        masked recon]; queries = position + target series-CLS. Predict held-out target patches (pixel
+        """Cross-modal. Online-encode source + target; decoder context = fused(source, its series-CLS)
+        [all positions] + fused(target anchors, its series-CLS) [few, disjoint from the masked recon];
+        queries = position + target series-CLS + target SIZE. Predict held-out target patches (pixel
         MAE) and match position<->blind-content. `src/tgt_series_cls` [B,W] come from the FROZEN
-        teacher (stable conditioner)."""
+        teacher (stable conditioner); `sizes` [B,n] are the shared source/target per-patch sizes."""
         B, n = source_patches.shape[:2]; dev = source_patches.device; W = self.cfg.width
         anchor, recon = self._split(B, n, anchor_frac, dev); n_recon = recon.shape[1]
-        src_enc = self._encode_prism(source_patches, coords, None, spec)             # online [B,n,W]
-        tgt_enc = self._encode_prism(target_patches, coords, None, spec)
+        src_enc = self._encode_prism(source_patches, coords, sizes)                  # online [B,n,W]
+        tgt_enc = self._encode_prism(target_patches, coords, sizes)
         src_fused = self.fuse_series(src_enc, src_series_cls)                        # all source (context)
         anc_fused = self.fuse_series(self._gather(tgt_enc, anchor, W), tgt_series_cls)  # few target anchors
         rec_coords = self._gather(coords, recon, 3); anc_coords = self._gather(coords, anchor, 3)
         ctx, cc = self._context([src_fused, anc_fused], [coords, anc_coords], dev, B)
-        query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :]).expand(B, n_recon, W).contiguous()
+        rec_sizes = sizes.gather(1, recon)                                          # [B,n_recon] target scale
+        query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :] + self._size_emb(rec_sizes)).contiguous()
         query = self._decode(query, ctx, cc, rec_coords)
-        pv = int(np.prod(spec.voxels))
-        tgt_recon = self._gather(target_patches.reshape(B, n, -1), recon, pv)        # disjoint from anchors
+        tgt_recon = self._gather(target_patches.reshape(B, n, -1), recon, self.pv)   # disjoint from anchors
         zero = query.new_zeros(())
-        pred = self.dec_pixel_head[spec.key](query)
+        pred = self.dec_pixel_head(query)
         mae = F.l1_loss(pred, tgt_recon) if objective in ("mae", "both") else zero
         match_acc = 0.0
         if objective in ("match", "both"):
             slots = F.normalize(self.match_slot_proj(query), dim=-1)
-            colors = F.normalize(self.color_head[spec.key](tgt_recon.reshape(B, n_recon, *spec.voxels)), dim=-1)
+            colors = F.normalize(self.color_head(tgt_recon.reshape(B, n_recon, *self.grid)), dim=-1)
             m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
             match_acc = m_met["match_acc"]
             loss = mae + match_weight * m_loss if objective == "both" else m_loss
         else:
             loss = mae
-        src_recon = self._gather(source_patches.reshape(B, n, -1), recon, pv)         # viz: source modality @ predicted positions
+        src_recon = self._gather(source_patches.reshape(B, n, -1), recon, self.pv)   # viz: source @ predicted positions
         return dict(loss=loss, mae=mae.detach(), match_acc=match_acc, n_recon=n_recon, n_anchor=int(anchor.shape[1]),
                     pred=pred.detach(), tgt_recon=tgt_recon.detach(), src_recon=src_recon.detach())
 
-    def forward_cross_latent(self, source_patches, target_patches, coords, spec, src_series_cls,
+    def forward_cross_latent(self, source_patches, target_patches, coords, sizes, src_series_cls,
                              tgt_series_cls, tgt_latents, *, anchor_frac=0.05):
         """Latent phase: same wiring as forward_cross, but the target is the FROZEN teacher's
         per-patch target latents (`tgt_latents` [B,n,W]) instead of pixels. Loss = 1 - cosine."""
         B, n = source_patches.shape[:2]; dev = source_patches.device; W = self.cfg.width
         anchor, recon = self._split(B, n, anchor_frac, dev); n_recon = recon.shape[1]
-        src_enc = self._encode_prism(source_patches, coords, None, spec)
-        tgt_enc = self._encode_prism(target_patches, coords, None, spec)
+        src_enc = self._encode_prism(source_patches, coords, sizes)
+        tgt_enc = self._encode_prism(target_patches, coords, sizes)
         src_fused = self.fuse_series(src_enc, src_series_cls)
         anc_fused = self.fuse_series(self._gather(tgt_enc, anchor, W), tgt_series_cls)
         rec_coords = self._gather(coords, recon, 3); anc_coords = self._gather(coords, anchor, 3)
         ctx, cc = self._context([src_fused, anc_fused], [coords, anc_coords], dev, B)
-        query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :]).expand(B, n_recon, W).contiguous()
+        rec_sizes = sizes.gather(1, recon)
+        query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :] + self._size_emb(rec_sizes)).contiguous()
         query = self._decode(query, ctx, cc, rec_coords)
         tgt = self._gather(tgt_latents, recon, W)
         cos = (F.normalize(self.latent_head(query), dim=-1) * F.normalize(tgt, dim=-1)).sum(-1)

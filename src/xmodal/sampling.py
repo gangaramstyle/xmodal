@@ -283,16 +283,15 @@ def apply_window_jitter(patches, *, center_std, width_log_std):
     return jittered, torch.cat([center.flatten(1), log_width.flatten(1)], dim=1)
 
 
-def sample_paired_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device,
+def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
+                        prism_choices=(32., 64., 128.), rng, device,
                         pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1):
-    """Phase-0 paired-view batch (for series-CLS + view-CLS). Per item: two prisms (a, b) from
-    one scan whose anchors sit ~log-uniform(pair_dist_min,max) apart. Grouped by scan (one
-    grid_sample per scan per view). Returns patches_a/_b [B,n,...], coords_a/_b [B,n,3],
-    rel_targets [B,5] (3 spatial-sign + 2 window-sign), series [B], patient [B]."""
+    """Phase-0 paired-view batch (for series-CLS + view-CLS). Per item: two prisms (a, b) from one
+    scan whose anchors sit ~log-uniform(pair_dist_min,max) apart. MIXED-size patches (per-patch size
+    from `patch_sizes`) and a per-item prism scale (from `prism_choices`). Returns patches_a/_b
+    [B,n,V,V,1], coords_a/_b [B,n,3], sizes_a/_b [B,n] (mm), rel_targets [B,5], series [B], patient [B]."""
     import torch
     from collections import defaultdict
-    prism = tuple(prism_mm) if not np.isscalar(prism_mm) else (float(prism_mm),) * 3
-    half = torch.as_tensor(prism, device=device, dtype=torch.float32) / 2.0
     n = token_count
     refs = []
     while len(refs) < batch_size:
@@ -302,11 +301,13 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_spec, prism_m
     for k, r in enumerate(refs):
         groups[r].append(k)
     pa = [None] * batch_size; pb = [None] * batch_size; ca = [None] * batch_size; cb = [None] * batch_size
+    za = [None] * batch_size; zb = [None] * batch_size
     spat = [None] * batch_size; ser = [0] * batch_size; pat = [0] * batch_size
     for (bi, m), ks in groups.items():
         sc = bundles[bi][m]; G = len(ks); fg = sc.foreground_mm; Mf = fg.shape[0]
-        off = patch_offsets_tensor(patch_spec, thick_axis=sc.thick_axis, device=device)
-        anchors_a = fg[torch.randint(Mf, (G,), device=device)]                          # [G,3]
+        unit = slab_unit_offsets(sc.thick_axis, voxels, device)
+        half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1] per item
+        anchors_a = fg[torch.randint(Mf, (G,), device=device)]                           # [G,3]
         d = np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max), size=G)).astype(np.float32)
         dt = torch.as_tensor(d, device=device)
         dvec = (fg[None] - anchors_a[:, None]).norm(dim=-1)                              # [G,M]
@@ -316,13 +317,15 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_spec, prism_m
         anchors_b = fg[torch.multinomial(band + add, 1)[:, 0]]                           # [G,3]
         ctr_a = anchors_a[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
         ctr_b = anchors_b[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
-        va = (off[None, None] + ctr_a[:, :, None, None, None, :] - sc.affine_trans) @ sc.affine_inv.T
-        vb = (off[None, None] + ctr_b[:, :, None, None, None, :] - sc.affine_trans) @ sc.affine_inv.T
-        pat_a = sample_patches_group(sc.volume, va); pat_b = sample_patches_group(sc.volume, vb)
+        sizes_a = draw_patch_sizes(rng, G, n, patch_sizes, device)                       # [G,n]
+        sizes_b = draw_patch_sizes(rng, G, n, patch_sizes, device)
+        pat_a = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_a, sizes_a, unit))
+        pat_b = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_b, sizes_b, unit))
         st = (anchors_b - anchors_a > 0).float()                                         # [G,3]
         for gi, k in enumerate(ks):
             pa[k], pb[k] = pat_a[gi], pat_b[gi]
             ca[k] = ctr_a[gi] - anchors_a[gi][None]; cb[k] = ctr_b[gi] - anchors_b[gi][None]
+            za[k], zb[k] = sizes_a[gi], sizes_b[gi]
             spat[k] = st[gi]; ser[k] = sc.series_idx; pat[k] = bi
     Pa = torch.stack(pa).float(); Pb = torch.stack(pb).float()
     Pa, ta = apply_window_jitter(Pa, center_std=win_center_std, width_log_std=win_width_log_std)
@@ -330,18 +333,18 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_spec, prism_m
     win_t = (tb - ta > 0).float()                                                        # [B,2]
     rel = torch.cat([torch.stack(spat), win_t], dim=1)                                   # [B,5]
     return dict(patches_a=Pa, patches_b=Pb, coords_a=torch.stack(ca).float(), coords_b=torch.stack(cb).float(),
+                sizes_a=torch.stack(za).float(), sizes_b=torch.stack(zb).float(),
                 rel_targets=rel, series=torch.tensor(ser, device=device, dtype=torch.long),
                 patient=torch.tensor(pat, device=device, dtype=torch.long))
 
 
-def sample_self_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device):
+def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
+                      prism_choices=(32., 64., 128.), rng, device):
     """Phase-0 (self) batch: one bag of patches per item from a single random scan. Vectorized
-    (grouped by scan). `prism_mm` may be non-cubic (variable aspect ratio); `patch_spec` may be
-    a 2.5D slab. Returns patches [B,n,v0,v1,v2], coords [B,n,3], series [B]."""
+    (grouped by scan). Mixed-size patches + per-item prism scale. Returns patches [B,n,V,V,1],
+    coords [B,n,3], sizes [B,n] (mm), series [B]."""
     import torch
     from collections import defaultdict
-    prism = tuple(prism_mm) if not np.isscalar(prism_mm) else (float(prism_mm),) * 3
-    half = torch.as_tensor(prism, device=device, dtype=torch.float32) / 2.0
     n = token_count
     refs = []
     while len(refs) < batch_size:
@@ -350,31 +353,31 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm,
     groups = defaultdict(list)
     for k, r in enumerate(refs):
         groups[r].append(k)
-    patch_l = [None] * batch_size; coord_l = [None] * batch_size; ser = [0] * batch_size
+    patch_l = [None] * batch_size; coord_l = [None] * batch_size; size_l = [None] * batch_size; ser = [0] * batch_size
     for (bi, m), ks in groups.items():
         sc = bundles[bi][m]; G = len(ks)
-        off = patch_offsets_tensor(patch_spec, thick_axis=sc.thick_axis, device=device)
+        unit = slab_unit_offsets(sc.thick_axis, voxels, device)
+        half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1]
         M = sc.foreground_mm.shape[0]
         anchors = sc.foreground_mm[torch.randint(M, (G,), device=device)]
         centers = anchors[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
         coords = centers - anchors[:, None]
-        vox = (off[None, None] + centers[:, :, None, None, None, :] - sc.affine_trans) @ sc.affine_inv.T
-        p = sample_patches_group(sc.volume, vox)
+        sizes = draw_patch_sizes(rng, G, n, patch_sizes, device)                         # [G,n]
+        p = sample_patches_group(sc.volume, mixed_bag_vox(sc, centers, sizes, unit))
         for gi, k in enumerate(ks):
-            patch_l[k], coord_l[k], ser[k] = p[gi], coords[gi], sc.series_idx
+            patch_l[k], coord_l[k], size_l[k], ser[k] = p[gi], coords[gi], sizes[gi], sc.series_idx
     return dict(patches=torch.stack(patch_l).float(), coords=torch.stack(coord_l).float(),
-                series=torch.tensor(ser, device=device, dtype=torch.long))
+                sizes=torch.stack(size_l).float(), series=torch.tensor(ser, device=device, dtype=torch.long))
 
 
-def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_spec, prism_mm, rng, device,
-                           pairs_per_patient=1):
-    """Vectorized `sample_cross_batch`: items sharing a (bundle, source, target) are drawn and
-    gathered together — one batched anchor/center draw and ONE `grid_sample` per group per
-    modality, instead of per-item kernels. Same output contract as `sample_cross_batch`."""
+def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
+                           prism_choices=(32., 64., 128.), rng, device, pairs_per_patient=1):
+    """Vectorized cross-modal batch: items sharing a (bundle, source, target) are drawn and gathered
+    together (one batched draw + ONE grid_sample per group per modality). Mixed-size patches (same
+    per-patch sizes + centers for source & target so they stay co-registered), per-item prism scale.
+    Returns source/target [B,n,V,V,1], coords [B,n,3], sizes [B,n] (mm), src/tgt series [B]."""
     import torch
     from collections import defaultdict
-    prism = tuple(prism_mm) if not np.isscalar(prism_mm) else (float(prism_mm),) * 3
-    half = torch.as_tensor(prism, device=device, dtype=torch.float32) / 2.0
     n = token_count
 
     items = []                                     # (bundle_idx, src_mod, tgt_mod)
@@ -394,27 +397,27 @@ def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_spec, pris
         groups[it].append(k)
 
     src_p = [None] * batch_size; tgt_p = [None] * batch_size; coord_l = [None] * batch_size
-    ssrc = [0] * batch_size; stgt = [0] * batch_size
+    size_l = [None] * batch_size; ssrc = [0] * batch_size; stgt = [0] * batch_size
     for (bi, sm, tm), ks in groups.items():
         s = bundles[bi][sm]; t = bundles[bi][tm]; G = len(ks)
-        off_s = patch_offsets_tensor(patch_spec, thick_axis=s.thick_axis, device=device)
-        off_t = patch_offsets_tensor(patch_spec, thick_axis=t.thick_axis, device=device)
+        unit_s = slab_unit_offsets(s.thick_axis, voxels, device)
+        unit_t = slab_unit_offsets(t.thick_axis, voxels, device)
+        half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1]
         M = s.foreground_mm.shape[0]
         anchors = s.foreground_mm[torch.randint(M, (G,), device=device)]                 # [G,3]
         centers = anchors[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half  # [G,n,3]
         coords = centers - anchors[:, None]
-        # grouped world-mm -> voxel: [G,n,v0,v1,v2,3]
-        vox_s = (off_s[None, None] + centers[:, :, None, None, None, :] - s.affine_trans) @ s.affine_inv.T
-        vox_t = (off_t[None, None] + centers[:, :, None, None, None, :] - t.affine_trans) @ t.affine_inv.T
-        ps = sample_patches_group(s.volume, vox_s)                                        # [G,n,v0,v1,v2]
-        pt = sample_patches_group(t.volume, vox_t)
+        sizes = draw_patch_sizes(rng, G, n, patch_sizes, device)                         # [G,n] shared src/tgt
+        ps = sample_patches_group(s.volume, mixed_bag_vox(s, centers, sizes, unit_s))    # [G,n,V,V,1]
+        pt = sample_patches_group(t.volume, mixed_bag_vox(t, centers, sizes, unit_t))
         for gi, k in enumerate(ks):
-            src_p[k], tgt_p[k], coord_l[k] = ps[gi], pt[gi], coords[gi]
+            src_p[k], tgt_p[k], coord_l[k], size_l[k] = ps[gi], pt[gi], coords[gi], sizes[gi]
             ssrc[k], stgt[k] = s.series_idx, t.series_idx
     return dict(
         source=torch.stack(src_p).float(),
         target=torch.stack(tgt_p).float(),
         coords=torch.stack(coord_l).float(),
+        sizes=torch.stack(size_l).float(),
         source_series=torch.tensor(ssrc, device=device, dtype=torch.long),
         target_series=torch.tensor(stgt, device=device, dtype=torch.long),
     )

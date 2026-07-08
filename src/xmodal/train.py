@@ -62,6 +62,9 @@ class TrainConfig:
     match_weight: float = 1.0         # matching vs pixel weight inside forward_cross
     anchor_frac: float = 0.05
     pairs_per_patient: int = 6
+    # mixed-size 2.5D sampling (categorical): per-patch physical size + per-item prism extent (mm)
+    patch_sizes: tuple = (4.0, 8.0, 16.0)
+    prism_choices: tuple = (32.0, 64.0, 128.0)
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -97,14 +100,12 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
             log(f"[wandb] disabled: {e}"); wb = None
 
     def draw(bundles):
-        spec = spec_list[rng.integers(len(spec_list))]
-        prism = tuple(float(x) for x in rng.uniform(cfg.prism_lo, cfg.prism_hi, size=3))
-        b = S.sample_paired_batch(bundles, batch_size=cfg.batch_size, token_count=cfg.token_count,
-                                  patch_spec=spec, prism_mm=prism, rng=rng, device=device)
-        return b, spec
+        return S.sample_paired_batch(bundles, batch_size=cfg.batch_size, token_count=cfg.token_count,
+                                     patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
+                                     rng=rng, device=device)
 
-    def phase0(b, spec):
-        return model.forward_phase0(b, spec, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
+    def phase0(b):
+        return model.forward_phase0(b, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
                                     series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
                                     rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
 
@@ -112,9 +113,9 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
     def validate():
         model.eval(); maes = []; accs = []
         for _ in range(cfg.val_iters):
-            b, spec = draw(val_bundles)
+            b = draw(val_bundles)
             with torch.autocast(**amp):
-                out = phase0(b, spec)
+                out = phase0(b)
             maes.append(float(out["mae"])); accs.append(out["rel_acc"])
         model.train(); return np.mean(maes), np.mean(accs)
 
@@ -128,9 +129,9 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
-        b, spec = draw(train_bundles.resident() if _is_cache else train_bundles)
+        b = draw(train_bundles.resident() if _is_cache else train_bundles)
         with torch.autocast(**amp):
-            out = phase0(b, spec)
+            out = phase0(b)
             total = out["loss"]
         opt.zero_grad(set_to_none=True)
         total.backward()
@@ -202,26 +203,24 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
         return train_source.resident() if is_cache else train_source
 
     def paired(bnd):
-        sp = spec_list[rng.integers(len(spec_list))]
-        prism = tuple(float(x) for x in rng.uniform(cfg.prism_lo, cfg.prism_hi, size=3))
+        # mixed-size 2.5D: per-patch sizes {4,8,16} mm + per-item prism {32,64,128} mm (sampler defaults)
         return S.sample_paired_batch(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
-                                     patch_spec=sp, prism_mm=prism, rng=rng, device=device), sp
+                                     patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
+                                     rng=rng, device=device)
 
     def crossb(bnd):
-        sp = spec_list[rng.integers(len(spec_list))]
-        prism = tuple(float(x) for x in rng.uniform(cfg.prism_lo, cfg.prism_hi, size=3))
         return S.sample_cross_batch_vec(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
-                                        patch_spec=sp, prism_mm=prism, rng=rng, device=device,
-                                        pairs_per_patient=cfg.pairs_per_patient), sp
+                                        patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
+                                        rng=rng, device=device, pairs_per_patient=cfg.pairs_per_patient)
 
-    def teach(b, sp, want_latent=False):
+    def teach(b, want_latent=False):
         with torch.no_grad(), torch.autocast(**amp):
-            s_scls, _ = teacher.teacher_readout(b["source"], b["coords"], sp)
-            t_scls, t_lat = teacher.teacher_readout(b["target"], b["coords"], sp)
+            s_scls, _ = teacher.teacher_readout(b["source"], b["coords"], b["sizes"])
+            t_scls, t_lat = teacher.teacher_readout(b["target"], b["coords"], b["sizes"])
         return s_scls.float(), t_scls.float(), (t_lat.float() if want_latent else None)
 
-    def phase0(b, sp):
-        return model.forward_phase0(b, sp, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
+    def phase0(b):
+        return model.forward_phase0(b, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
                                     match_weight=cfg.match_weight, series_weight=cfg.series_weight,
                                     rel_spatial_weight=cfg.rel_spatial_weight,
                                     rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
@@ -230,9 +229,9 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
     def validate():
         model.eval(); maes = []; accs = []
         for _ in range(cfg.val_iters):
-            b, sp = paired(val_bundles)
+            b = paired(val_bundles)
             with torch.autocast(**amp):
-                o = phase0(b, sp)
+                o = phase0(b)
             maes.append(float(o["mae"])); accs.append(o["rel_acc"])
         model.train(); return float(np.mean(maes)), float(np.mean(accs))
 
@@ -250,20 +249,20 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             for g in opt.param_groups:
                 g["lr"] = lr
             with torch.autocast(**amp):
-                b0, sp0 = paired(pool())
-                out0 = phase0(b0, sp0)
+                b0 = paired(pool())
+                out0 = phase0(b0)
                 loss = out0["loss"]
                 m = dict(mae=float(out0["mae"]), match=float(out0["match"]), series=float(out0["series"]),
                          rel_acc=out0["rel_acc"], self_match_acc=out0["match_acc"], series_viol=out0["series_viol"])
                 if pname == "cross":
-                    bc, spc = crossb(pool()); s_scls, t_scls, _ = teach(bc, spc)
-                    outc = model.forward_cross(bc["source"], bc["target"], bc["coords"], spc, s_scls, t_scls,
+                    bc = crossb(pool()); s_scls, t_scls, _ = teach(bc)
+                    outc = model.forward_cross(bc["source"], bc["target"], bc["coords"], bc["sizes"], s_scls, t_scls,
                                                objective="both", anchor_frac=cfg.anchor_frac, match_weight=cfg.match_weight)
                     loss = loss + cfg.cross_weight * outc["loss"]
                     m.update(cross_mae=float(outc["mae"]), match_acc=outc["match_acc"])
                 elif pname == "latent":
-                    bc, spc = crossb(pool()); s_scls, t_scls, t_lat = teach(bc, spc, want_latent=True)
-                    outc = model.forward_cross_latent(bc["source"], bc["target"], bc["coords"], spc,
+                    bc = crossb(pool()); s_scls, t_scls, t_lat = teach(bc, want_latent=True)
+                    outc = model.forward_cross_latent(bc["source"], bc["target"], bc["coords"], bc["sizes"],
                                                       s_scls, t_scls, t_lat, anchor_frac=cfg.anchor_frac)
                     loss = loss + cfg.cross_weight * outc["loss"]
                     m.update(latent_cos=outc["cos"])
