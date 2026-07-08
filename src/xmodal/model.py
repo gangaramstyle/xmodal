@@ -199,38 +199,68 @@ class Phase0Encoder(nn.Module):
         loss = F.l1_loss(recon[mask], target[mask]) if mask.any() else recon.new_zeros(())
         return dict(loss=loss, series_cls=x[:, 0], view_cls=x[:, 1], n_masked=int(mask.sum()))
 
-    # ---- phase-0 paired (MAE + series-CLS + view-CLS) --------------------------------
-    def encode_view(self, patches, coords, spec, series, *, mask_ratio):
-        """Encode one view -> (series_repr[B,W], view_repr[B,W], mae_loss)."""
+    # ---- phase-0 self: decoder MAE + matching + series-CLS + view-CLS -----------------
+    def _gather_patches(self, patches, idx):
+        """Gather patches [B,n,v0,v1,v2] at idx [B,k] -> [B,k,v0,v1,v2]."""
+        rest = patches.shape[2:]
+        return patches.gather(1, idx.view(idx.shape[0], idx.shape[1], *([1] * len(rest))).expand(-1, -1, *rest))
+
+    def _readout(self, patches, coords, spec, *, mask_ratio):
+        """Encode a (masked) prism -> (series_repr[B,W], view_repr[B,W]) for the 2nd view's CLS heads."""
         B, n = patches.shape[:2]; dev = patches.device
-        nreg = 2 + self.registers.shape[0]
-        tok = self.embed(patches, spec.key, series)
+        tok = self.embed(patches, spec.key)
         mask = torch.rand(B, n, device=dev) < mask_ratio
         tok = torch.where(mask[..., None], self.mask_token, tok)
         toks, ccs = self._context([tok], [coords], dev, B)
         x = self.encode(toks, ccs)
-        recon = self.pixel_head[spec.key](x[:, nreg:])
-        tgt = patches.reshape(B, n, -1)
-        mae = F.l1_loss(recon[mask], tgt[mask]) if mask.any() else x.new_zeros(())
-        return x[:, 0], x[:, 1], mae
+        return x[:, 0], x[:, 1]
 
-    def forward_phase0(self, batch, spec, *, mask_ratio=0.35, mae_weight=0.25, series_weight=1.0,
-                       rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
-        """Full phase-0: masked-MAE (both views) + series-CLS (rank_hinge_xmod) + view-CLS
-        (5-way BCE: 3 spatial + 2 window)."""
+    def forward_self(self, patches, coords, spec, *, mask_ratio=0.5):
+        """Self decoder task: hold out `mask_ratio` of patches; encode with them masked; the DECODER
+        predicts the held-out pixels (MAE) AND matches held-out position <-> blind content (matching).
+        Context = encoder output at VISIBLE positions only (held carry mask_token -> no content leak);
+        held (colors) are disjoint from the context. Returns mae, match, match_acc + CLS readouts."""
+        B, n = patches.shape[:2]; dev = patches.device; W = self.cfg.width
+        nreg = 2 + self.registers.shape[0]
+        perm = torch.argsort(torch.rand(B, n, device=dev), dim=1)
+        n_held = max(1, min(n - 1, int(round(n * mask_ratio))))
+        held, vis = perm[:, :n_held], perm[:, n_held:]
+        tok = self.embed(patches, spec.key)
+        tok = tok.scatter(1, held[..., None].expand(-1, -1, W), self.mask_token.expand(B, n_held, W))
+        x = self.encode(*self._context([tok], [coords], dev, B))
+        patch_enc = x[:, nreg:]
+        vis_ctx = self._gather(patch_enc, vis, W); vis_coords = self._gather(coords, vis, 3)
+        ctx, cc = self._context([vis_ctx], [vis_coords], dev, B)               # decoder context = visible only
+        held_coords = self._gather(coords, held, 3)
+        query = self.query_seed[None, None, :].expand(B, n_held, W).contiguous()
+        query = self._decode(query, ctx, cc, held_coords)
+        pv = int(np.prod(spec.voxels))
+        held_patches = self._gather_patches(patches, held)                     # [B,n_held,v,v,v]
+        mae = F.l1_loss(self.dec_pixel_head[spec.key](query), held_patches.reshape(B, n_held, pv))
+        slots = F.normalize(self.match_slot_proj(query), dim=-1)
+        colors = F.normalize(self.color_head[spec.key](held_patches), dim=-1)
+        m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
+        return dict(mae=mae, match=m_loss, match_acc=m_met["match_acc"],
+                    series_repr=x[:, 0], view_repr=x[:, 1])
+
+    def forward_phase0(self, batch, spec, *, mask_ratio=0.5, mae_weight=0.25, match_weight=1.0,
+                       series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
+        """Phase-0 self: decoder MAE + matching (view a) + series-CLS (rank_hinge_xmod) + view-CLS
+        (5-way BCE) across views a,b."""
         from xmodal.losses import rank_hinge_xmod_loss
-        sa, va, mae_a = self.encode_view(batch["patches_a"], batch["coords_a"], spec, batch["series"], mask_ratio=mask_ratio)
-        sb, vb, mae_b = self.encode_view(batch["patches_b"], batch["coords_b"], spec, batch["series"], mask_ratio=mask_ratio)
-        mae = 0.5 * (mae_a + mae_b)
+        out = self.forward_self(batch["patches_a"], batch["coords_a"], spec, mask_ratio=mask_ratio)
+        sa, va = out["series_repr"], out["view_repr"]
+        sb, vb = self._readout(batch["patches_b"], batch["coords_b"], spec, mask_ratio=mask_ratio)
         series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)
         rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
         rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
         spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()
-        total = (mae_weight * mae + series_weight * series_loss
+        total = (mae_weight * out["mae"] + match_weight * out["match"] + series_weight * series_loss
                  + rel_spatial_weight * spatial + rel_window_weight * window)
         with torch.no_grad():
             rel_acc = ((rel_logits > 0).float() == batch["rel_targets"]).float().mean()
-        return dict(loss=total, mae=mae.detach(), series=series_loss.detach(),
+        return dict(loss=total, mae=out["mae"].detach(), match=out["match"].detach(),
+                    match_acc=out["match_acc"], series=series_loss.detach(),
                     rel_spatial=spatial.detach(), rel_window=window.detach(),
                     rel_acc=float(rel_acc), series_viol=float(series_viol))
 

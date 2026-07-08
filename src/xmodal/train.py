@@ -222,7 +222,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
 
     def phase0(b, sp):
         return model.forward_phase0(b, sp, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
-                                    series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
+                                    match_weight=cfg.match_weight, series_weight=cfg.series_weight,
+                                    rel_spatial_weight=cfg.rel_spatial_weight,
                                     rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
 
     @torch.no_grad()
@@ -252,8 +253,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
                 b0, sp0 = paired(pool())
                 out0 = phase0(b0, sp0)
                 loss = out0["loss"]
-                m = dict(mae=float(out0["mae"]), series=float(out0["series"]),
-                         rel_acc=out0["rel_acc"], series_viol=out0["series_viol"])
+                m = dict(mae=float(out0["mae"]), match=float(out0["match"]), series=float(out0["series"]),
+                         rel_acc=out0["rel_acc"], self_match_acc=out0["match_acc"], series_viol=out0["series_viol"])
                 if pname == "cross":
                     bc, spc = crossb(pool()); s_scls, t_scls, _ = teach(bc, spc)
                     outc = model.forward_cross(bc["source"], bc["target"], bc["coords"], spc, s_scls, t_scls,
