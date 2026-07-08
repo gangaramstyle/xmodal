@@ -25,14 +25,24 @@ map of the old strains and the cleanup plan.
   **0.57 → 0.23** over 80 steps, 41 steps/s on the Blackwell. mm-RoPE positions tokens by
   physical-mm coords so any prism shape / patch size / 2.5D orientation just works.
 
-**Next (the cross-modal "both" path):**
-1. `models/` — mm-RoPE ViT encoder + cross-attention decoder + patch stem (lift from
-   `brats2026/models/{rope,vit,stem}`).
-2. `models/matching.py` — CLIP position→patch matching head (lift from `brats2026`).
-3. `train/` — one trainer: phase-0 self (view/series-CLS + patch-MAE) + cross `both`
-   (MAE + matching, `forward_cross`) + latent (`forward_cross_latent`).
-4. `eval/` — ET-from-T1 specificity probe + held-out ladder + `ablate_source`.
-5. `data/` — BraTS-HF loader (done inline in the molab notebook) + CT/NLST loader.
+**Phase-0 convergence (held-out patients) validated in molab:** 1500 steps, patient-disjoint
+holdout — val MAE **0.59 → 0.097**, tracking train (0.082) → learns generalizable structure,
+not memorization. 35 steps/s.
+
+**Done — cross-modal objectives (`model.forward_cross`, `model.forward_cross_latent`) + `xmodal/matching.py`:**
+- Cross-attention decoder; `forward_cross(objective='mae'|'match'|'both')` — source@recon +
+  target@anchor context → decode target at recon positions → pixel-MAE and/or CLIP
+  position→patch matching (blind `ColorHead` + symmetric-InfoNCE `slot_match_loss`).
+- `forward_cross_latent` — JEPA-style: predict frozen-teacher target latents (1 - cosine).
+- **Validated in molab** (35.3M params): cross-MAE **0.65 → 0.12**, match_acc rises to ~3×
+  chance and climbing, latent path runs.
+
+**Next:**
+1. `train.py` — a real trainer (rotating patient cache, curriculum over specs/prisms,
+   phase-0 → warm-start cross `both` → phase-4 latent), checkpointing, W&B.
+2. `eval/` — ET-from-T1 specificity probe + held-out ladder + `ablate_source`.
+3. `data/` — factor the BraTS-HF loader out of the notebook + add CT/NLST loader.
+4. Scale data (BraTS-MET for physiologic-enhancement specificity) + longer runs on Betty/CUBIC.
 
 **Dropped (documented dead ends):** Sinkhorn / band matching (`band_ce`/`band_ot`/`dustbin`).
 
