@@ -1,9 +1,12 @@
 """Data layer: BraTS (HF) loader + rotating GPU cache for datasets that exceed VRAM.
 
-The rotating cache (ported from brats2026/data/rotating_cache.py) keeps `size` patient bundles
-resident on the GPU; each slot has a jittered lifetime and only a small fraction of slots may
-refresh per step, so the resident set desynchronizes and turnover never stalls a step. Background
-prefetch threads decode the next volumes (nibabel releases the GIL) off the critical path.
+Key design for high GPU util under a rotating cache: **decode on CPU in background prefetch
+threads, place on the GPU on the main thread**. nibabel + numpy (decode, normalize, foreground)
+release/are-fine off the critical path; only the cheap H2D placement touches CUDA, and it happens
+on the training thread so it never contends with the compute stream. Refresh is rare (jittered
+lifetimes + capped per-step fraction), so the placement hitch is amortized over many steps.
+
+Ported from brats2026/data/rotating_cache.py, extended with the CPU-loader / GPU-placer split.
 """
 from __future__ import annotations
 
@@ -20,10 +23,6 @@ from xmodal import sampling as S
 
 T = TypeVar("T")
 
-# ---------------------------------------------------------------------------
-# BraTS-on-HF loader (factored out of the notebook)
-# ---------------------------------------------------------------------------
-
 BRATS_REPO = "Spirit-26/BraTS-2024-Complete"
 BRATS_SUFFIX = {"t1": "t1n", "t1c": "t1c", "t2": "t2w", "flair": "t2f"}
 BRATS_SERIES = {"t1": 0, "t1c": 1, "t2": 2, "flair": 3}
@@ -37,23 +36,62 @@ def discover_brats_patients(repo=BRATS_REPO, split="train", limit=None):
     return pats[:limit] if limit else pats
 
 
-def load_brats_bundle(pid, *, device, repo=BRATS_REPO, split="train", modalities=None):
-    """Load one BraTS patient -> {modality: CachedScan} on `device` (co-registered)."""
+# ---------------------------------------------------------------------------
+# CPU decode (background-safe) -> GPU placement (main thread)
+# ---------------------------------------------------------------------------
+
+def load_brats_cpu(pid, *, repo=BRATS_REPO, split="train", modalities=None,
+                   fg_thresh=0.02, max_fg=200_000):
+    """Decode one patient to a CPU payload (numpy). No CUDA — safe in a prefetch thread."""
     import nibabel as nib
     from huggingface_hub import hf_hub_download
     mods = modalities or list(BRATS_SUFFIX)
     base = f"BraTS-GLI/{split}/{pid}/{pid}-"
-    bundle = {}
+    out = {}
     for m in mods:
         img = nib.load(hf_hub_download(repo, base + BRATS_SUFFIX[m] + ".nii.gz", repo_type="dataset"))
-        vol = np.nan_to_num(img.get_fdata(), copy=False)                 # sanitize NaN/Inf
-        bundle[m] = S.to_device_scan(vol, img.affine, modality=m, series_idx=BRATS_SERIES[m],
-                                     patient=pid, device=device)
-    return bundle
+        vol = np.nan_to_num(np.ascontiguousarray(img.get_fdata(), dtype=np.float32), copy=False)
+        affine = np.asarray(img.affine, np.float32)
+        R, t = affine[:3, :3], affine[:3, 3]
+        thick, plane, spacing = S._thick_and_plane(R, None)
+        hi = float(vol.max()) or 1.0
+        vox = np.argwhere(vol > fg_thresh * hi).astype(np.float32)
+        if len(vox) == 0:
+            vox = np.argwhere(np.ones_like(vol)).astype(np.float32)
+        if len(vox) > max_fg:
+            vox = vox[np.random.default_rng(0).choice(len(vox), max_fg, replace=False)]
+        fg = (vox @ R.T + t).astype(np.float32)
+        keep = vol > fg_thresh * hi
+        lo, hiP = np.percentile(vol[keep], [0.5, 99.5]) if keep.any() else (0.0, hi)
+        voln = np.clip((vol - lo) / max(hiP - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+        out[m] = dict(volume=voln, affine_inv=np.linalg.inv(R).astype(np.float32),
+                      affine_trans=t.astype(np.float32), foreground_mm=fg, thick=int(thick),
+                      plane=int(plane), series=BRATS_SERIES[m], patient=pid, spacing=spacing)
+    return out
+
+
+def place_bundle(cpu_bundle, device):
+    """Move a CPU payload onto the GPU as {modality: CachedScan}. Cheap H2D; main-thread only."""
+    import torch
+    b = {}
+    for m, p in cpu_bundle.items():
+        b[m] = S.CachedScan(
+            volume=torch.as_tensor(p["volume"], device=device),
+            affine_inv=torch.as_tensor(p["affine_inv"], device=device),
+            affine_trans=torch.as_tensor(p["affine_trans"], device=device),
+            foreground_mm=torch.as_tensor(p["foreground_mm"], device=device),
+            thick_axis=p["thick"], plane_id=p["plane"], modality=m, series_idx=p["series"],
+            patient=p["patient"], spacing=p["spacing"])
+    return b
+
+
+def load_brats_bundle(pid, *, device, **kw):
+    """Convenience: decode + place in one call (main thread)."""
+    return place_bundle(load_brats_cpu(pid, **kw), device)
 
 
 # ---------------------------------------------------------------------------
-# Rotating GPU cache (ported from brats2026/data/rotating_cache.py)
+# Rotating GPU cache (CPU-loader / GPU-placer split)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -66,16 +104,19 @@ class CacheSlot(Generic[T]):
 
 
 class JitteredRotatingCache(Generic[T]):
-    """Bounded rotating cache with explicit lifetime jitter and capped per-step refresh."""
+    """Bounded rotating cache. `loader(key)` runs on prefetch threads (CPU-only, background);
+    `placer(raw)` runs on the main thread at warm/refresh (GPU placement). Jittered lifetimes +
+    capped per-step refresh keep turnover desynchronized and off the critical path."""
 
-    def __init__(self, keys, loader: Callable[[str], T], *, size, min_life=16, max_life=128,
-                 max_refresh_fraction=0.02, seed=0, warmup_log_every=0):
+    def __init__(self, keys, loader: Callable[[str], object], *, size, placer=None,
+                 min_life=64, max_life=256, max_refresh_fraction=0.02, seed=0, warmup_log_every=0):
         if not keys:
             raise ValueError("need at least one key")
         if not (0 < max_refresh_fraction <= 1):
             raise ValueError("max_refresh_fraction must be in (0, 1]")
         self.keys = list(keys)
         self.loader = loader
+        self.placer = placer or (lambda x: x)
         self.size = min(size, len(self.keys))
         self.min_life, self.max_life = min_life, max_life
         self.max_refresh_fraction = max_refresh_fraction
@@ -103,14 +144,13 @@ class JitteredRotatingCache(Generic[T]):
 
     def _load_slot(self):
         key = self._next_key()
-        return CacheSlot(value=self.loader(key), source_key=key, remaining_life=self._life())
+        return CacheSlot(value=self.placer(self.loader(key)), source_key=key, remaining_life=self._life())
 
     @property
     def max_refresh_per_step(self):
         return max(1, int(self.size * self.max_refresh_fraction))
 
     def resident(self):
-        """Current resident values (pass to the sampler each step)."""
         return [s.value for s in self.slots]
 
     def sample(self, rng=None):
@@ -118,7 +158,7 @@ class JitteredRotatingCache(Generic[T]):
         return self.slots[r.randrange(len(self.slots))].value
 
     def step(self):
-        """Age one step, refresh up to max_refresh_per_step expired slots. Returns #replaced."""
+        """Age one step; refresh up to max_refresh_per_step expired slots. Returns #replaced."""
         with self._lock:
             expired = []
             for idx, slot in enumerate(self.slots):
@@ -138,8 +178,8 @@ class JitteredRotatingCache(Generic[T]):
     def _replacement_slot(self):
         if self._prefetch_queue is not None:
             try:
-                key, value = self._prefetch_queue.get_nowait()
-                return CacheSlot(value=value, source_key=key, remaining_life=self._life())
+                key, raw = self._prefetch_queue.get_nowait()
+                return CacheSlot(value=self.placer(raw), source_key=key, remaining_life=self._life())
             except queue.Empty:
                 pass
         return self._load_slot()
@@ -153,10 +193,10 @@ class JitteredRotatingCache(Generic[T]):
         def run():
             while not self._stop:
                 key = self._next_key()
-                value = self.loader(key)
+                raw = self.loader(key)                    # CPU-only decode, background thread
                 while not self._stop:
                     try:
-                        self._prefetch_queue.put((key, value), timeout=0.1)
+                        self._prefetch_queue.put((key, raw), timeout=0.1)
                         break
                     except queue.Full:
                         time.sleep(0.01)
@@ -168,5 +208,5 @@ class JitteredRotatingCache(Generic[T]):
     def stop_prefetch(self):
         self._stop = True
         for w in self._workers:
-            w.join(timeout=0.2)
+            w.join(timeout=0.3)
         self._workers = []
