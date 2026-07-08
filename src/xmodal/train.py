@@ -238,9 +238,11 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
     log(f"phased run: {phases} | total {total} steps"); t0 = time.time()
     gstep = 0
     for pname, psteps in phases:
-        if pname != "self" and not teacher_ready:
-            teacher.load_state_dict(model.state_dict()); teacher.eval(); teacher_ready = True
-            log(f"[{pname}] snapshotted frozen teacher from step {gstep}")
+        if pname != "self":
+            # re-snapshot the teacher at EVERY phase boundary: frozen-self conditions cross,
+            # frozen-cross conditions latent (each phase continues off the previous one's weights).
+            teacher.load_state_dict(model.state_dict()); teacher.eval()
+            log(f"[{pname}] re-snapshotted frozen teacher from step {gstep}")
         for _ in range(psteps):
             gstep += 1
             lr = _cosine_warmup(gstep, total, cfg.lr, warmup)

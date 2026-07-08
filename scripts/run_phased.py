@@ -27,9 +27,9 @@ def main():
     ap.add_argument("--holdout-frac", type=float, default=0.1)
     ap.add_argument("--holdout-seed", type=int, default=0)
     ap.add_argument("--val-patients", type=int, default=16)
-    ap.add_argument("--self-steps", type=int, default=8000)
-    ap.add_argument("--cross-steps", type=int, default=8000)
-    ap.add_argument("--latent-steps", type=int, default=4000)
+    ap.add_argument("--self-steps", type=int, default=25000)
+    ap.add_argument("--cross-steps", type=int, default=25000)
+    ap.add_argument("--latent-steps", type=int, default=20000)
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--token-count", type=int, default=128)
     ap.add_argument("--ckpt-dir", default="runs/phased")
@@ -60,7 +60,9 @@ def main():
     cache.start_prefetch(workers=args.prefetch_workers, depth=8)
     val_bundles = [D.load_local_bundle(p, pid2dir[p], device=dev)[0] for p in val_pids[:args.val_patients]]
 
-    specs = {"cube4": S.cube_spec(4, 16), "slab4": S.slice_spec(4, 16)}
+    # multi-scale patches: fine -> coarse detail (cube 2/4/8/16 mm) + 2.5D slabs (4/8 mm)
+    specs = {"cube2": S.cube_spec(2, 16), "cube4": S.cube_spec(4, 16), "cube8": S.cube_spec(8, 16),
+             "cube16": S.cube_spec(16, 16), "slab4": S.slice_spec(4, 16), "slab8": S.slice_spec(8, 16)}
     enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8), list(specs.values())).to(dev)
     cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count,
                         compile=not args.no_compile, ckpt_dir=args.ckpt_dir,
