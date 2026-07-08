@@ -126,7 +126,7 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
         lo, hiP = np.percentile(vol_np[vol_np > fg_thresh * hi], [0.5, 99.5]) if (vol_np > fg_thresh * hi).any() else (0.0, hi)
         vol_np = np.clip((vol_np - lo) / max(hiP - lo, 1e-6), 0.0, 1.0)
     return CachedScan(
-        volume=torch.as_tensor(vol_np, device=device),
+        volume=torch.as_tensor(np.ascontiguousarray(vol_np, dtype=np.float32), device=device, dtype=torch.float32),
         affine_inv=torch.as_tensor(np.linalg.inv(R).copy(), device=device),
         affine_trans=torch.as_tensor(t.copy(), device=device),
         foreground_mm=torch.as_tensor(fg, device=device),
