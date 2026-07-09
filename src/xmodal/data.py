@@ -218,6 +218,7 @@ class JitteredRotatingCache(Generic[T]):
         self.rng.shuffle(self.keys)
         self._next_index = 0
         self._key_lock = Lock()
+        self._bad_keys = set()          # keys that failed to load (e.g. corrupt .nii.gz) -> skipped forever
         self._lock = Lock()
         self._stop = False
         self._prefetch_queue = None
@@ -233,13 +234,32 @@ class JitteredRotatingCache(Generic[T]):
 
     def _next_key(self):
         with self._key_lock:
-            key = self.keys[self._next_index % len(self.keys)]
-            self._next_index += 1
-        return key
+            n = len(self.keys)
+            for _ in range(n):                      # skip blacklisted (corrupt/failed) keys
+                key = self.keys[self._next_index % n]
+                self._next_index += 1
+                if key not in self._bad_keys:
+                    return key
+            raise RuntimeError(f"all {n} cache keys failed to load (bad={len(self._bad_keys)})")
+
+    def _load_raw(self, key):
+        """Load one key, isolating decode failures (e.g. corrupt .nii.gz). On failure, blacklist the
+        key so it's never retried, and return None instead of letting the exception kill the thread."""
+        try:
+            return self.loader(key)
+        except Exception as e:
+            with self._key_lock:
+                self._bad_keys.add(key)
+            print(f"[rotating-cache] SKIP unloadable key {key!r}: {type(e).__name__}: {e}", flush=True)
+            return None
 
     def _load_slot(self):
-        key = self._next_key()
-        return CacheSlot(value=self.placer(self.loader(key)), source_key=key, remaining_life=self._life())
+        for _ in range(len(self.keys)):
+            key = self._next_key()
+            raw = self._load_raw(key)
+            if raw is not None:
+                return CacheSlot(value=self.placer(raw), source_key=key, remaining_life=self._life())
+        raise RuntimeError("no loadable cache keys")
 
     @property
     def max_refresh_per_step(self):
@@ -287,8 +307,13 @@ class JitteredRotatingCache(Generic[T]):
 
         def run():
             while not self._stop:
-                key = self._next_key()
-                raw = self.loader(key)                    # CPU-only decode, background thread
+                try:
+                    key = self._next_key()
+                except RuntimeError:
+                    return                                # all keys blacklisted -> nothing left to prefetch
+                raw = self._load_raw(key)                 # CPU-only decode, background thread (guarded)
+                if raw is None:
+                    continue                              # corrupt/failed key already blacklisted; skip it
                 while not self._stop:
                     try:
                         self._prefetch_queue.put((key, raw), timeout=0.1)
