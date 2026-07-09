@@ -110,6 +110,31 @@ def draw_prism_half(rng, G: int, choices, device):
     return torch.as_tensor(arr[rng.integers(len(arr), size=G)], device=device)[:, None, None] / 2.0
 
 
+def resolve_thick_axis(sc: "CachedScan", orient: str, rng):
+    """Pick the 2.5D slab's thin (through-plane) voxel axis. `orient`:
+      'scan'   -> sc.thick_axis (from geometry; = argmax spacing, arbitrary for isotropic data)
+      'native' -> the scan's OUTLIER axis (the dim most different from the others, e.g. 240x240x155 -> 2)
+                  = the native through-plane. Robust even when spacing is isotropic. (This is the plane
+                  the scan was acquired in; it need not be axial -- could be sagittal/coronal natively.)
+      'random' -> a random voxel axis (per call) so the model sees all planes.
+    Isotropic BraTS defaults 'scan' to axis 0 (sagittal); use 'native'/'random' to fix that."""
+    if orient == "random":
+        return int(rng.integers(3))
+    if orient == "native":
+        shp = np.asarray(sc.volume.shape, dtype=np.float32)
+        return int(np.argmax(np.abs(shp - np.median(shp))))   # outlier-shaped axis = native through-plane
+    return sc.thick_axis
+
+
+def size_to_extent(sizes, thick_axis: int, thin_mm: float = 1.0):
+    """Scalar in-plane sizes [G,n] (mm) -> per-axis extent [G,n,3]: the two in-plane axes = the size,
+    the thin (through-plane) `thick_axis` = `thin_mm`. Feeds the model's size embedding both the scale
+    AND the slab orientation (which axis is thin)."""
+    ext = sizes[..., None].repeat(1, 1, 3)
+    ext[..., thick_axis] = thin_mm
+    return ext
+
+
 def mixed_bag_vox(sc: "CachedScan", centers, sizes, unit_off):
     """centers [G,n,3], sizes [G,n] (mm), unit_off [V,V,1,3] -> voxel coords [G,n,V,V,1,3].
     Per-patch offsets = unit_off * size, so each patch samples its own physical footprint."""
@@ -289,12 +314,13 @@ def apply_window_jitter(patches, *, center_std, width_log_std):
 
 
 def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
-                        prism_choices=(32., 64., 128.), size_per_bag=False, rng, device,
+                        prism_choices=(32., 64., 128.), size_per_bag=False, orient="scan", rng, device,
                         pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1):
     """Phase-0 paired-view batch (for series-CLS + view-CLS). Per item: two prisms (a, b) from one
     scan whose anchors sit ~log-uniform(pair_dist_min,max) apart. MIXED-size patches (per-patch size
     from `patch_sizes`) and a per-item prism scale (from `prism_choices`). Returns patches_a/_b
-    [B,n,V,V,1], coords_a/_b [B,n,3], sizes_a/_b [B,n] (mm), rel_targets [B,5], series [B], patient [B]."""
+    [B,n,V,V,1], coords_a/_b [B,n,3], sizes_a/_b [B,n,3] (per-axis mm extent; thin axis ~= 1mm encodes
+    slab orientation), rel_targets [B,5], series [B], patient [B]."""
     import torch
     from collections import defaultdict
     n = token_count
@@ -310,7 +336,8 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
     spat = [None] * batch_size; ser = [0] * batch_size; pat = [0] * batch_size
     for (bi, m), ks in groups.items():
         sc = bundles[bi][m]; G = len(ks); fg = sc.foreground_mm; Mf = fg.shape[0]
-        unit = slab_unit_offsets(sc.thick_axis, voxels, device)
+        _thick = resolve_thick_axis(sc, orient, rng)
+        unit = slab_unit_offsets(_thick, voxels, device)
         half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1] per item
         anchors_a = fg[torch.randint(Mf, (G,), device=device)]                           # [G,3]
         d = np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max), size=G)).astype(np.float32)
@@ -327,10 +354,11 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
         pat_a = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_a, sizes_a, unit))
         pat_b = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_b, sizes_b, unit))
         st = (anchors_b - anchors_a > 0).float()                                         # [G,3]
+        ext_a = size_to_extent(sizes_a, _thick); ext_b = size_to_extent(sizes_b, _thick)  # [G,n,3]
         for gi, k in enumerate(ks):
             pa[k], pb[k] = pat_a[gi], pat_b[gi]
             ca[k] = ctr_a[gi] - anchors_a[gi][None]; cb[k] = ctr_b[gi] - anchors_b[gi][None]
-            za[k], zb[k] = sizes_a[gi], sizes_b[gi]
+            za[k], zb[k] = ext_a[gi], ext_b[gi]
             spat[k] = st[gi]; ser[k] = sc.series_idx; pat[k] = bi
     Pa = torch.stack(pa).float(); Pb = torch.stack(pb).float()
     Pa, ta = apply_window_jitter(Pa, center_std=win_center_std, width_log_std=win_width_log_std)
@@ -344,10 +372,10 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
 
 
 def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
-                      prism_choices=(32., 64., 128.), size_per_bag=False, rng, device):
+                      prism_choices=(32., 64., 128.), size_per_bag=False, orient="scan", rng, device):
     """Phase-0 (self) batch: one bag of patches per item from a single random scan. Vectorized
     (grouped by scan). Mixed-size patches + per-item prism scale. Returns patches [B,n,V,V,1],
-    coords [B,n,3], sizes [B,n] (mm), series [B]."""
+    coords [B,n,3], sizes [B,n,3] (per-axis mm extent; thin axis ~= 1mm encodes slab orientation), series [B]."""
     import torch
     from collections import defaultdict
     n = token_count
@@ -361,7 +389,8 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 
     patch_l = [None] * batch_size; coord_l = [None] * batch_size; size_l = [None] * batch_size; ser = [0] * batch_size
     for (bi, m), ks in groups.items():
         sc = bundles[bi][m]; G = len(ks)
-        unit = slab_unit_offsets(sc.thick_axis, voxels, device)
+        _thick = resolve_thick_axis(sc, orient, rng)
+        unit = slab_unit_offsets(_thick, voxels, device)
         half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1]
         M = sc.foreground_mm.shape[0]
         anchors = sc.foreground_mm[torch.randint(M, (G,), device=device)]
@@ -369,18 +398,19 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 
         coords = centers - anchors[:, None]
         sizes = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)                         # [G,n]
         p = sample_patches_group(sc.volume, mixed_bag_vox(sc, centers, sizes, unit))
+        ext = size_to_extent(sizes, _thick)                                              # [G,n,3]
         for gi, k in enumerate(ks):
-            patch_l[k], coord_l[k], size_l[k], ser[k] = p[gi], coords[gi], sizes[gi], sc.series_idx
+            patch_l[k], coord_l[k], size_l[k], ser[k] = p[gi], coords[gi], ext[gi], sc.series_idx
     return dict(patches=torch.stack(patch_l).float(), coords=torch.stack(coord_l).float(),
                 sizes=torch.stack(size_l).float(), series=torch.tensor(ser, device=device, dtype=torch.long))
 
 
 def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
-                           prism_choices=(32., 64., 128.), size_per_bag=False, rng, device, pairs_per_patient=1):
+                           prism_choices=(32., 64., 128.), size_per_bag=False, orient="scan", rng, device, pairs_per_patient=1):
     """Vectorized cross-modal batch: items sharing a (bundle, source, target) are drawn and gathered
     together (one batched draw + ONE grid_sample per group per modality). Mixed-size patches (same
     per-patch sizes + centers for source & target so they stay co-registered), per-item prism scale.
-    Returns source/target [B,n,V,V,1], coords [B,n,3], sizes [B,n] (mm), src/tgt series [B]."""
+    Returns source/target [B,n,V,V,1], coords [B,n,3], sizes [B,n,3] (per-axis mm extent), src/tgt series [B]."""
     import torch
     from collections import defaultdict
     n = token_count
@@ -405,8 +435,9 @@ def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_sizes=(4.,
     size_l = [None] * batch_size; ssrc = [0] * batch_size; stgt = [0] * batch_size
     for (bi, sm, tm), ks in groups.items():
         s = bundles[bi][sm]; t = bundles[bi][tm]; G = len(ks)
-        unit_s = slab_unit_offsets(s.thick_axis, voxels, device)
-        unit_t = slab_unit_offsets(t.thick_axis, voxels, device)
+        _thick = resolve_thick_axis(s, orient, rng)      # co-registered s/t share orientation
+        unit_s = slab_unit_offsets(_thick, voxels, device)
+        unit_t = slab_unit_offsets(_thick, voxels, device)
         half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1]
         M = s.foreground_mm.shape[0]
         anchors = s.foreground_mm[torch.randint(M, (G,), device=device)]                 # [G,3]
@@ -415,8 +446,9 @@ def sample_cross_batch_vec(bundles, *, batch_size, token_count, patch_sizes=(4.,
         sizes = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)                         # [G,n] shared src/tgt
         ps = sample_patches_group(s.volume, mixed_bag_vox(s, centers, sizes, unit_s))    # [G,n,V,V,1]
         pt = sample_patches_group(t.volume, mixed_bag_vox(t, centers, sizes, unit_t))
+        ext = size_to_extent(sizes, _thick)                                             # [G,n,3]
         for gi, k in enumerate(ks):
-            src_p[k], tgt_p[k], coord_l[k], size_l[k] = ps[gi], pt[gi], coords[gi], sizes[gi]
+            src_p[k], tgt_p[k], coord_l[k], size_l[k] = ps[gi], pt[gi], coords[gi], ext[gi]
             ssrc[k], stgt[k] = s.series_idx, t.series_idx
     return dict(
         source=torch.stack(src_p).float(),

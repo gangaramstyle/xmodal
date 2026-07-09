@@ -141,7 +141,9 @@ class Phase0Encoder(nn.Module):
         self.grid = (V, V, 1)
         self.pv = V * V
         self.stem = nn.Conv3d(1, cfg.width, self.grid, stride=self.grid)
-        self.size_embed = nn.Sequential(nn.Linear(1, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
+        # per-axis physical extent (mm) [.,.,3] -> W. For a 2.5D slab two axes = the size, the thin
+        # (through-plane) axis ~= 0, so this encodes BOTH scale AND orientation (which plane the slab is).
+        self.size_embed = nn.Sequential(nn.Linear(3, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
         self.pixel_head = nn.Linear(cfg.width, self.pv)
         # cross-modal decoder fuses each patch encoding with its (frozen-teacher) series-CLS so the
         # decoder can tell sources apart (no series_embed lookup — series identity is the CLS output).
@@ -166,8 +168,8 @@ class Phase0Encoder(nn.Module):
                                            nn.Linear(cfg.width, 5))
 
     def _size_emb(self, sizes):
-        """Per-patch physical size (mm) [B,k] -> additive size embedding [B,k,W]."""
-        return self.size_embed(sizes[..., None])
+        """Per-patch per-axis physical extent (mm) [B,k,3] -> additive size+orientation embedding [B,k,W]."""
+        return self.size_embed(sizes)
 
     def embed(self, patches, sizes):
         """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n] -> tokens [B,n,W]. Single stem (all patches
@@ -221,25 +223,36 @@ class Phase0Encoder(nn.Module):
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, 1]
 
-    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5, content_blur=0):
+    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5, content_blur=0, held_size=None):
         """MAE-style self task: hold out `mask_ratio` of patches; the encoder sees ONLY the visible
         patches (held-out ones NEVER enter the encoder); the DECODER queries the held-out positions
         to reconstruct pixels (MAE) and match position <-> blind content. Held contents are optionally
         blurred (`content_blur`) so matching can't cheat on exact pixels. The query carries the held
-        patch's SIZE (target scale). Returns mae, match, match_acc + CLS readouts."""
+        patch's SIZE (target scale). If `held_size` is set (a size in mm or an iterable of sizes), held-out
+        patches are restricted to those in-plane size(s) so matching/recon targets are clean scales
+        (e.g. {8,16}, never 4mm); smaller/other sizes stay visible as context. Returns mae, match, match_acc + CLS readouts."""
         B, n = patches.shape[:2]; dev = patches.device; W = self.cfg.width
         nreg = 2 + self.registers.shape[0]
-        perm = torch.argsort(torch.rand(B, n, device=dev), dim=1)
         n_held = max(1, min(n - 1, int(round(n * mask_ratio))))
+        if held_size is not None:
+            # Hold out ONLY patches whose in-plane extent is an allowed target size. Bias the sort so
+            # those come first, then clamp n_held to the per-item target count so held is pure target-scale.
+            sz = sizes.amax(-1)                                              # [B,n] in-plane extent (mm)
+            allowed = [float(held_size)] if isinstance(held_size, (int, float)) else [float(s) for s in held_size]
+            is_t = (sz[..., None] == torch.tensor(allowed, device=dev, dtype=sz.dtype)).any(-1)
+            n_held = max(1, min(n_held, int(is_t.sum(1).min().item())))
+            perm = torch.argsort(torch.rand(B, n, device=dev) + (~is_t).float(), dim=1)  # targets in [0,1)
+        else:
+            perm = torch.argsort(torch.rand(B, n, device=dev), dim=1)
         held, vis = perm[:, :n_held], perm[:, n_held:]
         # MAE-style: embed + encode ONLY the visible patches; held positions are queried by the decoder.
         vis_patches = self._gather_patches(patches, vis); vis_coords = self._gather(coords, vis, 3)
-        vis_sizes = sizes.gather(1, vis)
+        vis_sizes = sizes.gather(1, vis[..., None].expand(-1, -1, 3))
         x = self.encode(*self._context([self.embed(vis_patches, vis_sizes)], [vis_coords], dev, B))
         vis_enc = x[:, nreg:]
         ctx, cc = self._context([vis_enc], [vis_coords], dev, B)               # decoder context = visible encodings
         held_coords = self._gather(coords, held, 3)
-        held_sizes = sizes.gather(1, held)                                     # [B,n_held]
+        held_sizes = sizes.gather(1, held[..., None].expand(-1, -1, 3))        # [B,n_held,3]
         query = (self.query_seed[None, None, :] + self._size_emb(held_sizes)).contiguous()   # position + target scale
         query = self._decode(query, ctx, cc, held_coords)
         held_patches = self._gather_patches(patches, held)                     # [B,n_held,V,V,1]
@@ -253,13 +266,13 @@ class Phase0Encoder(nn.Module):
                     recon=recon.detach(), held_patches=held_patches.detach(),   # viz: predicted vs truth pixels
                     slots=slots.detach(), colors=colors.detach())               # viz: match assignment
 
-    def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, content_blur=0, mae_weight=0.25,
+    def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, content_blur=0, held_size=None, mae_weight=0.25,
                        match_weight=1.0, series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
         """Phase-0 self: decoder MAE + matching (view a) + series-CLS (rank_hinge_xmod) + view-CLS
         (5-way BCE) across views a,b. `spec` is unused (size is per-patch) — kept for call compat."""
         from xmodal.losses import rank_hinge_xmod_loss
         out = self.forward_self(batch["patches_a"], batch["coords_a"], batch["sizes_a"],
-                                mask_ratio=mask_ratio, content_blur=content_blur)
+                                mask_ratio=mask_ratio, content_blur=content_blur, held_size=held_size)
         sa, va = out["series_repr"], out["view_repr"]
         sb, vb = self._readout(batch["patches_b"], batch["coords_b"], batch["sizes_b"], mask_ratio=mask_ratio)
         series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)
@@ -335,7 +348,7 @@ class Phase0Encoder(nn.Module):
         anc_fused = self.fuse_series(self._gather(tgt_enc, anchor, W), tgt_series_cls)  # few target anchors
         rec_coords = self._gather(coords, recon, 3); anc_coords = self._gather(coords, anchor, 3)
         ctx, cc = self._context([src_fused, anc_fused], [coords, anc_coords], dev, B)
-        rec_sizes = sizes.gather(1, recon)                                          # [B,n_recon] target scale
+        rec_sizes = sizes.gather(1, recon[..., None].expand(-1, -1, 3))                                          # [B,n_recon] target scale
         query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :] + self._size_emb(rec_sizes)).contiguous()
         query = self._decode(query, ctx, cc, rec_coords)
         tgt_recon = self._gather(target_patches.reshape(B, n, -1), recon, self.pv)   # disjoint from anchors
@@ -367,7 +380,7 @@ class Phase0Encoder(nn.Module):
         anc_fused = self.fuse_series(self._gather(tgt_enc, anchor, W), tgt_series_cls)
         rec_coords = self._gather(coords, recon, 3); anc_coords = self._gather(coords, anchor, 3)
         ctx, cc = self._context([src_fused, anc_fused], [coords, anc_coords], dev, B)
-        rec_sizes = sizes.gather(1, recon)
+        rec_sizes = sizes.gather(1, recon[..., None].expand(-1, -1, 3))
         query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :] + self._size_emb(rec_sizes)).contiguous()
         query = self._decode(query, ctx, cc, rec_coords)
         tgt = self._gather(tgt_latents, recon, W)

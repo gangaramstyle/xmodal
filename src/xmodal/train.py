@@ -37,6 +37,7 @@ class TrainConfig:
     token_count: int = 128
     mask_ratio: float = 0.35
     content_blur: int = 3             # blur held-out contents before the color head (semantic matching)
+    held_size: tuple | float | None = (8.0, 16.0)  # matching/recon TARGET size(s) (mm); 4mm stays INPUT-only. None = any size
     mae_weight: float = 0.25
     series_weight: float = 1.0
     rel_spatial_weight: float = 0.25
@@ -64,9 +65,10 @@ class TrainConfig:
     anchor_frac: float = 0.05
     pairs_per_patient: int = 6
     # mixed-size 2.5D sampling (categorical): per-patch physical size + per-item prism extent (mm)
-    patch_sizes: tuple = (4.0, 8.0, 16.0)
+    patch_sizes: tuple = (4.0, 8.0, 16.0)  # INPUT context sizes (4mm ok as input); held-out target scale set by held_size
     prism_choices: tuple = (32.0, 64.0, 128.0)
     size_per_bag: bool = False        # ablation: one size per bag (no within-bag scale mixing)
+    orient: str = "scan"              # slab orientation: 'scan' | 'native' | 'random' (see resolve_thick_axis)
     artifact_every: int = 5000        # log a wandb checkpoint artifact every N steps (0 = off)
 
 
@@ -209,12 +211,12 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
         # mixed-size 2.5D: per-patch sizes {4,8,16} mm + per-item prism {32,64,128} mm (sampler defaults)
         return S.sample_paired_batch(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
                                      patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
-                                     size_per_bag=cfg.size_per_bag, rng=rng, device=device)
+                                     size_per_bag=cfg.size_per_bag, orient=cfg.orient, rng=rng, device=device)
 
     def crossb(bnd):
         return S.sample_cross_batch_vec(bnd, batch_size=cfg.batch_size, token_count=cfg.token_count,
                                         patch_sizes=cfg.patch_sizes, prism_choices=cfg.prism_choices,
-                                        size_per_bag=cfg.size_per_bag, rng=rng, device=device,
+                                        size_per_bag=cfg.size_per_bag, orient=cfg.orient, rng=rng, device=device,
                                         pairs_per_patient=cfg.pairs_per_patient)
 
     def teach(b, want_latent=False):
@@ -225,6 +227,7 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
 
     def phase0(b):
         return model.forward_phase0(b, mask_ratio=cfg.mask_ratio, content_blur=cfg.content_blur,
+                                    held_size=cfg.held_size,
                                     mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
                                     series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
                                     rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
