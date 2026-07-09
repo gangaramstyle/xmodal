@@ -36,7 +36,9 @@ def blur_contents(patches, kernel):
         return patches
     b, q = patches.shape[:2]
     x = patches.reshape(b * q, 1, *patches.shape[2:])
-    x = F.avg_pool3d(x, kernel_size=kernel, stride=1, padding=kernel // 2)
+    ks = tuple(min(kernel, d) for d in x.shape[2:])   # cap per-dim so 2.5D thin axis (size 1) -> kernel 1
+    pad = tuple(k // 2 for k in ks)
+    x = F.avg_pool3d(x, kernel_size=ks, stride=1, padding=pad)
     return x.reshape(b, q, *patches.shape[2:])
 
 
