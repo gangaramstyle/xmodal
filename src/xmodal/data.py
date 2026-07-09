@@ -211,6 +211,11 @@ class JitteredRotatingCache(Generic[T]):
         self.min_life, self.max_life = min_life, max_life
         self.max_refresh_fraction = max_refresh_fraction
         self.rng = random.Random(seed)
+        # Shuffle the key order so the cache walks patients RANDOMLY, not down the sorted list.
+        # Sequential walking clusters same-region patients (incl. size outliers) into the cache at
+        # once (that's what made the OOM deterministic) and correlates batches; a random order both
+        # spreads outliers and diversifies each batch's ~size resident patients.
+        self.rng.shuffle(self.keys)
         self._next_index = 0
         self._key_lock = Lock()
         self._lock = Lock()
