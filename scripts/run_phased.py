@@ -55,6 +55,9 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4, help="base (peak) learning rate")
     ap.add_argument("--prism-choices", type=float, nargs="+", default=[32., 64., 128.],
                     help="per-item prism extents (mm) to sample from")
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="phase-4 faithful LATENT fork: freeze the encoder and train ONLY the decoder+latent_head "
+                         "(no self-MAE). Teacher == the frozen encoder; targets stationary.")
     args = ap.parse_args()
     dev = args.device
     root = os.path.expanduser(args.data_root)
@@ -86,6 +89,7 @@ def main():
                         compile=not args.no_compile, size_per_bag=args.size_per_bag,
                         patch_sizes=tuple(args.patch_sizes), prism_choices=tuple(args.prism_choices),
                         content_blur=args.content_blur, orient=args.orient, held_size=held,
+                        freeze_encoder=args.freeze_encoder,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)

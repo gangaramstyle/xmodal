@@ -63,6 +63,8 @@ class TrainConfig:
     cross_weight: float = 1.0         # weight on the cross-modal decoder loss (added to encoder objectives)
     match_weight: float = 1.0         # matching vs pixel weight inside forward_cross
     anchor_frac: float = 0.05
+    freeze_encoder: bool = False      # phase-4 faithful: freeze the encoder during the LATENT phase and train
+                                      # only the decoder + latent_head (no self-MAE). Teacher==frozen encoder.
     pairs_per_patient: int = 6
     # mixed-size 2.5D sampling (categorical): per-patch physical size + per-item prism extent (mm)
     patch_sizes: tuple = (4.0, 8.0, 16.0)  # INPUT context sizes (4mm ok as input); held-out target scale set by held_size
@@ -251,6 +253,7 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
     if resume_step:
         log(f"[resume] starting at gstep {resume_step} (LR schedule + phase position restored from checkpoint)")
     gstep = 0
+    frozen_done = False
     for pname, psteps in phases:
         pstart, pend = gstep, gstep + psteps
         if resume_step >= pend:            # phase fully completed before the resume point -> skip
@@ -266,6 +269,21 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             if pstart < resume_step:
                 log(f"[{pname}] WARNING: resuming mid-phase; teacher snapshotted from the RESUMED weights "
                     f"(no frozen teacher was checkpointed). Resume within 'self' avoids this.")
+        if pname == "latent" and cfg.freeze_encoder and not frozen_done:
+            # Phase-4 faithful: freeze the encoder (teacher == the frozen encoder, targets stationary)
+            # and train ONLY the latent-decoder path (decoder + latent_head + fuse + query_seed).
+            for p in model.parameters():
+                p.requires_grad_(False)
+            for mod in (model.decoder, model.latent_head, model.fuse):
+                for p in mod.parameters():
+                    p.requires_grad_(True)
+            model.query_seed.requires_grad_(True)
+            opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.lr,
+                                    weight_decay=cfg.weight_decay, betas=(0.9, 0.95), fused=(device == "cuda"))
+            ntr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            nfr = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+            log(f"[latent] freeze_encoder: trainable={ntr:,} frozen={nfr:,} (decoder+latent_head+fuse+query_seed)")
+            frozen_done = True
         if resume_step > gstep:            # skip already-completed steps within the containing phase
             gstep = resume_step
         while gstep < pend:
@@ -274,6 +292,13 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             for g in opt.param_groups:
                 g["lr"] = lr
             with torch.autocast(**amp):
+              if pname == "latent" and cfg.freeze_encoder:
+                # Phase-4 faithful: frozen encoder, NO self-MAE. Decoder trains only on latent cross-pred.
+                bc = crossb(pool()); s_scls, t_scls, t_lat = teach(bc, want_latent=True)
+                outc = model.forward_cross_latent(bc["source"], bc["target"], bc["coords"], bc["sizes"],
+                                                  s_scls, t_scls, t_lat, anchor_frac=cfg.anchor_frac)
+                loss = outc["loss"]; m = dict(latent_cos=outc["cos"], n_recon=outc["n_recon"])
+              else:
                 b0 = paired(pool())
                 out0 = phase0(b0)
                 loss = out0["loss"]
