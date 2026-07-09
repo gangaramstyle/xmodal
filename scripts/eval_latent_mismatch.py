@@ -18,9 +18,20 @@ import os
 
 import numpy as np
 import torch
-from sklearn.metrics import roc_auc_score
 
 from xmodal import data as D, holdout as H, model as M, sampling as S
+
+
+def roc_auc_score(y, s):
+    """AUROC via Mann-Whitney U (average ranks for ties). numpy-only, no sklearn dep."""
+    y = np.asarray(y).astype(bool); s = np.asarray(s, dtype=float)
+    n_pos = int(y.sum()); n_neg = int(len(y) - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    _, inv, counts = np.unique(s, return_inverse=True, return_counts=True)
+    avg_rank = np.cumsum(counts) - (counts - 1) / 2.0          # 1-based average rank per unique value
+    ranks = avg_rank[inv]
+    return (ranks[y].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 from xmodal.sampling import (draw_patch_sizes, draw_prism_half, mixed_bag_vox, resolve_thick_axis,
                              sample_patches_group, size_to_extent, slab_unit_offsets)
 
