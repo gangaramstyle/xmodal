@@ -368,6 +368,32 @@ class Phase0Encoder(nn.Module):
         return dict(loss=loss, mae=mae.detach(), match_acc=match_acc, n_recon=n_recon, n_anchor=int(anchor.shape[1]),
                     pred=pred.detach(), tgt_recon=tgt_recon.detach(), src_recon=src_recon.detach())
 
+    @torch.no_grad()
+    def cross_eval(self, source_patches, target_patches, coords, sizes, src_series_cls,
+                   tgt_series_cls, tgt_latents, *, anchor_frac=0.05):
+        """Eval-only: ONE anchor/recon split, ONE decode, BOTH heads (pixel + latent share the
+        identical context/query, so this is perfectly aligned). Returns per-patch [B,n_recon]
+        `latent_mismatch` = 1 - cos(pred_latent, frozen-teacher target latent) and `pixel_err` =
+        MSE(pred_pixels, true target pixels), plus the `recon` indices so callers can attach seg
+        labels. Use latent_mismatch for a latent ckpt, pixel_err for the pixel-cross baseline."""
+        B, n = source_patches.shape[:2]; dev = source_patches.device; W = self.cfg.width
+        anchor, recon = self._split(B, n, anchor_frac, dev); n_recon = recon.shape[1]
+        src_enc = self._encode_prism(source_patches, coords, sizes)
+        tgt_enc = self._encode_prism(target_patches, coords, sizes)
+        src_fused = self.fuse_series(src_enc, src_series_cls)
+        anc_fused = self.fuse_series(self._gather(tgt_enc, anchor, W), tgt_series_cls)
+        rec_coords = self._gather(coords, recon, 3); anc_coords = self._gather(coords, anchor, 3)
+        ctx, cc = self._context([src_fused, anc_fused], [coords, anc_coords], dev, B)
+        rec_sizes = sizes.gather(1, recon[..., None].expand(-1, -1, 3))
+        query = (self.query_seed[None, None, :] + tgt_series_cls[:, None, :] + self._size_emb(rec_sizes)).contiguous()
+        query = self._decode(query, ctx, cc, rec_coords)
+        pred_lat = self.latent_head(query); tgt_lat = self._gather(tgt_latents, recon, W)
+        latent_mismatch = 1.0 - (F.normalize(pred_lat, dim=-1) * F.normalize(tgt_lat, dim=-1)).sum(-1)
+        pred_px = self.dec_pixel_head(query)
+        tgt_px = self._gather(target_patches.reshape(B, n, -1), recon, self.pv)
+        pixel_err = ((pred_px - tgt_px) ** 2).mean(-1)
+        return dict(recon=recon, latent_mismatch=latent_mismatch.detach(), pixel_err=pixel_err.detach(), n_recon=n_recon)
+
     def forward_cross_latent(self, source_patches, target_patches, coords, sizes, src_series_cls,
                              tgt_series_cls, tgt_latents, *, anchor_frac=0.05):
         """Latent phase: same wiring as forward_cross, but the target is the FROZEN teacher's
