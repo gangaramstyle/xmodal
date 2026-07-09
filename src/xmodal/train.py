@@ -66,6 +66,7 @@ class TrainConfig:
     patch_sizes: tuple = (4.0, 8.0, 16.0)
     prism_choices: tuple = (32.0, 64.0, 128.0)
     size_per_bag: bool = False        # ablation: one size per bag (no within-bag scale mixing)
+    artifact_every: int = 5000        # log a wandb checkpoint artifact every N steps (0 = off)
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -285,8 +286,15 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
                     wb.log({"val/mae": vm, "val/rel_acc": va}, step=gstep)
             if cfg.ckpt_dir and gstep % cfg.ckpt_every == 0:
                 os.makedirs(cfg.ckpt_dir, exist_ok=True)
-                torch.save({"model": model.state_dict(), "step": gstep, "phase": pname, "cfg": cfg.__dict__},
-                           f"{cfg.ckpt_dir}/step_{gstep:06d}.pt")
+                ckpt_path = f"{cfg.ckpt_dir}/step_{gstep:06d}.pt"
+                torch.save({"model": model.state_dict(), "step": gstep, "phase": pname, "cfg": cfg.__dict__}, ckpt_path)
+                if wb and cfg.artifact_every and gstep % cfg.artifact_every == 0:
+                    try:
+                        art = wb.Artifact(f"ckpt-{cfg.wandb_run or 'run'}", type="model",
+                                          metadata={"step": gstep, "phase": pname})
+                        art.add_file(ckpt_path); wb.log_artifact(art)
+                    except Exception as e:
+                        log(f"[wandb] artifact log skipped: {e}")
     if wb:
         wb.finish()
     log(f"phased run done: {gstep} steps in {time.time()-t0:.0f}s")
