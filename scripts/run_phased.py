@@ -49,6 +49,12 @@ def main():
     ap.add_argument("--resume", default=None,
                     help="path to a checkpoint (step_XXXXXX.pt) to resume from: restores weights + step "
                          "(LR schedule position), and optimizer state if present in the checkpoint")
+    ap.add_argument("--init-from", default=None,
+                    help="load ONLY the weights from a checkpoint and start a FRESH schedule at step 0 "
+                         "(for forking a new phase off an existing encoder; teacher snapshots from these weights)")
+    ap.add_argument("--lr", type=float, default=3e-4, help="base (peak) learning rate")
+    ap.add_argument("--prism-choices", type=float, nargs="+", default=[32., 64., 128.],
+                    help="per-item prism extents (mm) to sample from")
     args = ap.parse_args()
     dev = args.device
     root = os.path.expanduser(args.data_root)
@@ -76,15 +82,20 @@ def main():
     # (TrainConfig defaults). One shared stem/heads; scale rides in via the per-patch size embedding.
     enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
     held = None if (len(args.held_size) == 1 and args.held_size[0] == 0) else tuple(args.held_size)
-    cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count,
+    cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count, lr=args.lr,
                         compile=not args.no_compile, size_per_bag=args.size_per_bag,
-                        patch_sizes=tuple(args.patch_sizes), content_blur=args.content_blur,
-                        orient=args.orient, held_size=held,
+                        patch_sizes=tuple(args.patch_sizes), prism_choices=tuple(args.prism_choices),
+                        content_blur=args.content_blur, orient=args.orient, held_size=held,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)
     resume_step, resume_opt = 0, None
-    if args.resume:
+    if args.init_from:
+        ckpt = torch.load(args.init_from, map_location=dev)
+        enc.load_state_dict(ckpt["model"])                       # weights only -> fresh schedule at step 0
+        print(f"INIT-FROM {args.init_from}: loaded weights (was step {ckpt.get('step')}), fresh schedule; "
+              f"teacher will snapshot from these weights at the first non-self phase", flush=True)
+    elif args.resume:
         ckpt = torch.load(args.resume, map_location=dev)
         enc.load_state_dict(ckpt["model"]); resume_step = int(ckpt["step"]); resume_opt = ckpt.get("opt")
         print(f"RESUME from {args.resume}: step {resume_step}, phase {ckpt.get('phase')}, "
