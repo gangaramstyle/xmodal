@@ -46,6 +46,9 @@ def main():
                     help="held-out matching/recon TARGET size(s) in mm (4mm stays input-only); pass 0 for any-size")
     ap.add_argument("--wandb", default=None)
     ap.add_argument("--wandb-run", default=None)
+    ap.add_argument("--resume", default=None,
+                    help="path to a checkpoint (step_XXXXXX.pt) to resume from: restores weights + step "
+                         "(LR schedule position), and optimizer state if present in the checkpoint")
     args = ap.parse_args()
     dev = args.device
     root = os.path.expanduser(args.data_root)
@@ -80,7 +83,14 @@ def main():
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)
-    T.train_phased(enc, cache, val_bundles, {}, cfg, phases=phases, device=dev)
+    resume_step, resume_opt = 0, None
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=dev)
+        enc.load_state_dict(ckpt["model"]); resume_step = int(ckpt["step"]); resume_opt = ckpt.get("opt")
+        print(f"RESUME from {args.resume}: step {resume_step}, phase {ckpt.get('phase')}, "
+              f"optimizer {'restored' if resume_opt is not None else 'FRESH (not in ckpt)'}", flush=True)
+    T.train_phased(enc, cache, val_bundles, {}, cfg, phases=phases, device=dev,
+                   resume_step=resume_step, resume_opt_state=resume_opt)
     cache.stop_prefetch()
 
 

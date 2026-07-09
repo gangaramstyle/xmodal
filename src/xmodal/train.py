@@ -170,7 +170,7 @@ def train_phase0(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, 
 
 
 def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, phases,
-                 device="cuda", log=print):
+                 device="cuda", log=print, resume_step=0, resume_opt_state=None):
     """One continuous run: self -> cross -> latent. `phases` = [(name, steps), ...] with name in
     {'self','cross','latent'}. A frozen teacher is snapshotted at the first non-self phase and gives
     the decoder its stable per-prism series-CLS conditioning (+ latent targets). Encoder objectives
@@ -183,6 +183,11 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
     is_cache = hasattr(train_source, "resident")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
                             betas=(0.9, 0.95), fused=(device == "cuda"))
+    if resume_opt_state is not None:
+        try:
+            opt.load_state_dict(resume_opt_state); log("[resume] restored optimizer (Adam) state")
+        except Exception as e:
+            log(f"[resume] optimizer state not loaded ({e}); Adam moments start fresh")
     teacher = copy.deepcopy(model).eval()                 # created BEFORE compile (clean); weights loaded at transition
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -243,8 +248,14 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
         model.train(); return float(np.mean(maes)), float(np.mean(accs))
 
     log(f"phased run: {phases} | total {total} steps"); t0 = time.time()
+    if resume_step:
+        log(f"[resume] starting at gstep {resume_step} (LR schedule + phase position restored from checkpoint)")
     gstep = 0
     for pname, psteps in phases:
+        pstart, pend = gstep, gstep + psteps
+        if resume_step >= pend:            # phase fully completed before the resume point -> skip
+            gstep = pend
+            continue
         if pname != "self":
             # re-snapshot the teacher at EVERY phase boundary: frozen-self conditions cross,
             # frozen-cross conditions latent (each phase continues off the previous one's weights).
@@ -252,7 +263,12 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             if device == "cuda":
                 torch.cuda.empty_cache()   # defrag before the heavier cross/latent phase (avoid transition OOM)
             log(f"[{pname}] re-snapshotted frozen teacher from step {gstep}")
-        for _ in range(psteps):
+            if pstart < resume_step:
+                log(f"[{pname}] WARNING: resuming mid-phase; teacher snapshotted from the RESUMED weights "
+                    f"(no frozen teacher was checkpointed). Resume within 'self' avoids this.")
+        if resume_step > gstep:            # skip already-completed steps within the containing phase
+            gstep = resume_step
+        while gstep < pend:
             gstep += 1
             lr = _cosine_warmup(gstep, total, cfg.lr, warmup)
             for g in opt.param_groups:
@@ -294,7 +310,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             if cfg.ckpt_dir and gstep % cfg.ckpt_every == 0:
                 os.makedirs(cfg.ckpt_dir, exist_ok=True)
                 ckpt_path = f"{cfg.ckpt_dir}/step_{gstep:06d}.pt"
-                torch.save({"model": model.state_dict(), "step": gstep, "phase": pname, "cfg": cfg.__dict__}, ckpt_path)
+                torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": gstep,
+                            "phase": pname, "cfg": cfg.__dict__}, ckpt_path)
                 if wb and cfg.artifact_every and gstep % cfg.artifact_every == 0:
                     try:
                         art = wb.Artifact(f"ckpt-{cfg.wandb_run or 'run'}", type="model",
