@@ -105,6 +105,15 @@ def _cpu_payload(vol_raw, affine, modality, series_idx, patient, *, fg_thresh=0.
     """Build the CPU payload (normalized volume + world-mm foreground + geometry) for place_bundle."""
     vol = np.nan_to_num(np.ascontiguousarray(vol_raw, dtype=np.float32), copy=False)
     affine = np.asarray(affine, np.float32)
+    # Cap GPU cache memory: downsample sub-1mm volumes to ~1mm isotropic. The model samples patches
+    # at physical mm (grid_sample) so this is lossless for its purposes; standard 1mm volumes pass
+    # untouched. Prevents high-res outliers (e.g. 0.5mm 512x257x418 = 55M voxels) from ballooning the
+    # rotating GPU cache and OOMing the forward pass (deterministic crash the 40-slot cache hit ~step 11.5k).
+    _sp = np.linalg.norm(affine[:3, :3], axis=0)
+    _f = np.maximum(1, np.round(1.0 / np.maximum(_sp, 1e-3))).astype(int)
+    if (_f > 1).any():
+        vol = np.ascontiguousarray(vol[::int(_f[0]), ::int(_f[1]), ::int(_f[2])])
+        affine = affine.copy(); affine[:3, :3] = affine[:3, :3] * _f
     R, t = affine[:3, :3], affine[:3, 3]
     thick, plane, spacing = S._thick_and_plane(R, None)
     hi = float(vol.max()) or 1.0
