@@ -36,6 +36,7 @@ class TrainConfig:
     batch_size: int = 24
     token_count: int = 128
     mask_ratio: float = 0.35
+    content_blur: int = 3             # blur held-out contents before the color head (semantic matching)
     mae_weight: float = 0.25
     series_weight: float = 1.0
     rel_spatial_weight: float = 0.25
@@ -223,9 +224,9 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
         return s_scls.float(), t_scls.float(), (t_lat.float() if want_latent else None)
 
     def phase0(b):
-        return model.forward_phase0(b, mask_ratio=cfg.mask_ratio, mae_weight=cfg.mae_weight,
-                                    match_weight=cfg.match_weight, series_weight=cfg.series_weight,
-                                    rel_spatial_weight=cfg.rel_spatial_weight,
+        return model.forward_phase0(b, mask_ratio=cfg.mask_ratio, content_blur=cfg.content_blur,
+                                    mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
+                                    series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
                                     rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
 
     @torch.no_grad()
@@ -260,7 +261,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
                 if pname == "cross":
                     bc = crossb(pool()); s_scls, t_scls, _ = teach(bc)
                     outc = model.forward_cross(bc["source"], bc["target"], bc["coords"], bc["sizes"], s_scls, t_scls,
-                                               objective="both", anchor_frac=cfg.anchor_frac, match_weight=cfg.match_weight)
+                                               objective="both", anchor_frac=cfg.anchor_frac,
+                                               match_weight=cfg.match_weight, content_blur=cfg.content_blur)
                     loss = loss + cfg.cross_weight * outc["loss"]
                     m.update(cross_mae=float(outc["mae"]), match_acc=outc["match_acc"])
                 elif pname == "latent":

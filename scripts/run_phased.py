@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--size-per-bag", action="store_true",
                     help="ablation: one patch size per bag (no within-bag scale mixing)")
+    ap.add_argument("--patch-sizes", type=float, nargs="+", default=[4., 8., 16.],
+                    help="per-patch physical sizes (mm) to sample from; pass one for single-size")
+    ap.add_argument("--content-blur", type=int, default=3, help="blur held-out contents before color head")
     ap.add_argument("--wandb", default=None)
     ap.add_argument("--wandb-run", default=None)
     args = ap.parse_args()
@@ -67,6 +70,7 @@ def main():
     enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
     cfg = T.TrainConfig(batch_size=args.batch_size, token_count=args.token_count,
                         compile=not args.no_compile, size_per_bag=args.size_per_bag,
+                        patch_sizes=tuple(args.patch_sizes), content_blur=args.content_blur,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xmodal.matching import ColorHead, default_log_logit_scale, slot_match_loss
+from xmodal.matching import ColorHead, blur_contents, default_log_logit_scale, slot_match_loss
 
 
 @dataclass
@@ -221,23 +221,23 @@ class Phase0Encoder(nn.Module):
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, 1]
 
-    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5):
-        """Self decoder task: hold out `mask_ratio` of patches; encode with them masked; the DECODER
-        predicts the held-out pixels (MAE) AND matches held-out position <-> blind content (matching).
-        Context = encoder output at VISIBLE positions only (held carry mask_token -> no content leak);
-        held (colors) are disjoint from the context. The query carries the held patch's SIZE (target
-        scale) via the size embedding. Returns mae, match, match_acc + CLS readouts."""
+    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5, content_blur=0):
+        """MAE-style self task: hold out `mask_ratio` of patches; the encoder sees ONLY the visible
+        patches (held-out ones NEVER enter the encoder); the DECODER queries the held-out positions
+        to reconstruct pixels (MAE) and match position <-> blind content. Held contents are optionally
+        blurred (`content_blur`) so matching can't cheat on exact pixels. The query carries the held
+        patch's SIZE (target scale). Returns mae, match, match_acc + CLS readouts."""
         B, n = patches.shape[:2]; dev = patches.device; W = self.cfg.width
         nreg = 2 + self.registers.shape[0]
         perm = torch.argsort(torch.rand(B, n, device=dev), dim=1)
         n_held = max(1, min(n - 1, int(round(n * mask_ratio))))
         held, vis = perm[:, :n_held], perm[:, n_held:]
-        tok = self.embed(patches, sizes)
-        tok = tok.scatter(1, held[..., None].expand(-1, -1, W), self.mask_token.to(tok.dtype).expand(B, n_held, W))
-        x = self.encode(*self._context([tok], [coords], dev, B))
-        patch_enc = x[:, nreg:]
-        vis_ctx = self._gather(patch_enc, vis, W); vis_coords = self._gather(coords, vis, 3)
-        ctx, cc = self._context([vis_ctx], [vis_coords], dev, B)               # decoder context = visible only
+        # MAE-style: embed + encode ONLY the visible patches; held positions are queried by the decoder.
+        vis_patches = self._gather_patches(patches, vis); vis_coords = self._gather(coords, vis, 3)
+        vis_sizes = sizes.gather(1, vis)
+        x = self.encode(*self._context([self.embed(vis_patches, vis_sizes)], [vis_coords], dev, B))
+        vis_enc = x[:, nreg:]
+        ctx, cc = self._context([vis_enc], [vis_coords], dev, B)               # decoder context = visible encodings
         held_coords = self._gather(coords, held, 3)
         held_sizes = sizes.gather(1, held)                                     # [B,n_held]
         query = (self.query_seed[None, None, :] + self._size_emb(held_sizes)).contiguous()   # position + target scale
@@ -246,19 +246,20 @@ class Phase0Encoder(nn.Module):
         recon = self.dec_pixel_head(query)
         mae = F.l1_loss(recon, held_patches.reshape(B, n_held, self.pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
-        colors = F.normalize(self.color_head(held_patches), dim=-1)
+        colors = F.normalize(self.color_head(blur_contents(held_patches, content_blur)), dim=-1)  # blind + blurred
         m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
         return dict(mae=mae, match=m_loss, match_acc=m_met["match_acc"],
                     series_repr=x[:, 0], view_repr=x[:, 1],
                     recon=recon.detach(), held_patches=held_patches.detach(),   # viz: predicted vs truth pixels
                     slots=slots.detach(), colors=colors.detach())               # viz: match assignment
 
-    def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, mae_weight=0.25, match_weight=1.0,
-                       series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
+    def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, content_blur=0, mae_weight=0.25,
+                       match_weight=1.0, series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1):
         """Phase-0 self: decoder MAE + matching (view a) + series-CLS (rank_hinge_xmod) + view-CLS
         (5-way BCE) across views a,b. `spec` is unused (size is per-patch) — kept for call compat."""
         from xmodal.losses import rank_hinge_xmod_loss
-        out = self.forward_self(batch["patches_a"], batch["coords_a"], batch["sizes_a"], mask_ratio=mask_ratio)
+        out = self.forward_self(batch["patches_a"], batch["coords_a"], batch["sizes_a"],
+                                mask_ratio=mask_ratio, content_blur=content_blur)
         sa, va = out["series_repr"], out["view_repr"]
         sb, vb = self._readout(batch["patches_b"], batch["coords_b"], batch["sizes_b"], mask_ratio=mask_ratio)
         series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)
@@ -320,7 +321,7 @@ class Phase0Encoder(nn.Module):
         return query
 
     def forward_cross(self, source_patches, target_patches, coords, sizes, src_series_cls, tgt_series_cls,
-                      *, anchor_frac=0.05, objective="both", match_weight=1.0):
+                      *, anchor_frac=0.05, objective="both", match_weight=1.0, content_blur=0):
         """Cross-modal. Online-encode source + target; decoder context = fused(source, its series-CLS)
         [all positions] + fused(target anchors, its series-CLS) [few, disjoint from the masked recon];
         queries = position + target series-CLS + target SIZE. Predict held-out target patches (pixel
@@ -344,7 +345,7 @@ class Phase0Encoder(nn.Module):
         match_acc = 0.0
         if objective in ("match", "both"):
             slots = F.normalize(self.match_slot_proj(query), dim=-1)
-            colors = F.normalize(self.color_head(tgt_recon.reshape(B, n_recon, *self.grid)), dim=-1)
+            colors = F.normalize(self.color_head(blur_contents(tgt_recon.reshape(B, n_recon, *self.grid), content_blur)), dim=-1)
             m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
             match_acc = m_met["match_acc"]
             loss = mae + match_weight * m_loss if objective == "both" else m_loss
