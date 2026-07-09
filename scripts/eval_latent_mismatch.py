@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 import numpy as np
 import torch
 
-from xmodal import data as D, holdout as H, model as M, sampling as S
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from xmodal import data as D, holdout as H, model as M, sampling as S  # noqa: E402
 
 
 def roc_auc_score(y, s):
