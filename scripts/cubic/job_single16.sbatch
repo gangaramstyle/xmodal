@@ -18,7 +18,7 @@ git pull -q || true
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 .venv/bin/python -u scripts/run_phased.py \
-    --batch-size 256 --token-count 128 --cache-size 40 \
+    --batch-size 224 --token-count 128 --cache-size 40 \
     --patch-sizes 16 --content-blur 3 \
     --self-steps 25000 --cross-steps 25000 --latent-steps 20000 \
     --ckpt-dir runs/single16 \
