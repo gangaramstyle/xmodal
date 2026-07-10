@@ -60,11 +60,13 @@ def prism_soft(E, b, tgt, mask, G, pm, blur, tau, dev, soft_sim="model"):
     ctr = torch.as_tensor(anchor_mm + baseoff, device=dev, dtype=torch.float32)
     tgtp = S.sample_patches_group(b[tgt].volume, S.mixed_bag_vox(b[tgt], ctr[None], sz, unit))
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        if soft_sim == "pixel":                                            # FIXED raw blurred pixels (non-circular)
-            feat = torch.nn.functional.normalize(blur_contents(tgtp, blur).reshape(1, N, -1).float(), dim=-1)
-        else:                                                              # trainable color_head (model-based)
+        if soft_sim == "pixel":                                            # FIXED raw blurred pixels, RBF (intensity-aware)
+            feat = blur_contents(tgtp, blur).reshape(N, -1).float()
+            d2 = torch.cdist(feat[None], feat[None])[0] ** 2               # squared Euclidean [N,N]; respects brightness
+            sim = (-d2 / (d2[d2 > 0].median() + 1e-9)).float().cpu().numpy()  # neg normalized dist; self=0=max
+        else:                                                              # trainable color_head (model-based), cosine
             feat = torch.nn.functional.normalize(E.color_head(blur_contents(tgtp, blur)), dim=-1)
-    sim = (feat[0] @ feat[0].T).float().cpu().numpy()
+            sim = (feat[0] @ feat[0].T).float().cpu().numpy()
     soft = np.exp(sim / tau); soft = soft / soft.sum(1, keepdims=True)
     amb = 1.0 / (soft ** 2).sum(1)
     return dict(ax=ax, inpl=inpl, av=av, baseoff=baseoff, spacing=spacing, N=N,
