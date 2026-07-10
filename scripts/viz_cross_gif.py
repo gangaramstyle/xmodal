@@ -20,7 +20,7 @@ import nibabel as nib
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy import ndimage as ndi
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -129,18 +129,30 @@ def main():
             slt = F.normalize(E.match_slot_proj(q), dim=-1); clr = F.normalize(E.color_head(_blur(tgt[:, rect], 3)), dim=-1)
             pick = (slt @ clr.transpose(1, 2))[0].argmax(1).cpu().numpy()
         tnp = tgt[0, :, :, :, 0].float().cpu().numpy(); snp = src[0, :, :, :, 0].float().cpu().numpy()
-        FT = 260
-        ft1c = np.array(Image.fromarray(full(volc, zc)).resize((FT, FT), Image.NEAREST))
-        ft1n = np.array(Image.fromarray(full(voln, zc)).resize((FT, FT), Image.NEAREST))
-        row1 = np.hstack([ft1c, np.full((FT, 4, 3), 50, np.uint8), ft1n])
-        srcg = pgrid([u8(snp[n]) for n in range(N)])                                     # SOURCE t1 the model was given
-        gt = pgrid([u8(tnp[n]) for n in range(N)])
-        prd = pgrid([u8(pred[rset[n]]) if n in rset else u8(tnp[n]) for n in range(N)], lambda n: (70, 150, 255) if n in rset else None)
-        jig = pgrid([u8(tnp[rec[pick[rset[n]]]]) if n in rset else u8(tnp[n]) for n in range(N)],
-                    lambda n: ((45, 220, 45) if pick[rset[n]] == rset[n] else (235, 45, 45)) if n in rset else None)
-        sep = np.full((G * p, 4, 3), 50, np.uint8); row2 = np.hstack([srcg, sep, gt, sep, prd, sep, jig])
-        r1 = Image.fromarray(row1); r2 = Image.fromarray(row2).resize((r1.width, int(row2.shape[0] * r1.width / row2.shape[1])), Image.NEAREST)
-        frames.append(Image.fromarray(np.vstack([np.array(r1), np.full((4, r1.width, 3), 50, np.uint8), np.array(r2)])).resize((640, int((r1.height + 4 + r2.height) * 640 / r1.width)), Image.NEAREST))
+        anc_set = set(int(x) for x in anc); black = np.zeros((p, p), np.uint8)
+        P = 200
+        def Rz(a):
+            return np.array(Image.fromarray(a).resize((P, P), Image.NEAREST))
+        # 4 rows x 2 cols (SOURCE t1 | TARGET t1c): full scan / full prism / model context / model output
+        p11 = Rz(full(voln, zc)); p12 = Rz(full(volc, zc))
+        p21 = Rz(pgrid([u8(snp[n]) for n in range(N)])); p22 = Rz(pgrid([u8(tnp[n]) for n in range(N)]))
+        p31 = Rz(pgrid([u8(snp[n]) for n in range(N)]))                                            # source: ALL patches are context
+        p32 = Rz(pgrid([u8(tnp[n]) if n in anc_set else black for n in range(N)], lambda n: (45, 220, 45) if n in anc_set else None))  # target: only anchors
+        p41 = Rz(pgrid([u8(pred[rset[n]]) if n in rset else u8(tnp[n]) for n in range(N)], lambda n: (70, 150, 255) if n in rset else None))
+        p42 = Rz(pgrid([u8(tnp[rec[pick[rset[n]]]]) if n in rset else u8(tnp[n]) for n in range(N)],
+                       lambda n: ((45, 220, 45) if pick[rset[n]] == rset[n] else (235, 45, 45)) if n in rset else None))
+        vs = np.full((P, 6, 3), 50, np.uint8); W = 2 * P + 6
+        hs = np.full((6, W, 3), 50, np.uint8)
+        rows = [np.hstack([p11, vs, p12]), np.hstack([p21, vs, p22]), np.hstack([p31, vs, p32]), np.hstack([p41, vs, p42])]
+        grid = rows[0]
+        for r in rows[1:]:
+            grid = np.vstack([grid, hs, r])
+        LM, TM = 66, 18; canvas = Image.new("RGB", (LM + W, TM + grid.shape[0]), (15, 15, 15))
+        canvas.paste(Image.fromarray(grid), (LM, TM)); d = ImageDraw.Draw(canvas)
+        d.text((LM + P // 2 - 28, 4), "SOURCE t1", fill=(210, 210, 210)); d.text((LM + P + 6 + P // 2 - 30, 4), "TARGET t1c", fill=(210, 210, 210))
+        for k, lb in enumerate(["scan", "prism", "context", "predict"]):
+            d.text((6, TM + k * (P + 6) + P // 2 - 4), lb, fill=(210, 210, 210))
+        frames.append(canvas)
     frames[0].save(a.out, save_all=True, append_images=frames[1:], duration=110, loop=0, format="GIF")
     print(f"WROTE {a.out} | patient {pid} | {csz}-vox enhancing met | src {a.src}->tgt {a.tgt} | ckpt step {step}")
 
