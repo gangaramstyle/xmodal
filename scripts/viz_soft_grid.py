@@ -46,7 +46,7 @@ def find_mets(dirs, n_prisms):
     return out
 
 
-def prism_soft(E, b, tgt, mask, G, pm, blur, tau, dev):
+def prism_soft(E, b, tgt, mask, G, pm, blur, tau, dev, soft_sim="model"):
     sc = b[tgt]
     ax = int(np.argmax(np.abs(np.array(sc.volume.shape, float) - np.median(sc.volume.shape))))
     inpl = [x for x in range(3) if x != ax]
@@ -60,8 +60,11 @@ def prism_soft(E, b, tgt, mask, G, pm, blur, tau, dev):
     ctr = torch.as_tensor(anchor_mm + baseoff, device=dev, dtype=torch.float32)
     tgtp = S.sample_patches_group(b[tgt].volume, S.mixed_bag_vox(b[tgt], ctr[None], sz, unit))
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        colors = torch.nn.functional.normalize(E.color_head(blur_contents(tgtp, blur)), dim=-1)
-    sim = (colors[0] @ colors[0].T).float().cpu().numpy()
+        if soft_sim == "pixel":                                            # FIXED raw blurred pixels (non-circular)
+            feat = torch.nn.functional.normalize(blur_contents(tgtp, blur).reshape(1, N, -1).float(), dim=-1)
+        else:                                                              # trainable color_head (model-based)
+            feat = torch.nn.functional.normalize(E.color_head(blur_contents(tgtp, blur)), dim=-1)
+    sim = (feat[0] @ feat[0].T).float().cpu().numpy()
     soft = np.exp(sim / tau); soft = soft / soft.sum(1, keepdims=True)
     amb = 1.0 / (soft ** 2).sum(1)
     return dict(ax=ax, inpl=inpl, av=av, baseoff=baseoff, spacing=spacing, N=N,
@@ -78,6 +81,8 @@ def main():
     ap.add_argument("--patch-mm", type=float, default=2.0)
     ap.add_argument("--grid", type=int, default=16)
     ap.add_argument("--content-blur", type=int, default=3)
+    ap.add_argument("--soft-sim", choices=["model", "pixel"], default="model",
+                    help="pixel = FIXED blurred-pixel similarity (non-circular); model = color_head")
     ap.add_argument("--n-prisms", type=int, default=5)
     ap.add_argument("--n-queries", type=int, default=10)
     ap.add_argument("--out", default="/tmp/soft_grid.png")
@@ -99,7 +104,7 @@ def main():
     row_labels = []
     for d, pid, mask in mets:
         b = D.load_local_bundle(pid, d, device=dev)[0]
-        P = prism_soft(E, b, a.tgt, mask, G, pm, a.content_blur, a.tau, dev)
+        P = prism_soft(E, b, a.tgt, mask, G, pm, a.content_blur, a.tau, dev, soft_sim=a.soft_sim)
         av, inpl, ax, baseoff, soft, amb, vol = P["av"], P["inpl"], P["ax"], P["baseoff"], P["soft"], P["amb"], P["vol"]
         zc = int(round(av[ax])); sl = np.take(vol, int(np.clip(zc, 0, vol.shape[ax] - 1)), axis=ax); fimg = np.stack([u8(sl)] * 3, -1)
         half = G * P["spacing"] / 2 + 3 * pm

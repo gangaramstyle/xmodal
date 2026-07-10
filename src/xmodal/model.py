@@ -223,7 +223,8 @@ class Phase0Encoder(nn.Module):
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, 1]
 
-    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5, content_blur=0, held_size=None, soft_match_tau=None):
+    def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5, content_blur=0, held_size=None,
+                     soft_match_tau=None, soft_match_sim="model"):
         """MAE-style self task: hold out `mask_ratio` of patches; the encoder sees ONLY the visible
         patches (held-out ones NEVER enter the encoder); the DECODER queries the held-out positions
         to reconstruct pixels (MAE) and match position <-> blind content. Held contents are optionally
@@ -260,7 +261,11 @@ class Phase0Encoder(nn.Module):
         mae = F.l1_loss(recon, held_patches.reshape(B, n_held, self.pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
         colors = F.normalize(self.color_head(blur_contents(held_patches, content_blur)), dim=-1)  # blind + blurred
-        m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale, soft_tau=soft_match_tau)
+        # soft-target similarity source: "pixel" = FIXED raw blurred pixels (non-circular, collapse-safe);
+        # "model" = the trainable color_head (circular / collapse-prone). Only used when soft_match_tau set.
+        soft_feat = blur_contents(held_patches, content_blur).reshape(B, held_patches.shape[1], -1) \
+            if (soft_match_tau is not None and soft_match_sim == "pixel") else None
+        m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale, soft_tau=soft_match_tau, soft_feat=soft_feat)
         return dict(mae=mae, match=m_loss, match_acc=m_met["match_acc"],
                     series_repr=x[:, 0], view_repr=x[:, 1],
                     recon=recon.detach(), held_patches=held_patches.detach(),   # viz: predicted vs truth pixels
@@ -268,13 +273,13 @@ class Phase0Encoder(nn.Module):
 
     def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, content_blur=0, held_size=None, mae_weight=0.25,
                        match_weight=1.0, series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1,
-                       soft_match_tau=None):
+                       soft_match_tau=None, soft_match_sim="model"):
         """Phase-0 self: decoder MAE + matching (view a) + series-CLS (rank_hinge_xmod) + view-CLS
         (5-way BCE) across views a,b. `spec` is unused (size is per-patch) — kept for call compat."""
         from xmodal.losses import rank_hinge_xmod_loss
         out = self.forward_self(batch["patches_a"], batch["coords_a"], batch["sizes_a"],
                                 mask_ratio=mask_ratio, content_blur=content_blur, held_size=held_size,
-                                soft_match_tau=soft_match_tau)
+                                soft_match_tau=soft_match_tau, soft_match_sim=soft_match_sim)
         sa, va = out["series_repr"], out["view_repr"]
         sb, vb = self._readout(batch["patches_b"], batch["coords_b"], batch["sizes_b"], mask_ratio=mask_ratio)
         series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)

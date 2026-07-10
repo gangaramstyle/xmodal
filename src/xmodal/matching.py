@@ -42,13 +42,15 @@ def blur_contents(patches, kernel):
     return x.reshape(b, q, *patches.shape[2:])
 
 
-def slot_match_loss(slots, colors, logit_scale, soft_tau=None):
+def slot_match_loss(slots, colors, logit_scale, soft_tau=None, soft_feat=None):
     """slots, colors: [B,Q,D] L2-normalized, order-matched. Symmetric InfoNCE.
     soft_tau=None -> hard identity targets. soft_tau>0 -> SIMILARITY-SOFTENED targets: the target for
-    slot q is softmax(content-content cosine / soft_tau) over the slots, so near-identical (genuinely
-    interchangeable) patches SHARE the positive mass and confusing them is barely penalized, while
-    far confusions still cost full price. `colors` (the target contents) are symmetric, so the same
-    soft matrix serves both InfoNCE directions."""
+    slot q is softmax(similarity / soft_tau) over the slots, so genuinely-interchangeable patches SHARE
+    the positive mass (confusing them is barely penalized) while far confusions cost full price.
+    `soft_feat` [B,Q,F] chooses WHERE that similarity comes from:
+      None  -> use `colors` (the trainable color_head) = MODEL-based -> circular / collapse-prone.
+      given -> a FIXED, non-trainable descriptor (e.g. raw blurred pixels) = non-circular, collapse-safe
+               (the target is external, so collapsing colors only RAISES the loss)."""
     scale = logit_scale.exp().clamp(max=100.0)
     logits = scale * torch.einsum("bqd,bkd->bqk", slots, colors)   # [B,Q,Q]
     b, q, _ = logits.shape
@@ -58,8 +60,9 @@ def slot_match_loss(slots, colors, logit_scale, soft_tau=None):
                       + F.cross_entropy(logits.transpose(1, 2).reshape(b * q, q), target.reshape(-1)))
     else:
         with torch.no_grad():
-            sim = torch.einsum("bqd,bkd->bqk", colors, colors)    # content-content cosine [B,Q,Q], symmetric
-            soft = F.softmax(sim / soft_tau, dim=-1)               # row-normalized soft targets
+            f = F.normalize(soft_feat if soft_feat is not None else colors, dim=-1)  # fixed pixels OR model colors
+            sim = torch.einsum("bqd,bkd->bqk", f, f)              # symmetric similarity [B,Q,Q]
+            soft = F.softmax(sim / soft_tau, dim=-1)
         lp = F.log_softmax(logits, dim=-1); lpt = F.log_softmax(logits.transpose(1, 2), dim=-1)
         loss = 0.5 * (-(soft * lp).sum(-1).mean() - (soft * lpt).sum(-1).mean())
     with torch.no_grad():

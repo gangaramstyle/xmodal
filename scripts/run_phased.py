@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--soft-match-tau", type=float, default=None,
                     help="similarity-softened matching target temperature (e.g. 0.1-0.2); omit for hard identity. "
                          "Near-identical patches share the positive so ambiguous confusions aren't penalized.")
+    ap.add_argument("--soft-match-sim", choices=["model", "pixel"], default="model",
+                    help="soft-target similarity source: 'pixel' = FIXED raw blurred pixels (non-circular, "
+                         "collapse-safe); 'model' = trainable color_head (circular/collapse-prone).")
     ap.add_argument("--latent-only", action="store_true",
                     help="latent phase runs ONLY the latent loss (skip self-MAE); encoder still TRAINS unless "
                          "--freeze-encoder. Use for the online-encoder ablation (native_latent minus the freeze).")
@@ -98,7 +101,7 @@ def main():
                         patch_sizes=tuple(args.patch_sizes), prism_choices=tuple(args.prism_choices),
                         content_blur=args.content_blur, orient=args.orient, held_size=held,
                         freeze_encoder=args.freeze_encoder, latent_only=args.latent_only,
-                        soft_match_tau=args.soft_match_tau,
+                        soft_match_tau=args.soft_match_tau, soft_match_sim=args.soft_match_sim,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     phases = [("self", args.self_steps), ("cross", args.cross_steps), ("latent", args.latent_steps)]
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | phases {phases}", flush=True)
