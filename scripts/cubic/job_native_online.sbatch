@@ -26,10 +26,11 @@ echo "init-from (native @40k, pinned): $INIT"
 [ -f "$INIT" ] || { echo "missing $INIT"; exit 1; }
 
 # Like job_native_latent but NO --freeze-encoder: latent phase runs self-MAE + latent, encoder TRAINS.
-# Same lr 6e-4 / 40k init / frozen teacher as native_latent (only freeze + self-MAE differ).
+# lr 1e-4 (gentle fine-tune): 6e-4 destabilized the encoder (val_mae drifted UP) since it is 2x native's
+# 3e-4 training lr; native_latent's 6e-4 only touched the FROZEN decoder so it was never a real match.
 .venv/bin/python -u scripts/run_phased.py \
     --batch-size 224 --token-count 128 --cache-size 32 \
-    --orient native --lr 6e-4 \
+    --orient native --lr 1e-4 \
     --self-steps 0 --cross-steps 0 --latent-steps 40000 \
     --init-from "$INIT" \
     --ckpt-dir runs/native_online \
