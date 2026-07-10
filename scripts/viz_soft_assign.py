@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--tgt", default="t1c")
     ap.add_argument("--tau", type=float, default=0.1)
     ap.add_argument("--patch-mm", type=float, default=8.0, help="physical patch size (mm); try 4 or 2 for finer")
+    ap.add_argument("--fov-mm", type=float, default=None, help="spread the GxG patches over this total FOV (mm); "
+                    "decouples spacing from patch size so small patches sample a readable anatomical region")
     ap.add_argument("--content-blur", type=int, default=3)
     ap.add_argument("--out", default="/tmp/soft_assign.png")
     ap.add_argument("--device", default="cuda")
@@ -69,8 +71,12 @@ def main():
     inpl = [x for x in range(3) if x != ax]
     ctrd = np.argwhere(mask).mean(0).astype(np.float32)
     anchor_mm = (np.linalg.inv(sc.affine_inv.cpu().numpy()) @ ctrd) + sc.affine_trans.cpu().numpy()
+    av = (sc.affine_inv.cpu().numpy() @ (anchor_mm - sc.affine_trans.cpu().numpy()))   # anchor voxel
+    volc = sc.volume.cpu().numpy()
 
-    G, pm, p = 6, a.patch_mm, 16; spacing = pm * 15 / 16; N = G * G
+    G, pm, p = 6, a.patch_mm, 16
+    spacing = (a.fov_mm / G) if a.fov_mm else pm * 15 / 16                              # spread patches over --fov-mm
+    N = G * G
     lin = (np.arange(G) - (G - 1) / 2) * spacing; gi, gj = np.meshgrid(lin, lin, indexing="ij")
     baseoff = np.zeros((N, 3), np.float32); baseoff[:, inpl[0]] = gi.ravel(); baseoff[:, inpl[1]] = gj.ravel()
     unit = S.slab_unit_offsets(ax, 16, dev); sz = torch.full((1, N), pm, device=dev)
@@ -88,7 +94,7 @@ def main():
                "ambiguous (amb %.1f)" % amb[int(amb.argmax())]: int(amb.argmax()),
                "central/met (amb %.1f)" % amb[N // 2 + G // 2]: N // 2 + G // 2}
 
-    CELL = 40; thr = None
+    CELL = 40
     def grid_img(tint_q=None):
         img = Image.new("RGB", (G * CELL, G * CELL), (10, 10, 10)); dr = ImageDraw.Draw(img)
         w = soft[tint_q] / soft[tint_q].max() if tint_q is not None else None
@@ -97,29 +103,47 @@ def main():
             patch = np.array(Image.fromarray(u8(tnp[n])).resize((CELL, CELL), Image.NEAREST))
             rgb = np.stack([patch] * 3, -1).astype(np.float32)
             if tint_q is not None:
-                rgb[..., 1] = np.clip(rgb[..., 1] + 200 * w[n], 0, 255)             # green glow ~ soft mass
+                rgb[..., 1] = np.clip(rgb[..., 1] + 200 * w[n], 0, 255)
             img.paste(Image.fromarray(rgb.astype(np.uint8)), (j * CELL, i * CELL))
             if tint_q is not None:
                 if n == tint_q:
                     dr.rectangle([j * CELL, i * CELL, (j + 1) * CELL - 1, (i + 1) * CELL - 1], outline=(255, 230, 40), width=3)
-                elif w[n] > 0.35:                                                    # "considered the same"
+                elif w[n] > 0.35:
                     dr.rectangle([j * CELL, i * CELL, (j + 1) * CELL - 1, (i + 1) * CELL - 1], outline=(40, 220, 60), width=2)
         return img
 
-    panels = [("all patches (target t1c)", grid_img(None))]
-    for lbl, q in queries.items():
-        panels.append((lbl, grid_img(q)))
-    # soft-matrix heatmap (green), upscaled
-    hm = (soft / soft.max(1, keepdims=True) * 255).astype(np.uint8)
-    hmimg = Image.fromarray(np.stack([np.zeros_like(hm), hm, np.zeros_like(hm)], -1)).resize((G * CELL, G * CELL), Image.NEAREST)
-    panels.append(("soft matrix (row=query)", hmimg))
+    # ANATOMICAL LOCATOR: patch positions drawn on the real t1c slice (cropped to FOV + margin) so the
+    # interchangeability can be judged against where each patch actually is.
+    zc = int(round(av[ax])); sl = np.take(volc, int(np.clip(zc, 0, volc.shape[ax] - 1)), axis=ax)
+    fimg = np.stack([u8(sl)] * 3, -1)
+    half = G * spacing / 2 + 3 * max(pm, spacing)
+    y0 = max(0, int(av[inpl[0]] - half)); y1 = min(fimg.shape[0], int(av[inpl[0]] + half))
+    x0 = max(0, int(av[inpl[1]] - half)); x1 = min(fimg.shape[1], int(av[inpl[1]] + half))
+    SC = 300; sy = SC / max(1, y1 - y0); sx = SC / max(1, x1 - x0)
+    def locator(tint_q=None):
+        pim = Image.fromarray(np.array(Image.fromarray(fimg[y0:y1, x0:x1]).resize((SC, SC), Image.NEAREST)))
+        dr = ImageDraw.Draw(pim); w = soft[tint_q] / soft[tint_q].max() if tint_q is not None else None
+        r = max(3, pm / 2 * (sy + sx) / 2)
+        for n in range(N):
+            py = (av[inpl[0]] + baseoff[n][inpl[0]] - y0) * sy; px = (av[inpl[1]] + baseoff[n][inpl[1]] - x0) * sx
+            col, wdt = (110, 110, 110), 1
+            if tint_q is not None:
+                col, wdt = ((255, 230, 40), 3) if n == tint_q else (((40, 220, 60), 2) if w[n] > 0.35 else ((70, 70, 70), 1))
+            dr.rectangle([px - r, py - r, px + r, py + r], outline=col, width=wdt)
+        return pim
 
-    LM, TM, GAP = 8, 20, 12; PW = G * CELL
+    panels = [("locate: all patches", locator(None)), ("patch contents", grid_img(None))]
+    for lbl, q in queries.items():
+        panels.append(("on brain: " + lbl, locator(q)))
+    hm = (soft / soft.max(1, keepdims=True) * 255).astype(np.uint8)
+    panels.append(("soft matrix", Image.fromarray(np.stack([np.zeros_like(hm), hm, np.zeros_like(hm)], -1))))
+
+    LM, TM, GAP, PW = 8, 20, 12, 300
     W = LM + len(panels) * (PW + GAP); H = TM + PW + 24
     canvas = Image.new("RGB", (W, H), (18, 18, 18)); d = ImageDraw.Draw(canvas)
-    d.text((LM, 4), f"SOFT-ASSIGNMENT tau={a.tau}  patch={pm:g}mm  ckpt step {step}  {pid}  amb {amb.min():.1f}-{amb.max():.1f}/{N}  (yellow=query, green=interchangeable)", fill=(220, 220, 220))
+    d.text((LM, 4), f"SOFT-ASSIGN tau={a.tau} patch={pm:g}mm fov={G*spacing:.0f}mm  {pid} step {step}  amb {amb.min():.1f}-{amb.max():.1f}/{N}  (yellow=query, green=interchangeable)", fill=(220, 220, 220))
     for idx, (lbl, im) in enumerate(panels):
-        x = LM + idx * (PW + GAP); canvas.paste(im, (x, TM)); d.text((x, TM + PW + 4), lbl, fill=(210, 210, 210))
+        x = LM + idx * (PW + GAP); canvas.paste(im.resize((PW, PW), Image.NEAREST), (x, TM)); d.text((x, TM + PW + 4), lbl, fill=(210, 210, 210))
     canvas.save(a.out)
     print(f"WROTE {a.out} | {pid} | tau {a.tau} | ambiguity range {amb.min():.1f}-{amb.max():.1f} (of {N}) | ckpt step {step}")
 
