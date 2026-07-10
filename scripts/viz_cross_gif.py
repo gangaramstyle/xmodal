@@ -104,12 +104,12 @@ def main():
 
     def full(vol, z):
         sl = np.take(vol, int(np.clip(z, 0, vol.shape[ax] - 1)), axis=ax); img = np.stack([u8(sl)] * 3, -1)
-        y0, y1 = int(av[inpl[0]] - hw), int(av[inpl[0]] + hw); x0, x1 = int(av[inpl[1]] - hw), int(av[inpl[1]] + hw)
-        g = np.array([40, 220, 90], np.uint8)
-        for (yy, xx) in [(y0, slice(x0, x1)), (y1, slice(x0, x1))]:
-            img[np.clip(yy, 0, img.shape[0] - 1), xx] = g
-        for (yy, xx) in [(slice(y0, y1), x0), (slice(y0, y1), x1)]:
-            img[yy, np.clip(xx, 0, img.shape[1] - 1)] = g
+        H, W = img.shape[:2]; g = np.array([40, 220, 90], np.uint8); th = max(2, H // 140)   # thick enough to survive resize
+        y0, y1 = int(np.clip(av[inpl[0]] - hw, 0, H - 1)), int(np.clip(av[inpl[0]] + hw, 0, H - 1))
+        x0, x1 = int(np.clip(av[inpl[1]] - hw, 0, W - 1)), int(np.clip(av[inpl[1]] + hw, 0, W - 1))
+        for d in range(th):
+            img[np.clip(y0 + d, 0, H - 1), x0:x1 + 1] = g; img[np.clip(y1 - d, 0, H - 1), x0:x1 + 1] = g
+            img[y0:y1 + 1, np.clip(x0 + d, 0, W - 1)] = g; img[y0:y1 + 1, np.clip(x1 - d, 0, W - 1)] = g
         return img
 
     frames = []
@@ -128,16 +128,17 @@ def main():
             q = E._decode(q, cx, cc, co[:, rect]); pred = E.dec_pixel_head(q)[0].reshape(-1, 16, 16).float().cpu().numpy()
             slt = F.normalize(E.match_slot_proj(q), dim=-1); clr = F.normalize(E.color_head(_blur(tgt[:, rect], 3)), dim=-1)
             pick = (slt @ clr.transpose(1, 2))[0].argmax(1).cpu().numpy()
-        tnp = tgt[0, :, :, :, 0].float().cpu().numpy()
+        tnp = tgt[0, :, :, :, 0].float().cpu().numpy(); snp = src[0, :, :, :, 0].float().cpu().numpy()
         FT = 260
         ft1c = np.array(Image.fromarray(full(volc, zc)).resize((FT, FT), Image.NEAREST))
         ft1n = np.array(Image.fromarray(full(voln, zc)).resize((FT, FT), Image.NEAREST))
         row1 = np.hstack([ft1c, np.full((FT, 4, 3), 50, np.uint8), ft1n])
+        srcg = pgrid([u8(snp[n]) for n in range(N)])                                     # SOURCE t1 the model was given
         gt = pgrid([u8(tnp[n]) for n in range(N)])
         prd = pgrid([u8(pred[rset[n]]) if n in rset else u8(tnp[n]) for n in range(N)], lambda n: (70, 150, 255) if n in rset else None)
         jig = pgrid([u8(tnp[rec[pick[rset[n]]]]) if n in rset else u8(tnp[n]) for n in range(N)],
                     lambda n: ((45, 220, 45) if pick[rset[n]] == rset[n] else (235, 45, 45)) if n in rset else None)
-        sep = np.full((G * p, 4, 3), 50, np.uint8); row2 = np.hstack([gt, sep, prd, sep, jig])
+        sep = np.full((G * p, 4, 3), 50, np.uint8); row2 = np.hstack([srcg, sep, gt, sep, prd, sep, jig])
         r1 = Image.fromarray(row1); r2 = Image.fromarray(row2).resize((r1.width, int(row2.shape[0] * r1.width / row2.shape[1])), Image.NEAREST)
         frames.append(Image.fromarray(np.vstack([np.array(r1), np.full((4, r1.width, 3), 50, np.uint8), np.array(r2)])).resize((640, int((r1.height + 4 + r2.height) * 640 / r1.width)), Image.NEAREST))
     frames[0].save(a.out, save_all=True, append_images=frames[1:], duration=110, loop=0, format="GIF")
