@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--orient", default="native")
     ap.add_argument("--anchor-frac", type=float, default=0.05)
     ap.add_argument("--gate", type=float, default=0.25)
+    ap.add_argument("--all-patients", action="store_true",
+                    help="use ALL found patients (data-root is already a held-out set; skip the train/val split)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -79,7 +81,10 @@ def main():
         if os.path.isdir(d):
             pid2dir.update(D.find_brats_patients(d))
     all_pids = sorted(pid2dir)
-    _, val_pids = H.split_patients(all_pids, seed=args.holdout_seed, val_frac=args.holdout_frac)
+    if args.all_patients:
+        val_pids = all_pids
+    else:
+        _, val_pids = H.split_patients(all_pids, seed=args.holdout_seed, val_frac=args.holdout_frac)
     print(f"held-out patients: {len(val_pids)} (using up to {args.max_patients})", flush=True)
 
     enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
