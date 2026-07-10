@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--tracks", nargs="+", default=["mets_ho"])
     ap.add_argument("--tgt", default="t1c")
     ap.add_argument("--tau", type=float, default=0.1)
+    ap.add_argument("--patch-mm", type=float, default=8.0, help="physical patch size (mm); try 4 or 2 for finer")
     ap.add_argument("--content-blur", type=int, default=3)
     ap.add_argument("--out", default="/tmp/soft_assign.png")
     ap.add_argument("--device", default="cuda")
@@ -69,7 +70,7 @@ def main():
     ctrd = np.argwhere(mask).mean(0).astype(np.float32)
     anchor_mm = (np.linalg.inv(sc.affine_inv.cpu().numpy()) @ ctrd) + sc.affine_trans.cpu().numpy()
 
-    G, pm, p = 6, 8.0, 16; spacing = pm * 15 / 16; N = G * G
+    G, pm, p = 6, a.patch_mm, 16; spacing = pm * 15 / 16; N = G * G
     lin = (np.arange(G) - (G - 1) / 2) * spacing; gi, gj = np.meshgrid(lin, lin, indexing="ij")
     baseoff = np.zeros((N, 3), np.float32); baseoff[:, inpl[0]] = gi.ravel(); baseoff[:, inpl[1]] = gj.ravel()
     unit = S.slab_unit_offsets(ax, 16, dev); sz = torch.full((1, N), pm, device=dev)
@@ -116,7 +117,7 @@ def main():
     LM, TM, GAP = 8, 20, 12; PW = G * CELL
     W = LM + len(panels) * (PW + GAP); H = TM + PW + 24
     canvas = Image.new("RGB", (W, H), (18, 18, 18)); d = ImageDraw.Draw(canvas)
-    d.text((LM, 4), f"SOFT-ASSIGNMENT tau={a.tau}  ckpt step {step}  {pid}  (yellow=query, green=interchangeable soft>0.35 of max)", fill=(220, 220, 220))
+    d.text((LM, 4), f"SOFT-ASSIGNMENT tau={a.tau}  patch={pm:g}mm  ckpt step {step}  {pid}  amb {amb.min():.1f}-{amb.max():.1f}/{N}  (yellow=query, green=interchangeable)", fill=(220, 220, 220))
     for idx, (lbl, im) in enumerate(panels):
         x = LM + idx * (PW + GAP); canvas.paste(im, (x, TM)); d.text((x, TM + PW + 4), lbl, fill=(210, 210, 210))
     canvas.save(a.out)
