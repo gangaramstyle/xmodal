@@ -62,6 +62,7 @@ class TrainConfig:
     # cross / latent phase
     cross_weight: float = 1.0         # weight on the cross-modal decoder loss (added to encoder objectives)
     match_weight: float = 1.0         # matching vs pixel weight inside forward_cross
+    soft_match_tau: float | None = None  # similarity-softened matching target (None=hard identity). ~0.1-0.2
     anchor_frac: float = 0.05
     freeze_encoder: bool = False      # phase-4 faithful: freeze the encoder during the LATENT phase and train
                                       # only the decoder + latent_head (no self-MAE). Teacher==frozen encoder.
@@ -239,7 +240,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
                                     held_size=cfg.held_size,
                                     mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
                                     series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
-                                    rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod)
+                                    rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod,
+                                    soft_match_tau=cfg.soft_match_tau)
 
     @torch.no_grad()
     def validate():
