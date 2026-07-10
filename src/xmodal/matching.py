@@ -60,8 +60,12 @@ def slot_match_loss(slots, colors, logit_scale, soft_tau=None, soft_feat=None):
                       + F.cross_entropy(logits.transpose(1, 2).reshape(b * q, q), target.reshape(-1)))
     else:
         with torch.no_grad():
-            f = F.normalize(soft_feat if soft_feat is not None else colors, dim=-1)  # fixed pixels OR model colors
-            sim = torch.einsum("bqd,bkd->bqk", f, f)              # symmetric similarity [B,Q,Q]
+            if soft_feat is not None:                            # FIXED raw pixels: RBF (Euclidean), intensity-aware.
+                d2 = torch.cdist(soft_feat, soft_feat) ** 2      # [B,Q,Q]; cosine would over-pool flat patches
+                med = d2.flatten(1).median(1).values.clamp_min(1e-6)
+                sim = -d2 / med[:, None, None]                   # neg normalized sq-dist; self=0=max
+            else:                                                # trainable color_head: cosine
+                f = F.normalize(colors, dim=-1); sim = torch.einsum("bqd,bkd->bqk", f, f)
             soft = F.softmax(sim / soft_tau, dim=-1)
         lp = F.log_softmax(logits, dim=-1); lpt = F.log_softmax(logits.transpose(1, 2), dim=-1)
         loss = 0.5 * (-(soft * lp).sum(-1).mean() - (soft * lpt).sum(-1).mean())
