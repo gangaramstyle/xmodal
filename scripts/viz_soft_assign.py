@@ -39,6 +39,8 @@ def main():
     ap.add_argument("--patch-mm", type=float, default=8.0, help="physical patch size (mm); try 4 or 2 for finer")
     ap.add_argument("--fov-mm", type=float, default=None, help="spread the GxG patches over this total FOV (mm); "
                     "decouples spacing from patch size so small patches sample a readable anatomical region")
+    ap.add_argument("--grid", type=int, default=6, help="patches per side (G). Larger G + no --fov-mm = dense tiling "
+                    "of a bigger region (e.g. --grid 16 --patch-mm 2 tiles ~30mm densely)")
     ap.add_argument("--content-blur", type=int, default=3)
     ap.add_argument("--out", default="/tmp/soft_assign.png")
     ap.add_argument("--device", default="cuda")
@@ -74,8 +76,8 @@ def main():
     av = (sc.affine_inv.cpu().numpy() @ (anchor_mm - sc.affine_trans.cpu().numpy()))   # anchor voxel
     volc = sc.volume.cpu().numpy()
 
-    G, pm, p = 6, a.patch_mm, 16
-    spacing = (a.fov_mm / G) if a.fov_mm else pm * 15 / 16                              # spread patches over --fov-mm
+    G, pm, p = a.grid, a.patch_mm, 16
+    spacing = (a.fov_mm / G) if a.fov_mm else pm * 15 / 16                              # default = dense tiling (spacing~=patch)
     N = G * G
     lin = (np.arange(G) - (G - 1) / 2) * spacing; gi, gj = np.meshgrid(lin, lin, indexing="ij")
     baseoff = np.zeros((N, 3), np.float32); baseoff[:, inpl[0]] = gi.ravel(); baseoff[:, inpl[1]] = gj.ravel()
