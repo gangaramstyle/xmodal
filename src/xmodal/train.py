@@ -65,6 +65,8 @@ class TrainConfig:
     anchor_frac: float = 0.05
     freeze_encoder: bool = False      # phase-4 faithful: freeze the encoder during the LATENT phase and train
                                       # only the decoder + latent_head (no self-MAE). Teacher==frozen encoder.
+    latent_only: bool = False         # latent phase runs ONLY the latent loss (skip self-MAE); the encoder
+                                      # still TRAINS unless --freeze-encoder. Isolates freeze vs online-encoder.
     pairs_per_patient: int = 6
     # mixed-size 2.5D sampling (categorical): per-patch physical size + per-item prism extent (mm)
     patch_sizes: tuple = (4.0, 8.0, 16.0)  # INPUT context sizes (4mm ok as input); held-out target scale set by held_size
@@ -292,8 +294,9 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             for g in opt.param_groups:
                 g["lr"] = lr
             with torch.autocast(**amp):
-              if pname == "latent" and cfg.freeze_encoder:
-                # Phase-4 faithful: frozen encoder, NO self-MAE. Decoder trains only on latent cross-pred.
+              if pname == "latent" and (cfg.freeze_encoder or cfg.latent_only):
+                # Latent-only step (NO self-MAE): the decoder -- and the encoder too, unless
+                # --freeze-encoder -- trains only on latent cross-pred vs the frozen teacher's latents.
                 bc = crossb(pool()); s_scls, t_scls, t_lat = teach(bc, want_latent=True)
                 outc = model.forward_cross_latent(bc["source"], bc["target"], bc["coords"], bc["sizes"],
                                                   s_scls, t_scls, t_lat, anchor_frac=cfg.anchor_frac)

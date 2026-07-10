@@ -1,10 +1,10 @@
 #!/bin/bash
-# FORK off native @40k: ONLINE-ENCODER latent (JEPA-style). Same as native_latent BUT WITHOUT
-# --freeze-encoder, so the student ENCODER trains on self-MAE + latent cross-prediction while the
-# frozen native@40k teacher supplies the (stationary, non-collapsing) target latents. Question:
-# does baking the cross-modal-prediction objective into the encoder finally lift the encoder-readout
-# F1 off ~0.64? Success metric = molab encoder-embedding F1 moving (NOT latent_cos). Self-MAE stays
-# on as the anti-collapse anchor; frozen (not EMA) teacher = no collapse but a fixed target.
+# FORK off native @40k: ONLINE-ENCODER latent (JEPA-style). Like job_native_latent but WITHOUT
+# --freeze-encoder, so the student ENCODER trains on self-MAE + latent cross-prediction against the
+# FROZEN native@40k teacher's target latents (self-MAE grounds the encoder; frozen rich target also
+# blocks collapse). Same lr 6e-4 / 40k init / teacher as native_latent for comparability. Question:
+# does baking cross-modal prediction into the encoder lift the encoder-readout F1 off ~0.64?
+# Success metric = molab encoder-embedding F1 moving (NOT latent_cos).
 #SBATCH --job-name=xmodal_native_online
 #SBATCH --partition=ai
 #SBATCH --gres=gpu:a40:1
@@ -25,12 +25,11 @@ INIT=runs/native/step_040000.pt          # pinned 40k fork point == the frozen t
 echo "init-from (native @40k, pinned): $INIT"
 [ -f "$INIT" ] || { echo "missing $INIT"; exit 1; }
 
-# self/cross 0 -> straight into latent; teacher snapshots from the 40k init weights (frozen).
-# NO --freeze-encoder: encoder trains (self-MAE + latent). Native sampling; gentle 1e-4 fine-tune LR.
+# Like job_native_latent but NO --freeze-encoder: latent phase runs self-MAE + latent, encoder TRAINS.
+# Same lr 6e-4 / 40k init / frozen teacher as native_latent (only freeze + self-MAE differ).
 .venv/bin/python -u scripts/run_phased.py \
     --batch-size 224 --token-count 128 --cache-size 32 \
-    --patch-sizes 4 8 16 --held-size 8 16 --content-blur 3 \
-    --orient native --lr 1e-4 \
+    --orient native --lr 6e-4 \
     --self-steps 0 --cross-steps 0 --latent-steps 40000 \
     --init-from "$INIT" \
     --ckpt-dir runs/native_online \
