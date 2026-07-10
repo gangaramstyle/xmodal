@@ -22,7 +22,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 .venv/bin/python -u scripts/run_phased.py \
     --batch-size 224 --token-count 128 --cache-size 32 \
     --patch-sizes 4 8 16 --held-size 8 16 --content-blur 3 \
-    --orient native --seed 0 \
+    --orient native --seed ${SEED:-0} \
     --self-steps 25000 --cross-steps 0 --latent-steps 0 \
-    --ckpt-dir runs/hardmatch \
-    --wandb xmodal-phased --wandb-run "hardmatch_${SLURM_JOB_ID:-manual}"
+    --ckpt-dir runs/hardmatch_s${SEED:-0} \
+    --wandb xmodal-phased --wandb-run "hardmatch_s${SEED:-0}_${SLURM_JOB_ID:-manual}"
