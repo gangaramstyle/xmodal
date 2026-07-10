@@ -122,16 +122,21 @@ def main():
     y0 = max(0, int(av[inpl[0]] - half)); y1 = min(fimg.shape[0], int(av[inpl[0]] + half))
     x0 = max(0, int(av[inpl[1]] - half)); x1 = min(fimg.shape[1], int(av[inpl[1]] + half))
     SC = 300; sy = SC / max(1, y1 - y0); sx = SC / max(1, x1 - x0)
+    r = max(2, pm / 2 * (sy + sx) / 2)
+    def pos(n):
+        return (av[inpl[1]] + baseoff[n][inpl[1]] - x0) * sx, (av[inpl[0]] + baseoff[n][inpl[0]] - y0) * sy
     def locator(tint_q=None):
-        pim = Image.fromarray(np.array(Image.fromarray(fimg[y0:y1, x0:x1]).resize((SC, SC), Image.NEAREST)))
-        dr = ImageDraw.Draw(pim); w = soft[tint_q] / soft[tint_q].max() if tint_q is not None else None
-        r = max(3, pm / 2 * (sy + sx) / 2)
-        for n in range(N):
-            py = (av[inpl[0]] + baseoff[n][inpl[0]] - y0) * sy; px = (av[inpl[1]] + baseoff[n][inpl[1]] - x0) * sx
-            col, wdt = (110, 110, 110), 1
-            if tint_q is not None:
-                col, wdt = ((255, 230, 40), 3) if n == tint_q else (((40, 220, 60), 2) if w[n] > 0.35 else ((70, 70, 70), 1))
-            dr.rectangle([px - r, py - r, px + r, py + r], outline=col, width=wdt)
+        base = np.array(Image.fromarray(fimg[y0:y1, x0:x1]).resize((SC, SC), Image.NEAREST)).astype(np.float32)
+        if tint_q is not None:
+            w = soft[tint_q] / soft[tint_q].max()                                       # CONTINUOUS green ~ interchangeability
+            for n in range(N):
+                if n == tint_q:
+                    continue
+                px, py = pos(n); yy0, yy1 = max(0, int(py - r)), int(py + r); xx0, xx1 = max(0, int(px - r)), int(px + r)
+                base[yy0:yy1, xx0:xx1, 1] = np.clip(base[yy0:yy1, xx0:xx1, 1] + 235 * w[n], 0, 255)
+        pim = Image.fromarray(base.astype(np.uint8)); dr = ImageDraw.Draw(pim)
+        if tint_q is not None:
+            px, py = pos(tint_q); dr.rectangle([px - r, py - r, px + r, py + r], outline=(255, 230, 40), width=3)
         return pim
 
     panels = [("locate: all patches", locator(None)), ("patch contents", grid_img(None))]
