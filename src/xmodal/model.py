@@ -40,7 +40,8 @@ class EncoderConfig:
     patch_voxels: int = 16            # 2.5D slab sample grid (V,V,1); physical size is per-patch (size embed)
     rope_lambda_min_mm: float = 2.0
     rope_lambda_max_mm: float = 1024.0
-    scan_context: bool = False        # v3: scan-conditioned target teacher + per-patch scan-context on tokens
+    scan_context: bool = False        # v3: scan-relative input channels on stem + target teacher
+    max_source: int = 128             # v3: source-slot bank size for ACTIVE variable registers (missing patches)
 
 
 # --- mm-RoPE over physical-mm coords --------------------------------------------------
@@ -168,6 +169,10 @@ class Phase0Encoder(nn.Module):
         self.series_token = nn.Parameter(torch.randn(cfg.width) * 0.02)
         self.view_token = nn.Parameter(torch.randn(cfg.width) * 0.02)
         self.registers = nn.Parameter(torch.randn(cfg.n_registers, cfg.width) * 0.02)
+        # ACTIVE variable registers (v3): a bank of DISTINCT learned embeddings, one per source slot, used
+        # for missing source patches. Distinct (not identical copies) so they add attention diversity, not a
+        # single repeated token. No fake modality/size/scan embedding; coord 0 (non-spatial, set by sampler).
+        self.source_registers = nn.Parameter(torch.randn(cfg.max_source, cfg.width) * 0.02)
         self.mask_token = nn.Parameter(torch.randn(cfg.width) * 0.02)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.depth))
         self.norm = nn.LayerNorm(cfg.width)
@@ -215,16 +220,19 @@ class Phase0Encoder(nn.Module):
             return self._scan_channels(raw, raw if reference is None else reference, stats)
         return raw
 
-    def embed(self, patches, sizes, series_ids=None, reference=None, stats=None):
+    def embed(self, patches, sizes, series_ids=None, reference=None, stats=None, valid=None):
         """patches [B,n,V,V,1] (PRESENTED raw) + sizes [B,n,3] -> tokens [B,n,W]. `series_ids` additively
-        injects modality (Site A). `reference`+`stats` build the scan-relative channels (scan-context A);
-        `reference` is the CLEAN intensity for z/CDF (defaults to `patches` when there is no augmentation)."""
+        injects modality (Site A). `reference`+`stats` build the scan-relative channels (scan-context A).
+        `valid` [B,n] bool: slots that are False are MISSING source patches -> replaced wholesale by a
+        distinct active register (no content/size/series/scan signal); the sampler sets their coord to 0."""
         B, n = patches.shape[:2]
         inp = self._stem_in(patches, reference, stats).reshape(B * n, self.in_ch, *self.grid)
         tok = self.stem(inp).reshape(B, n, self.cfg.width)
         tok = tok + self._size_emb(sizes).to(tok.dtype)
         if series_ids is not None:
             tok = tok + self.series_in_embed(series_ids).to(tok.dtype)
+        if valid is not None:
+            tok = torch.where(valid[..., None], tok, self.source_registers[:n][None].to(tok.dtype))
         return tok
 
     def encode(self, tokens, coords):
@@ -339,10 +347,10 @@ class Phase0Encoder(nn.Module):
                     rel_acc=float(rel_acc), series_viol=float(series_viol))
 
     # ---- mixed-modality conditioned SSL (docs/MIXED_MODAL_DESIGN.md) ------------------
-    def _view_repr(self, patches, coords, sizes, series_ids, reference=None, stats=None):
+    def _view_repr(self, patches, coords, sizes, series_ids, reference=None, stats=None, valid=None):
         """Encode a bag (per-patch source series, Site A) -> its view-CLS output [B,W] (for view-CLS)."""
         B = patches.shape[0]
-        toks, ccs = self._context([self.embed(patches, sizes, series_ids, reference, stats)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids, reference, stats, valid)], [coords], patches.device, B)
         return self.encode(toks, ccs)[:, 1]
 
     def forward_mixed(self, batch, *, content_blur=0, ema_color=False, mae_weight=0.25, match_weight=1.0,
@@ -359,7 +367,7 @@ class Phase0Encoder(nn.Module):
         ca, za, ssa = batch["coords_a"], batch["sizes_a"], batch["source_series_a"]
         sta = batch.get("stats_a")                                                  # v3 scan-context (None if off)
         B, n = pa.shape[:2]
-        x = self.encode(*self._context([self.embed(pa, za, ssa, ref_a, sta)], [ca], dev, B))
+        x = self.encode(*self._context([self.embed(pa, za, ssa, ref_a, sta, batch.get("source_valid_a"))], [ca], dev, B))
         src_enc = x[:, nreg:]; va = x[:, 1]
         if drop_source:                                                             # CONTROL: no anatomical context
             src_enc = torch.zeros_like(src_enc)
@@ -383,7 +391,8 @@ class Phase0Encoder(nn.Module):
             m_loss, m_met, colors = self._match_loss(slots, hsem, content_blur, ema=ema_color, stats=hstats)
             match_acc = m_met["match_acc"]
         vb = self._view_repr(batch["patches_b_raw"], batch["coords_b"], batch["sizes_b"],
-                             batch["source_series_b"], batch.get("patches_b_reference"), batch.get("stats_b"))
+                             batch["source_series_b"], batch.get("patches_b_reference"), batch.get("stats_b"),
+                             batch.get("source_valid_b"))
         rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
         rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
         spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()

@@ -41,7 +41,7 @@ def main():
     ap.add_argument("--patch-sizes", type=float, nargs="+", default=[4., 8., 16.])
     ap.add_argument("--content-blur", type=int, default=3, help="blur held-out contents before color head")
     ap.add_argument("--orient", choices=["scan", "native", "random"], default="native")
-    ap.add_argument("--prism-choices", type=float, nargs="+", default=[32., 64., 128.])
+    ap.add_argument("--prism-choices", type=float, nargs="+", default=[32., 64.])   # v3: dropped 128 (mostly background)
     ap.add_argument("--lr", type=float, default=3e-4, help="base (peak) learning rate")
     ap.add_argument("--seed", type=int, default=0, help="training seed (data sampling + weight init)")
     ap.add_argument("--ema-color", action="store_true",

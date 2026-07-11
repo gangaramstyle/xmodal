@@ -23,33 +23,33 @@ def frac_fg(patches):
 
 
 def audit_config(bundles, *, prism, ssize, bags, batch, device, rng):
-    n_valid_src, ndup, src_fg, tgt_fg, tgt_allvalid, src_zero, overlap = [], [], [], [], [], [], []
+    # NEW sampler: source/targets from foreground, register mask marks missing source. Report the ACTUAL
+    # register mask (not fg-inferred) for N_real, and foreground fraction over VALID (real) slots only.
+    nreal, ndup, src_fg, tgt_fg, tgt_allvalid, reg_frac, overlap = [], [], [], [], [], [], []
     done = 0
     while done < bags:
         bs = min(batch, bags - done)
         b = S.sample_mixed_paired_batch(
             bundles, batch_size=bs, token_count=128, held_count=48, n_series=8, step=0, total=1,
             patch_sizes=(ssize,), voxels=16, prism_choices=(prism,), orient="native", rng=rng, device=device,
-            structured=True, n_pos=12, target_size=8.0, scan_context=False)
-        sfg = frac_fg(b["patches_a_reference"])              # [bs,128]
-        hfg = frac_fg(b["held_semantic"])                    # [bs,48]
-        n_valid_src.append((sfg >= FG_MIN).float().sum(1).cpu().numpy())     # N_real per bag
-        src_fg.append(sfg.mean(1).cpu().numpy()); tgt_fg.append(hfg.mean(1).cpu().numpy())
-        src_zero.append((sfg < FG_EPS).float().mean(1).cpu().numpy())        # all-zero (padding/bg) source frac
-        tgt_allvalid.append(((hfg >= FG_MIN).all(1)).float().cpu().numpy())  # all 48 held valid
-        overlap.append(b["overlap_rate"])
-        ca = b["coords_a"]                                                   # [bs,128,3] centers rel anchor
-        dd = torch.cdist(ca, ca)                                            # in-plane approx; near-dup if < ssize/2
+            structured=True, n_pos=12, target_size=8.0, scan_context=False, source_dropout=0.0)  # dropout off: measure availability
+        valid = b["source_valid_a"]                          # [bs,128] real-vs-register
+        sfg = frac_fg(b["patches_a_reference"]); hfg = frac_fg(b["held_semantic"])
+        nreal.append(valid.sum(1).cpu().numpy())
+        vfg = torch.where(valid, sfg, torch.full_like(sfg, float("nan")))
+        src_fg.append(np.nanmean(vfg.cpu().numpy(), 1)); tgt_fg.append(hfg.mean(1).cpu().numpy())
+        tgt_allvalid.append(((hfg >= FG_MIN).all(1)).float().cpu().numpy())
+        reg_frac.append(float(b["reg_frac"])); overlap.append(b["overlap_rate"])
+        ca = b["coords_a"]; dd = torch.cdist(ca, ca)
         eye = torch.eye(128, dtype=torch.bool, device=device)[None]
-        ndup.append(((dd < ssize / 2) & ~eye).float().sum(-1).mean(-1).cpu().numpy())
+        ndup.append(((dd < ssize / 2) & ~eye & valid[:, :, None] & valid[:, None, :]).float().sum(-1).mean(-1).cpu().numpy())
         done += bs
-    nreal = np.concatenate(n_valid_src)
+    nr = np.concatenate(nreal)
     return dict(prism=prism, ssize=ssize,
-                nreal_med=float(np.median(nreal)), nreal_p5=float(np.percentile(nreal, 5)),
-                nreal_lt64=float((nreal < 64).mean()), reg_frac_med=float(np.median((128 - nreal) / 128)),
-                src_fg=float(np.mean(np.concatenate(src_fg))), tgt_fg=float(np.mean(np.concatenate(tgt_fg))),
-                src_zero=float(np.mean(np.concatenate(src_zero))),
-                tgt_allvalid=float(np.mean(np.concatenate(tgt_allvalid))),
+                nreal_med=float(np.median(nr)), nreal_p5=float(np.percentile(nr, 5)),
+                nreal_lt64=float((nr < 64).mean()), reg_frac_med=float(np.mean(reg_frac)),
+                src_fg=float(np.nanmean(np.concatenate(src_fg))), tgt_fg=float(np.mean(np.concatenate(tgt_fg))),
+                src_zero=0.0, tgt_allvalid=float(np.mean(np.concatenate(tgt_allvalid))),
                 ndup=float(np.mean(np.concatenate(ndup))), overlap=float(np.mean(overlap)))
 
 

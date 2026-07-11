@@ -412,6 +412,86 @@ def _apply_hardneg(oh, sh, sdh, present, frac, rng):
         sdh[i0], sdh[i1] = int(s0), int(s1)                       # differ ONLY in modality
 
 
+PRISM_SIZE_MAP = {32.0: (4.0, 8.0), 64.0: (4.0, 8.0, 16.0)}   # v3: per-prism source sizes (16mm only in 64mm)
+
+
+def _common_fg(sid2, cap=50000):
+    """Union of the co-registered modalities' foreground clouds -> common brain-ish mask [K,3] world-mm
+    (subsampled to `cap`). Sampling target/source centers from THIS (not uniform-in-box) is what makes
+    patches land on anatomy instead of skull-stripped background (audit: uniform gave tgt_ok ~50% and
+    40-60% background at 64/128 mm)."""
+    import torch
+    clouds = [sc.foreground_mm for sc in sid2.values()]
+    fg = torch.cat(clouds, 0) if len(clouds) > 1 else clouds[0]
+    if fg.shape[0] > cap:
+        fg = fg[torch.randint(fg.shape[0], (cap,), device=fg.device)]
+    return fg
+
+
+def _local_fg(common_fg, anchor, half):
+    """Points of `common_fg` inside the prism box (L-inf <= half of anchor) -> [K,3]."""
+    d = (common_fg - anchor[None]).abs().amax(-1)
+    return common_fg[d <= half]
+
+
+def _fps(points, k, rng):
+    """Farthest-point sample k well-separated indices from `points` [K,3] (greedy). Returns [k] LongTensor.
+    Ensures the 12 target positions are distinct so position|modality isn't confused by near-duplicates."""
+    import torch
+    K = points.shape[0]
+    if K <= k:
+        return torch.arange(K, device=points.device)
+    idx = torch.empty(k, dtype=torch.long, device=points.device)
+    idx[0] = int(rng.integers(K))
+    d = (points - points[idx[0]][None]).pow(2).sum(-1)
+    for i in range(1, k):
+        idx[i] = int(d.argmax())
+        d = torch.minimum(d, (points - points[idx[i]][None]).pow(2).sum(-1))
+    return idx
+
+
+def _band_anchor(fg, a_a, dmin, dmax, rng):
+    """View-b anchor: a foreground point ~log-uniform(dmin,dmax) from a_a (for the view-CLS pair)."""
+    import torch
+    dwant = float(np.exp(rng.uniform(np.log(dmin), np.log(dmax))))
+    dist = (fg - a_a[None]).norm(dim=-1)
+    band = torch.nonzero((dist >= 0.7 * dwant) & (dist <= 1.3 * dwant), as_tuple=False).flatten()
+    return fg[int(band[int(rng.integers(band.numel()))])] if band.numel() > 0 else fg[int((dist - dwant).abs().argmin())]
+
+
+def _fg_source(local_np, n, sizes_pool, present, share, n_hard_min, dropout, tgt_rel, tsize, thick, excl_frac, rng):
+    """Build the source bag from prism foreground offsets `local_np` [K,3] (RELATIVE to anchor). Returns
+    per-slot (offsets [n,3], valid_mask [n] bool, series [n], sizes [n], overlap_rate). Real patches
+    occupy n_real = min(K,n) slots (minus random dropout, floored at n_hard_min); the rest are REGISTER
+    slots (valid=False). Real source-modality counts are EXACT over real slots; real patches are SCATTERED
+    into random slots (so register count isn't a positional signal). Source overlapping a target slab is
+    redrawn from `local_np`."""
+    K = len(local_np)
+    n_real = min(K, n)
+    if dropout > 0 and n_real > n_hard_min:
+        n_real = max(n_hard_min, n_real - int(rng.random() * dropout * n_real))
+    cen = local_np[rng.choice(K, size=n_real, replace=(K < n_real))].astype(np.float32)   # [n_real,3] rel anchor
+    sizes_r = np.asarray(sizes_pool, np.float32)[rng.integers(len(sizes_pool), size=n_real)]
+    orate = 0.0
+    if excl_frac > 0 and tgt_rel is not None and n_real:                        # redraw source overlapping a target slab
+        ip = [a for a in (0, 1, 2) if a != thick]
+        viol = np.zeros(n_real, dtype=bool)
+        for _ in range(8):
+            d = np.abs(cen[:, None, :] - tgt_rel[None, :, :])                    # [n_real,P,3]
+            viol = ((d[:, :, ip[0]] < (sizes_r[:, None] + tsize) / 2) &
+                    (d[:, :, ip[1]] < (sizes_r[:, None] + tsize) / 2) & (d[:, :, thick] < 1.0)).any(1)
+            if not viol.any():
+                break
+            cen[viol] = local_np[rng.choice(K, size=int(viol.sum()))]
+        orate = float(viol.mean())
+    off = np.zeros((n, 3), np.float32); valid = np.zeros(n, bool)
+    series = np.zeros(n, np.int64); sizes = np.zeros(n, np.float32)
+    slots = rng.choice(n, size=n_real, replace=False)                           # SCATTER real into random slots
+    off[slots] = cen; valid[slots] = True; sizes[slots] = sizes_r
+    series[slots] = _exact_source_series(rng, present, n_real, share)
+    return off, valid, series, sizes, orate
+
+
 def _exact_source_series(rng, present, n, share):
     """v3 structured curriculum (review pt 4): EXACT per-modality source counts, not Dirichlet+share.
     The dominant modality gets exactly round(share*n); the remainder is split as evenly as possible over
@@ -462,13 +542,13 @@ def _gather_slabs(scan, centers, sizes, thick_axis, voxels, device):
 
 
 def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n_series, step, total,
-                              patch_sizes=(4., 8., 16.), voxels=16, prism_choices=(32., 64., 128.),
+                              patch_sizes=(4., 8., 16.), voxels=16, prism_choices=(32., 64.),
                               size_per_bag=False, orient="native", rng, device,
                               pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1,
                               align_floor=0.1, dom_lo=0.7, dom_hi=0.95, ramp_frac=0.8,
                               held_excl_frac=1.0, hardneg_frac=0.0, force_align=None,
                               structured=False, n_pos=12, target_size=8.0, src_share_lo=0.3, src_share_hi=0.9,
-                              scan_context=False):
+                              scan_context=False, n_hard_min=64, source_dropout=0.1, prism_size_map=None):
     """Mixed-modality paired batch. Per item: a fully-visible source bag `a` + `held_count` disjoint
     held targets (bag a) + a 2nd view `b` (view-CLS only). Per-patch series ~ Categorical(source_mix)
     for a,b and Categorical(target_mix) for held, from `sample_mixes(step,total)` on the item's bundle.
@@ -494,7 +574,11 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
     ssa = torch.zeros(batch_size, n, dtype=torch.long, device=device)
     ssb = torch.zeros(batch_size, n, dtype=torch.long, device=device)
     tsr = torch.zeros(batch_size, m, dtype=torch.long, device=device)
+    sva = torch.ones(batch_size, n, dtype=torch.bool, device=device)          # source-valid mask (register where False)
+    svb = torch.ones(batch_size, n, dtype=torch.bool, device=device)
     a_anch = torch.empty(batch_size, 3, device=device); b_anch = torch.empty(batch_size, 3, device=device)
+    smap_map = prism_size_map or PRISM_SIZE_MAP
+    common_cache = {}                                                         # id(bundle) -> common foreground cloud
     st_a = st_b = st_h = None
     if scan_context:                                                        # per-patch scan-stats [B,*,D]
         st_a = torch.zeros(batch_size, n, SCAN_STATS_DIM, device=device)
@@ -519,39 +603,44 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         rep = sid2[present[0]]
         thick = resolve_thick_axis(rep, orient, rng)
         fg = rep.foreground_mm; Mf = fg.shape[0]
-        half = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]) / 2.0
-        a_a = fg[int(rng.integers(Mf))]
-        dwant = float(np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max))))
-        dist = (fg - a_a[None]).norm(dim=-1)
-        band = torch.nonzero((dist >= 0.7 * dwant) & (dist <= 1.3 * dwant), as_tuple=False).flatten()
-        b_a = fg[int(band[int(rng.integers(band.numel()))])] if band.numel() > 0 else fg[int((dist - dwant).abs().argmin())]
-        a_anch[i] = a_a; b_anch[i] = b_a
-        sa = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
-        sb = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
-        ob_np = (rng.random((n, 3)) * 2 - 1) * half
+        prism = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]); half = prism / 2.0
+        sh_share = {"aligned": src_share_lo, "balanced": 1.0 / len(present), "cross": src_share_hi}.get(force_align, share)
         if structured:
-            # TARGETS FIRST: 12 positions x 4 modalities, one size; then place source AVOIDING their slabs
-            pos = (rng.random((n_pos, 3)) * 2 - 1) * half
-            oa_np = (rng.random((n, 3)) * 2 - 1) * half
-            if held_excl_frac > 0:
-                oa_np, orate = _reject_source_overlap(oa_np, sa, pos, target_size, thick, half, rng)
-                overlap_rates.append(orate)
-            # source-breadth curriculum with EXACT counts; panels: balanced=easy (0.25), cross=hard (share_hi)
-            sh_share = {"aligned": src_share_lo, "balanced": 1.0 / len(present), "cross": src_share_hi}.get(force_align, share)
-            sda = _exact_source_series(rng, present, n, sh_share); sdb = _exact_source_series(rng, present, n, sh_share)
-            oh_np = np.repeat(pos, 4, axis=0)                              # [n_pos*4,3]
-            sdh = np.tile(np.asarray(present[:4], dtype=np.int64), n_pos)  # series 0,1,2,3 per position
-            sh = np.full(n_pos * 4, float(target_size), dtype=np.float32)
+            # sample BOTH targets and source from the common foreground (union of the 4 modalities) inside the
+            # prism -> patches land on anatomy, not skull-stripped background (audit). Variable real source
+            # count; missing slots become register tokens (valid=False).
+            bid = id(bnd)
+            if bid not in common_cache:
+                common_cache[bid] = _common_fg(sid2)
+            cfg = common_cache[bid]; sizes_pool = smap_map.get(prism, patch_sizes)
+            for _t in range(8):                                          # resample anchor until >=12 valid targets
+                a_a = fg[int(rng.integers(Mf))]; local = _local_fg(cfg, a_a, half)
+                if local.shape[0] >= n_pos:
+                    break
+            local_np = (local - a_a[None]).cpu().numpy().astype(np.float32)
+            pos = (local[_fps(local, n_pos, rng)] - a_a[None]).cpu().numpy().astype(np.float32)   # [n_pos,3] FPS targets
+            oa_np, va_np, sda, sa, orate = _fg_source(local_np, n, sizes_pool, present, sh_share, n_hard_min,
+                                                      source_dropout, pos, target_size, thick, held_excl_frac, rng)
+            overlap_rates.append(orate)
+            b_a = _band_anchor(fg, a_a, pair_dist_min, pair_dist_max, rng)
+            lb = _local_fg(cfg, b_a, half); lb_np = (lb - b_a[None]).cpu().numpy().astype(np.float32)
+            ob_np, vb_np, sdb, sb, _ = _fg_source(lb_np, n, sizes_pool, present, sh_share, n_hard_min,
+                                                  source_dropout, None, target_size, thick, held_excl_frac, rng)
+            sva[i] = torch.as_tensor(va_np, device=device); svb[i] = torch.as_tensor(vb_np, device=device)
+            oh_np = np.repeat(pos, 4, axis=0); sdh = np.tile(np.asarray(present[:4], np.int64), n_pos)
+            sh = np.full(n_pos * 4, float(target_size), np.float32)
         else:
-            oa_np = (rng.random((n, 3)) * 2 - 1) * half
+            a_a = fg[int(rng.integers(Mf))]; b_a = _band_anchor(fg, a_a, pair_dist_min, pair_dist_max, rng)
+            sa = _draw_sizes_np(rng, n, patch_sizes, size_per_bag); sb = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
+            oa_np = (rng.random((n, 3)) * 2 - 1) * half; ob_np = (rng.random((n, 3)) * 2 - 1) * half
             smix, tmix = sample_mixes(rng, n_series, present, step, total, dom_lo=dom_lo, dom_hi=dom_hi,
                                       floor=align_floor, ramp_frac=ramp_frac, force_align=force_align)
             sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix)
-            sh = _draw_sizes_np(rng, m, patch_sizes, size_per_bag)
-            sdh = _draw_series_np(rng, m, tmix)
+            sh = _draw_sizes_np(rng, m, patch_sizes, size_per_bag); sdh = _draw_series_np(rng, m, tmix)
             oh_np = (rng.random((m, 3)) * 2 - 1) * half
             oh_np = _apply_exclusion(oh_np, sh, sdh, oa_np, sa, sda, half, thick, held_excl_frac, rng)
             _apply_hardneg(oh_np, sh, sdh, present, hardneg_frac, rng)
+        a_anch[i] = a_a; b_anch[i] = b_a
         oa = torch.as_tensor(oa_np, device=device, dtype=fg.dtype)
         ob = torch.as_tensor(ob_np, device=device, dtype=fg.dtype)
         oh = torch.as_tensor(oh_np, device=device, dtype=fg.dtype)
@@ -616,8 +705,10 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                 coords_a=ca, coords_b=cb, held_coords=ch,
                 sizes_a=za, sizes_b=zb, held_sizes=zh,
                 source_series_a=ssa, source_series_b=ssb, target_series=tsr,
+                source_valid_a=sva, source_valid_b=svb,        # False slots -> active register tokens
                 stats_a=st_a, stats_b=st_b, held_stats=st_h,   # None unless scan_context
                 overlap_rate=float(np.mean(overlap_rates)) if overlap_rates else 0.0,
+                reg_frac=float((~sva).float().mean()),         # fraction of source slots that are registers
                 rel_targets=rel)
 
 

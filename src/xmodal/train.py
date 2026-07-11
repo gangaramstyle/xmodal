@@ -94,6 +94,8 @@ class TrainConfig:
     src_share_lo: float = 0.3         # structured curriculum: source dominant-share ramps lo(balanced/easy)->
     src_share_hi: float = 0.9         #                        hi(peaked/cross) over align_ramp_frac
     scan_context: bool = False        # scan-relative input channels (scan-context A) on stem + target
+    n_hard_min: int = 64              # structured: allow down to this many real source patches (rest = registers)
+    source_dropout: float = 0.1       # structured: random source-token dropout -> variable register count
     git_commit: str = ""              # provenance recorded in the checkpoint cfg
     git_branch: str = ""
 
@@ -415,7 +417,7 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
             dom_hi=cfg.dom_hi, ramp_frac=cfg.align_ramp_frac, held_excl_frac=cfg.held_excl_frac,
             hardneg_frac=cfg.hardneg_frac, force_align=force_align, structured=cfg.structured, n_pos=cfg.n_pos,
             target_size=cfg.target_size, src_share_lo=cfg.src_share_lo, src_share_hi=cfg.src_share_hi,
-            scan_context=cfg.scan_context)
+            scan_context=cfg.scan_context, n_hard_min=cfg.n_hard_min, source_dropout=cfg.source_dropout)
 
     def fwd(b, **kw):
         return model.forward_mixed(b, content_blur=cfg.content_blur, ema_color=cfg.ema_color,
@@ -505,7 +507,7 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
             d = {"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
                  "train/match_acc": out["match_acc"], "train/rel_spatial": float(out["rel_spatial"]),
                  "train/rel_window": float(out["rel_window"]), "train/rel_acc": out["rel_acc"],
-                 "train/logit_scale": tmp, "train/overlap": b["overlap_rate"], "lr": lr}
+                 "train/logit_scale": tmp, "train/overlap": b["overlap_rate"], "train/reg_frac": b["reg_frac"], "lr": lr}
             if out.get("acc_mod") is not None:                             # structured: log both objectives + directions
                 d.update({f"train/{k}": out[k] for k in ("acc_mod", "acc_pos_t2s", "acc_mod_t2s", "loss_pos", "loss_mod")})
             wb.log(d, step=step)
