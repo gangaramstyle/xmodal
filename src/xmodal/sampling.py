@@ -296,6 +296,167 @@ def sample_cross_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm
     )
 
 
+# ---------------------------------------------------------------------------
+# Mixed-modality conditioned sampling (docs/MIXED_MODAL_DESIGN.md)
+# Per-patch series drawn from a mixture; self<->cross is a stochastic dominant-series ALIGNMENT ramp.
+# ---------------------------------------------------------------------------
+
+def sample_mixes(rng, n_series, present, step, total, *, dom_lo=0.7, dom_hi=0.95, floor=0.1, ramp_frac=0.8):
+    """Per-item source/target series distributions [n_series] over `present` (the bundle's series ids).
+    Both have ONE dominant series with a sampled share in [dom_lo,dom_hi]; the rest is Dirichlet spread.
+    Curriculum: early the target-dominant == source-dominant (aligned/easy same-modal); an alignment
+    prob ramps 1->`floor` over `ramp_frac*total` so late the dominants diverge (cross-modal). All
+    proportions + the aligned coin are stochastic per item. Floors ensure no series cold-starts."""
+    present = list(present)
+    s_dom = int(rng.choice(present))
+    align_p = max(floor, 1.0 - step / max(1.0, ramp_frac * total))
+    others = [s for s in present if s != s_dom]
+    aligned = (rng.random() < align_p) or (not others)
+    t_dom = s_dom if aligned else int(rng.choice(others))
+
+    def mix(dom):
+        p = np.zeros(n_series, dtype=np.float64)
+        if len(present) == 1:
+            p[dom] = 1.0
+            return p
+        w = rng.dirichlet(np.ones(len(present)))
+        share = float(rng.uniform(dom_lo, dom_hi))
+        for s, wi in zip(present, w):
+            p[s] = (1.0 - share) * wi
+        p[dom] += share
+        return p / p.sum()
+
+    return mix(s_dom), mix(t_dom)
+
+
+def _draw_sizes_np(rng, k, choices, per_bag=False):
+    arr = np.asarray(choices, dtype=np.float32)
+    if per_bag:
+        return np.full(k, float(arr[rng.integers(len(arr))]), dtype=np.float32)
+    return arr[rng.integers(len(arr), size=k)].astype(np.float32)
+
+
+def _draw_series_np(rng, k, mix):
+    p = np.asarray(mix, dtype=np.float64); p = p / p.sum()
+    return rng.choice(len(p), size=k, p=p).astype(np.int64)
+
+
+def _gather_slabs(scan, centers, sizes, thick_axis, voxels, device):
+    """centers [K,3] world-mm, sizes [K] (mm) -> slab patches [K,V,V,1] from ONE scan (one grid_sample)."""
+    import torch
+    unit = slab_unit_offsets(thick_axis, voxels, device)                     # [V,V,1,3]
+    off = unit[None] * sizes[:, None, None, None, None]                       # [K,V,V,1,3]
+    phys = off + centers[:, None, None, None, :]
+    vox = (phys - scan.affine_trans) @ scan.affine_inv.T
+    return sample_patches(scan.volume, vox)                                  # [K,V,V,1]
+
+
+def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n_series, step, total,
+                              patch_sizes=(4., 8., 16.), voxels=16, prism_choices=(32., 64., 128.),
+                              size_per_bag=False, orient="native", rng, device,
+                              pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1,
+                              align_floor=0.1, dom_lo=0.7, dom_hi=0.95, ramp_frac=0.8):
+    """Mixed-modality paired batch. Per item: a fully-visible source bag `a` + `held_count` disjoint
+    held targets (bag a) + a 2nd view `b` (view-CLS only). Per-patch series ~ Categorical(source_mix)
+    for a,b and Categorical(target_mix) for held, from `sample_mixes(step,total)` on the item's bundle.
+    Gather is grouped by distinct (scan,thick) — ONE grid_sample each — then scattered (vectorized).
+
+    Returns patches_a/_b [B,n,V,V,1], held_patches [B,m,V,V,1], coords_a/_b/held [B,*,3],
+    sizes_a/_b/held [B,*,3], source_series_a/_b [B,n], target_series [B,m], rel_targets [B,5]."""
+    import torch
+    n, m, V = token_count, held_count, voxels
+    scan_list, gid = [], {}                                                  # distinct scans -> global index
+    for bnd in bundles:
+        for sc in bnd.values():
+            if id(sc) not in gid:
+                gid[id(sc)] = len(scan_list); scan_list.append(sc)
+
+    A_src = torch.empty(batch_size, n, V, V, 1, device=device)
+    A_held = torch.empty(batch_size, m, V, V, 1, device=device)
+    B_src = torch.empty(batch_size, n, V, V, 1, device=device)
+    ca = torch.empty(batch_size, n, 3, device=device); cb = torch.empty(batch_size, n, 3, device=device)
+    ch = torch.empty(batch_size, m, 3, device=device)
+    za = torch.empty(batch_size, n, 3, device=device); zb = torch.empty(batch_size, n, 3, device=device)
+    zh = torch.empty(batch_size, m, 3, device=device)
+    ssa = torch.zeros(batch_size, n, dtype=torch.long, device=device)
+    ssb = torch.zeros(batch_size, n, dtype=torch.long, device=device)
+    tsr = torch.zeros(batch_size, m, dtype=torch.long, device=device)
+    a_anch = torch.empty(batch_size, 3, device=device); b_anch = torch.empty(batch_size, 3, device=device)
+
+    G_ctr, G_siz, G_key, G_buf, G_i, G_k = [], [], [], [], [], []            # flat gather accumulators
+    for i in range(batch_size):
+        bnd = bundles[int(rng.integers(len(bundles)))]
+        sid2 = {sc.series_idx: sc for sc in bnd.values()}
+        present = sorted(sid2.keys())
+        rep = sid2[present[0]]
+        thick = resolve_thick_axis(rep, orient, rng)
+        fg = rep.foreground_mm; Mf = fg.shape[0]
+        half = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]) / 2.0
+        a_a = fg[int(rng.integers(Mf))]
+        dwant = float(np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max))))
+        dist = (fg - a_a[None]).norm(dim=-1)
+        band = torch.nonzero((dist >= 0.7 * dwant) & (dist <= 1.3 * dwant), as_tuple=False).flatten()
+        b_a = fg[int(band[int(rng.integers(band.numel()))])] if band.numel() > 0 else fg[int((dist - dwant).abs().argmin())]
+        a_anch[i] = a_a; b_anch[i] = b_a
+        smix, tmix = sample_mixes(rng, n_series, present, step, total,
+                                  dom_lo=dom_lo, dom_hi=dom_hi, floor=align_floor, ramp_frac=ramp_frac)
+        sa = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
+        sb = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
+        sh = _draw_sizes_np(rng, m, patch_sizes, size_per_bag)
+        oa = torch.as_tensor((rng.random((n, 3)) * 2 - 1) * half, device=device, dtype=fg.dtype)
+        ob = torch.as_tensor((rng.random((n, 3)) * 2 - 1) * half, device=device, dtype=fg.dtype)
+        oh = torch.as_tensor((rng.random((m, 3)) * 2 - 1) * half, device=device, dtype=fg.dtype)
+        sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix); sdh = _draw_series_np(rng, m, tmix)
+        ca[i] = oa; cb[i] = ob; ch[i] = oh
+        za[i] = size_to_extent(torch.as_tensor(sa[None], device=device), thick)[0]
+        zb[i] = size_to_extent(torch.as_tensor(sb[None], device=device), thick)[0]
+        zh[i] = size_to_extent(torch.as_tensor(sh[None], device=device), thick)[0]
+        ssa[i] = torch.as_tensor(sda, device=device); ssb[i] = torch.as_tensor(sdb, device=device)
+        tsr[i] = torch.as_tensor(sdh, device=device)
+        bmap = np.zeros(n_series, dtype=np.int64)                            # series id -> global scan index (this bundle)
+        for sid, sc in sid2.items():
+            bmap[sid] = gid[id(sc)]
+        for ctr, siz, sids, buf in ((a_a[None] + oa, sa, sda, 0), (a_a[None] + oh, sh, sdh, 1), (b_a[None] + ob, sb, sdb, 2)):
+            G_ctr.append(ctr); G_siz.append(torch.as_tensor(siz, device=device))
+            G_key.append(bmap[sids] * 3 + thick); G_buf.append(np.full(len(sids), buf, np.int64))
+            G_i.append(np.full(len(sids), i, np.int64)); G_k.append(np.arange(len(sids), dtype=np.int64))
+
+    allctr = torch.cat(G_ctr); allsiz = torch.cat(G_siz)
+    allkey = np.concatenate(G_key); allbuf = np.concatenate(G_buf); alli = np.concatenate(G_i); allk = np.concatenate(G_k)
+    bufs = {0: A_src, 1: A_held, 2: B_src}
+    for u in np.unique(allkey):
+        sel = np.nonzero(allkey == u)[0]
+        scan = scan_list[int(u) // 3]; th = int(u) % 3
+        sel_t = torch.as_tensor(sel, device=device)
+        patches = _gather_slabs(scan, allctr[sel_t], allsiz[sel_t], th, V, device)   # [len,V,V,1]
+        bsel, isel, ksel = allbuf[sel], alli[sel], allk[sel]
+        for b, buf in bufs.items():
+            mb = np.nonzero(bsel == b)[0]
+            if mb.size:
+                buf[torch.as_tensor(isel[mb], device=device), torch.as_tensor(ksel[mb], device=device)] = \
+                    patches[torch.as_tensor(mb, device=device)]
+
+    def _jit(std_c, std_w):                                                   # per-item window jitter params
+        c = torch.as_tensor(rng.normal(0.0, std_c, size=batch_size), device=device, dtype=A_src.dtype) if std_c > 0 \
+            else torch.zeros(batch_size, device=device, dtype=A_src.dtype)
+        w = torch.as_tensor(np.clip(rng.normal(0.0, std_w, size=batch_size), -3 * std_w, 3 * std_w), device=device,
+                            dtype=A_src.dtype) if std_w > 0 else torch.zeros(batch_size, device=device, dtype=A_src.dtype)
+        return c, w
+    ac, aw = _jit(win_center_std, win_width_log_std); bc, bw = _jit(win_center_std, win_width_log_std)
+    ea = aw.exp()[:, None, None, None, None]; eb = bw.exp()[:, None, None, None, None]
+    A_src = (A_src - ac[:, None, None, None, None]) / ea                      # view a: source + held share a's window
+    A_held = (A_held - ac[:, None, None, None, None]) / ea
+    B_src = (B_src - bc[:, None, None, None, None]) / eb
+    spatial = (b_anch - a_anch > 0).float()                                  # [B,3] relative anchor order
+    window = torch.stack([(bc > ac).float(), (bw > aw).float()], dim=1)      # [B,2] relative window sign
+    rel = torch.cat([spatial, window], dim=1)                               # [B,5]
+    return dict(patches_a=A_src, patches_b=B_src, held_patches=A_held,
+                coords_a=ca, coords_b=cb, held_coords=ch,
+                sizes_a=za, sizes_b=zb, held_sizes=zh,
+                source_series_a=ssa, source_series_b=ssb, target_series=tsr,
+                rel_targets=rel)
+
+
 def apply_window_jitter(patches, *, center_std, width_log_std):
     """Per-scan intensity window jitter on a patch bag (ported). Returns (jittered, target[B,2])
     where target = [center_shift, log_width]."""

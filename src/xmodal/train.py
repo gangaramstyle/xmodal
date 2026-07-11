@@ -78,6 +78,12 @@ class TrainConfig:
     size_per_bag: bool = False        # ablation: one size per bag (no within-bag scale mixing)
     orient: str = "scan"              # slab orientation: 'scan' | 'native' | 'random' (see resolve_thick_axis)
     artifact_every: int = 5000        # log a wandb checkpoint artifact every N steps (0 = off)
+    # mixed-modality conditioned SSL (docs/MIXED_MODAL_DESIGN.md): one continuous loop, series mixes
+    held_count: int = 48              # disjoint held/target positions per item (the recon+match targets)
+    align_ramp_frac: float = 0.8      # target-dom==source-dom prob ramps 1->floor over this frac of steps
+    align_floor: float = 0.1          # min alignment prob (keeps some easy same-modal signal late)
+    dom_lo: float = 0.7               # dominant-series share ~ Uniform(dom_lo, dom_hi), sampled per item
+    dom_hi: float = 0.95
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -359,3 +365,99 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
     if wb:
         wb.finish()
     log(f"phased run done: {gstep} steps in {time.time()-t0:.0f}s")
+
+
+def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, device="cuda", log=print):
+    """Mixed-modality conditioned trainer (docs/MIXED_MODAL_DESIGN.md). One continuous loop over
+    `cfg.steps`: each step samples a mixed-modality paired batch whose per-patch series follow a
+    stochastic dominant-series ALIGNMENT curriculum (self->cross), and optimizes pixel-MAE + matching
+    + view-CLS. No phases, no latent. `--ema-color` swaps the matching target to an EMA color_head."""
+    import os
+    torch.manual_seed(cfg.seed)
+    _is_cache = hasattr(train_bundles, "resident")
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+                            betas=(0.9, 0.95), fused=(device == "cuda"))
+    if cfg.compile:
+        try:
+            model.encode = torch.compile(model.encode, dynamic=True)
+        except Exception as e:
+            log(f"[compile] skipped: {e}")
+    rng = np.random.default_rng(cfg.seed)
+    warmup = int(cfg.warmup_frac * cfg.steps)
+    amp = dict(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.amp_bf16 and device == "cuda")
+    n_series = model.cfg.n_series
+    wb = None
+    if cfg.wandb:
+        try:
+            import wandb as wb
+            wb.init(project=cfg.wandb, name=cfg.wandb_run, config=cfg.__dict__)
+        except Exception as e:
+            log(f"[wandb] disabled: {e}"); wb = None
+
+    def draw(bundles, step):
+        return S.sample_mixed_paired_batch(
+            bundles, batch_size=cfg.batch_size, token_count=cfg.token_count, held_count=cfg.held_count,
+            n_series=n_series, step=step, total=cfg.steps, patch_sizes=cfg.patch_sizes,
+            voxels=model.cfg.patch_voxels, prism_choices=cfg.prism_choices, size_per_bag=cfg.size_per_bag,
+            orient=cfg.orient, rng=rng, device=device, align_floor=cfg.align_floor, dom_lo=cfg.dom_lo,
+            dom_hi=cfg.dom_hi, ramp_frac=cfg.align_ramp_frac)
+
+    def fwd(b):
+        return model.forward_mixed(b, content_blur=cfg.content_blur, ema_color=cfg.ema_color,
+                                   mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
+                                   rel_spatial_weight=cfg.rel_spatial_weight, rel_window_weight=cfg.rel_window_weight)
+
+    @torch.no_grad()
+    def validate(step):
+        model.eval(); maes = []; accs = []; macc = []
+        for _ in range(cfg.val_iters):
+            b = draw(val_bundles, step)
+            with torch.autocast(**amp):
+                out = fwd(b)
+            maes.append(float(out["mae"])); accs.append(out["rel_acc"]); macc.append(out["match_acc"])
+        model.train(); return float(np.mean(maes)), float(np.mean(accs)), float(np.mean(macc))
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    t0 = time.time()
+    vm, va, vmatch = validate(0)
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'match':>7} {'macc':>6} {'relacc':>7} {'val_mae':>8} {'val_macc':>8} {'lr':>8}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {'-':>6} {'-':>7} {vm:>8.4f} {vmatch:>8.3f} {'-':>8}")
+    for step in range(1, cfg.steps + 1):
+        lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
+        for g in opt.param_groups:
+            g["lr"] = lr
+        b = draw(train_bundles.resident() if _is_cache else train_bundles, step)
+        with torch.autocast(**amp):
+            out = fwd(b)
+            total = out["loss"]
+        opt.zero_grad(set_to_none=True)
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        opt.step()
+        if cfg.ema_color:
+            model.update_color_ema(cfg.ema_color_m)
+        if _is_cache:
+            train_bundles.step()
+        if wb and step % cfg.log_every == 0:
+            wb.log({"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
+                    "train/match_acc": out["match_acc"], "train/rel_spatial": float(out["rel_spatial"]),
+                    "train/rel_window": float(out["rel_window"]), "train/rel_acc": out["rel_acc"], "lr": lr}, step=step)
+        if step % cfg.val_every == 0:
+            vm, va, vmatch = validate(step)
+            log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {float(out['match']):>7.4f} "
+                f"{out['match_acc']:>6.3f} {out['rel_acc']:>7.3f} {vm:>8.4f} {vmatch:>8.3f} {lr:>8.2e}")
+            if wb:
+                wb.log({"val/mae": vm, "val/rel_acc": va, "val/match_acc": vmatch}, step=step)
+        if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
+            os.makedirs(cfg.ckpt_dir, exist_ok=True)
+            ckpt_path = f"{cfg.ckpt_dir}/step_{step:06d}.pt"
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": cfg.__dict__}, ckpt_path)
+            if wb and cfg.artifact_every and step % cfg.artifact_every == 0:
+                try:
+                    art = wb.Artifact(f"ckpt-{cfg.wandb_run or 'run'}", type="model", metadata={"step": step})
+                    art.add_file(ckpt_path); wb.log_artifact(art)
+                except Exception as e:
+                    log(f"[wandb] artifact log skipped: {e}")
+    if wb:
+        wb.finish()
+    log(f"mixed run done: {cfg.steps} steps in {time.time()-t0:.0f}s")

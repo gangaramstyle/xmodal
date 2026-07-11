@@ -145,6 +145,13 @@ class Phase0Encoder(nn.Module):
         # per-axis physical extent (mm) [.,.,3] -> W. For a 2.5D slab two axes = the size, the thin
         # (through-plane) axis ~= 0, so this encodes BOTH scale AND orientation (which plane the slab is).
         self.size_embed = nn.Sequential(nn.Linear(3, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
+        # per-patch SERIES conditioning (mixed-modality design, docs/MIXED_MODAL_DESIGN.md): two
+        # SEPARATE tables — "this token IS series S" (encoder, Site A) vs "produce series S" (decoder
+        # query, Site B). Static (unlike the dynamic series-CLS), so a bag can mix modalities per patch.
+        self.series_in_embed = nn.Embedding(cfg.n_series, cfg.width)
+        self.series_q_embed = nn.Embedding(cfg.n_series, cfg.width)
+        nn.init.normal_(self.series_in_embed.weight, std=0.02)
+        nn.init.normal_(self.series_q_embed.weight, std=0.02)
         self.pixel_head = nn.Linear(cfg.width, self.pv)
         # cross-modal decoder fuses each patch encoding with its (frozen-teacher) series-CLS so the
         # decoder can tell sources apart (no series_embed lookup — series identity is the CLS output).
@@ -177,14 +184,17 @@ class Phase0Encoder(nn.Module):
         """Per-patch per-axis physical extent (mm) [B,k,3] -> additive size+orientation embedding [B,k,W]."""
         return self.size_embed(sizes)
 
-    def embed(self, patches, sizes):
-        """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n] -> tokens [B,n,W]. Single stem (all patches
+    def embed(self, patches, sizes, series_ids=None):
+        """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n,3] -> tokens [B,n,W]. Single stem (all patches
         are V×V×1 grids regardless of physical size); physical scale rides in via the additive size
-        embedding. NO series_embed — series identity is learned into the series-CLS token, not injected
-        per patch (else series-CLS is trivialized)."""
+        embedding. `series_ids` [B,n] (long) additively injects the patch's modality (Site A) for the
+        mixed-modality design — None keeps the legacy phased behavior (series identity via the CLS)."""
         B, n = patches.shape[:2]
         tok = self.stem(patches.reshape(B * n, 1, *patches.shape[2:])).reshape(B, n, self.cfg.width)
-        return tok + self._size_emb(sizes).to(tok.dtype)
+        tok = tok + self._size_emb(sizes).to(tok.dtype)
+        if series_ids is not None:
+            tok = tok + self.series_in_embed(series_ids).to(tok.dtype)
+        return tok
 
     def encode(self, tokens, coords):
         """tokens [B,T,W] with matching coords [B,T,3] (CLS/regs use coord 0) -> [B,T,W]."""
@@ -297,6 +307,48 @@ class Phase0Encoder(nn.Module):
                     rel_spatial=spatial.detach(), rel_window=window.detach(),
                     rel_acc=float(rel_acc), series_viol=float(series_viol))
 
+    # ---- mixed-modality conditioned SSL (docs/MIXED_MODAL_DESIGN.md) ------------------
+    def _view_repr(self, patches, coords, sizes, series_ids):
+        """Encode a bag (per-patch source series, Site A) -> its view-CLS output [B,W] (for view-CLS)."""
+        B = patches.shape[0]
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids)], [coords], patches.device, B)
+        return self.encode(toks, ccs)[:, 1]
+
+    def forward_mixed(self, batch, *, content_blur=0, ema_color=False, mae_weight=0.25, match_weight=1.0,
+                      rel_spatial_weight=0.25, rel_window_weight=0.25):
+        """One continuous objective (no phases). Bag `a` (per-patch source series at Site A) is fully
+        encoded as decoder context; disjoint held positions carry per-patch TARGET series at the query
+        (Site B) and are reconstructed (pixel MAE) + matched (slot<->blind color). Bag `b` supplies the
+        2nd view for view-CLS. Series identity is the static embeddings on tokens+queries — NO series-CLS,
+        rank-hinge, fuse, or teacher pass. The self↔cross curriculum lives in the sampler's series mixes."""
+        dev = batch["patches_a"].device
+        nreg = 2 + self.registers.shape[0]
+        pa, ca, za, ssa = batch["patches_a"], batch["coords_a"], batch["sizes_a"], batch["source_series_a"]
+        B, n = pa.shape[:2]
+        x = self.encode(*self._context([self.embed(pa, za, ssa)], [ca], dev, B))   # Site A on tokens
+        src_enc = x[:, nreg:]; va = x[:, 1]
+        ctx, cc = self._context([src_enc], [ca], dev, B)                            # decoder context = bag a
+        hp, hc, hz, tser = batch["held_patches"], batch["held_coords"], batch["held_sizes"], batch["target_series"]
+        m = hp.shape[1]
+        query = (self.query_seed[None, None, :] + self._size_emb(hz)
+                 + self.series_q_embed(tser)).contiguous()                          # Site B: position+size+want-series
+        query = self._decode(query, ctx, cc, hc)
+        recon = self.dec_pixel_head(query)
+        mae = F.l1_loss(recon, hp.reshape(B, m, self.pv))
+        slots = F.normalize(self.match_slot_proj(query), dim=-1)
+        m_loss, m_met, colors = self._match_loss(slots, hp, content_blur, ema=ema_color)
+        vb = self._view_repr(batch["patches_b"], batch["coords_b"], batch["sizes_b"], batch["source_series_b"])
+        rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
+        rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
+        spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()
+        total = (mae_weight * mae + match_weight * m_loss
+                 + rel_spatial_weight * spatial + rel_window_weight * window)
+        with torch.no_grad():
+            rel_acc = float(((rel_logits > 0).float() == batch["rel_targets"]).float().mean())
+        return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=m_met["match_acc"],
+                    rel_spatial=spatial.detach(), rel_window=window.detach(), rel_acc=rel_acc,
+                    recon=recon.detach(), held_patches=hp.detach(), slots=slots.detach(), colors=colors)
+
     # ---- cross-modal ---------------------------------------------------------------
     def _gather(self, x, idx, d):
         return x.gather(1, idx[..., None].expand(-1, -1, d))
@@ -322,13 +374,13 @@ class Phase0Encoder(nn.Module):
         toks, ccs = self._context([self.embed(patches, sizes)], [coords], patches.device, B)
         return self.encode(toks, ccs)[:, nreg:]
 
-    def teacher_readout(self, patches, coords, sizes):
-        """One (frozen-teacher) encoder pass -> (series_cls [B,W], patch_latents [B,n,W]). The
-        series_cls is the stable per-prism series descriptor that conditions the decoder; the
-        patch_latents are the target for the latent phase."""
+    def teacher_readout(self, patches, coords, sizes, series_ids=None):
+        """One (frozen-teacher) encoder pass -> (series_cls [B,W], patch_latents [B,n,W]). Pass
+        `series_ids` [B,n] so the readout conditions the encoder the SAME way training did (Site A) —
+        required for the mixed-modality models; leave None for legacy phased checkpoints."""
         B = patches.shape[0]
         nreg = 2 + self.registers.shape[0]
-        toks, ccs = self._context([self.embed(patches, sizes)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids)], [coords], patches.device, B)
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, nreg:]
 
