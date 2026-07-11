@@ -38,8 +38,9 @@ PY
       "v2_ema=runs/mixed_v2_ema_s0/step_0*.pt" \
       "v2_noema=runs/mixed_v2_noema_s0/step_0*.pt"
 
-# sanity: same v2_ema checkpoint WITHOUT --mixed -> should differ (confirms series conditioning is used)
+# sanity: the MOST-TRAINED run (v1_ema) WITHOUT --mixed -> should differ if series conditioning matters
+# for the frozen-encoder readout (v2@1k earlier was too early to tell)
 .venv/bin/python -u scripts/eval_battery.py \
     --data-root /tmp/ho --tracks mets_ho --device cuda \
-    --checkpoints "v2_ema_NOMIX=runs/mixed_v2_ema_s0/step_0*.pt"
+    --checkpoints "v1_ema_NOMIX=runs/mixed_ema_s0/step_0*.pt"
 echo "=== eval_mixed done ==="
