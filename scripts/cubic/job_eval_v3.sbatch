@@ -32,6 +32,6 @@ PY
     --cache /tmp/patchcache_v3.npz --data-root /tmp/ho --tracks mets_ho --build --device cuda --mixed \
     --checkpoints \
       "v1_noema=runs/mixed_noema_s0/step_0*.pt" \
-      "v2_noema=runs/mixed_v2_noema_s0/step_0*.pt" \
-      "v3=runs/mixed_v3_s0/step_0*.pt"
+      "v3=runs/mixed_v3_s0/step_0*.pt" \
+      "v4=runs/modality_v4_s0/step_0*.pt"
 echo "=== eval_v3 done ==="
