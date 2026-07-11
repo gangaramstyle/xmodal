@@ -82,7 +82,7 @@ def place_bundle(cpu_bundle, device):
             affine_trans=torch.as_tensor(p["affine_trans"], device=device),
             foreground_mm=torch.as_tensor(p["foreground_mm"], device=device),
             thick_axis=p["thick"], plane_id=p["plane"], modality=m, series_idx=p["series"],
-            patient=p["patient"], spacing=p["spacing"])
+            patient=p["patient"], spacing=p["spacing"], stats=p.get("stats"))
     return b
 
 
@@ -128,7 +128,8 @@ def _cpu_payload(vol_raw, affine, modality, series_idx, patient, *, fg_thresh=0.
     voln = np.clip((vol - lo) / max(hiP - lo, 1e-6), 0.0, 1.0).astype(np.float32)
     return dict(volume=voln, affine_inv=np.linalg.inv(R).astype(np.float32),
                 affine_trans=t.astype(np.float32), foreground_mm=fg, thick=int(thick),
-                plane=int(plane), series=int(series_idx), patient=patient, spacing=spacing)
+                plane=int(plane), series=int(series_idx), patient=patient, spacing=spacing,
+                stats=S.scan_stats(voln, keep))
 
 
 def find_brats_patients(root, anchor_suffix="t1n"):

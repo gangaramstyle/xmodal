@@ -23,7 +23,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xmodal.matching import ColorHead, blur_contents, default_log_logit_scale, slot_match_loss
+from xmodal.matching import (ColorHead, ScanConditionedPatchTeacher, blur_contents,
+                             default_log_logit_scale, slot_match_loss)
+from xmodal.sampling import SCAN_STATS_DIM
 
 
 @dataclass
@@ -38,6 +40,7 @@ class EncoderConfig:
     patch_voxels: int = 16            # 2.5D slab sample grid (V,V,1); physical size is per-patch (size embed)
     rope_lambda_min_mm: float = 2.0
     rope_lambda_max_mm: float = 1024.0
+    scan_context: bool = False        # v3: scan-conditioned target teacher + per-patch scan-context on tokens
 
 
 # --- mm-RoPE over physical-mm coords --------------------------------------------------
@@ -169,8 +172,13 @@ class Phase0Encoder(nn.Module):
         self.dec_pixel_head = nn.Linear(cfg.width, self.pv)
         self.match_slot_proj = nn.Linear(cfg.width, cfg.width)
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
-        self.color_head = ColorHead(cfg.width, self.grid)
-        # EMA (target) copy of the SINGLE shared color_head (BYOL/DINO-style stable matching target).
+        # target (value) encoder: v3 scan-conditioned teacher (AdaLN by scan-context) or blind ColorHead.
+        # `scan_ctx` (G) maps per-scan stats -> context vector, SHARED between the teacher's AdaLN and the
+        # encoder-token conditioning (symmetry: both sides scan-calibrated).
+        self.scan_ctx = nn.Sequential(nn.Linear(SCAN_STATS_DIM, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
+        self.color_head = (ScanConditionedPatchTeacher(cfg.width, self.grid) if cfg.scan_context
+                           else ColorHead(cfg.width, self.grid))
+        # EMA (target) copy of the SINGLE shared target encoder (BYOL/DINO-style stable matching target).
         # Init identical; updated by EMA (never by grad). Used only when ema_color is enabled.
         self.color_head_ema = copy.deepcopy(self.color_head)
         for p in self.color_head_ema.parameters():
@@ -184,16 +192,19 @@ class Phase0Encoder(nn.Module):
         """Per-patch per-axis physical extent (mm) [B,k,3] -> additive size+orientation embedding [B,k,W]."""
         return self.size_embed(sizes)
 
-    def embed(self, patches, sizes, series_ids=None):
+    def embed(self, patches, sizes, series_ids=None, stats=None):
         """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n,3] -> tokens [B,n,W]. Single stem (all patches
         are V×V×1 grids regardless of physical size); physical scale rides in via the additive size
-        embedding. `series_ids` [B,n] (long) additively injects the patch's modality (Site A) for the
-        mixed-modality design — None keeps the legacy phased behavior (series identity via the CLS)."""
+        embedding. `series_ids` [B,n] (long) additively injects the patch's modality (Site A). `stats`
+        [B,n,SCAN_STATS_DIM] additively injects the v3 per-patch scan-context (symmetry with the target
+        teacher). None on either keeps the earlier behavior."""
         B, n = patches.shape[:2]
         tok = self.stem(patches.reshape(B * n, 1, *patches.shape[2:])).reshape(B, n, self.cfg.width)
         tok = tok + self._size_emb(sizes).to(tok.dtype)
         if series_ids is not None:
             tok = tok + self.series_in_embed(series_ids).to(tok.dtype)
+        if stats is not None:
+            tok = tok + self.scan_ctx(stats).to(tok.dtype)
         return tok
 
     def encode(self, tokens, coords):
@@ -308,10 +319,10 @@ class Phase0Encoder(nn.Module):
                     rel_acc=float(rel_acc), series_viol=float(series_viol))
 
     # ---- mixed-modality conditioned SSL (docs/MIXED_MODAL_DESIGN.md) ------------------
-    def _view_repr(self, patches, coords, sizes, series_ids):
+    def _view_repr(self, patches, coords, sizes, series_ids, stats=None):
         """Encode a bag (per-patch source series, Site A) -> its view-CLS output [B,W] (for view-CLS)."""
         B = patches.shape[0]
-        toks, ccs = self._context([self.embed(patches, sizes, series_ids)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids, stats)], [coords], patches.device, B)
         return self.encode(toks, ccs)[:, 1]
 
     def forward_mixed(self, batch, *, content_blur=0, ema_color=False, mae_weight=0.25, match_weight=1.0,
@@ -324,8 +335,9 @@ class Phase0Encoder(nn.Module):
         dev = batch["patches_a"].device
         nreg = 2 + self.registers.shape[0]
         pa, ca, za, ssa = batch["patches_a"], batch["coords_a"], batch["sizes_a"], batch["source_series_a"]
+        sta = batch.get("stats_a")                                                  # v3 scan-context (None if off)
         B, n = pa.shape[:2]
-        x = self.encode(*self._context([self.embed(pa, za, ssa)], [ca], dev, B))   # Site A on tokens
+        x = self.encode(*self._context([self.embed(pa, za, ssa, sta)], [ca], dev, B))   # Site A + scan-context on tokens
         src_enc = x[:, nreg:]; va = x[:, 1]
         ctx, cc = self._context([src_enc], [ca], dev, B)                            # decoder context = bag a
         hp, hc, hz, tser = batch["held_patches"], batch["held_coords"], batch["held_sizes"], batch["target_series"]
@@ -336,8 +348,9 @@ class Phase0Encoder(nn.Module):
         recon = self.dec_pixel_head(query)
         mae = F.l1_loss(recon, hp.reshape(B, m, self.pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
-        m_loss, m_met, colors = self._match_loss(slots, hp, content_blur, ema=ema_color)
-        vb = self._view_repr(batch["patches_b"], batch["coords_b"], batch["sizes_b"], batch["source_series_b"])
+        m_loss, m_met, colors = self._match_loss(slots, hp, content_blur, ema=ema_color, stats=batch.get("held_stats"))
+        vb = self._view_repr(batch["patches_b"], batch["coords_b"], batch["sizes_b"],
+                             batch["source_series_b"], batch.get("stats_b"))
         rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
         rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
         spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()
@@ -374,13 +387,13 @@ class Phase0Encoder(nn.Module):
         toks, ccs = self._context([self.embed(patches, sizes)], [coords], patches.device, B)
         return self.encode(toks, ccs)[:, nreg:]
 
-    def teacher_readout(self, patches, coords, sizes, series_ids=None):
+    def teacher_readout(self, patches, coords, sizes, series_ids=None, stats=None):
         """One (frozen-teacher) encoder pass -> (series_cls [B,W], patch_latents [B,n,W]). Pass
-        `series_ids` [B,n] so the readout conditions the encoder the SAME way training did (Site A) —
-        required for the mixed-modality models; leave None for legacy phased checkpoints."""
+        `series_ids` [B,n] (and `stats` [B,n,SCAN_STATS_DIM] for scan-context models) so the readout
+        conditions the encoder the SAME way training did (Site A + scan-context); leave None for legacy."""
         B = patches.shape[0]
         nreg = 2 + self.registers.shape[0]
-        toks, ccs = self._context([self.embed(patches, sizes, series_ids)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids, stats)], [coords], patches.device, B)
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, nreg:]
 
@@ -390,16 +403,19 @@ class Phase0Encoder(nn.Module):
         for pe, po in zip(self.color_head_ema.parameters(), self.color_head.parameters()):
             pe.mul_(m).add_(po.detach(), alpha=1.0 - m)
 
-    def _match_loss(self, slots, content, content_blur, *, soft_tau=None, soft_sim="model", ema=False):
-        """Slot<->content matching loss. `content` = held/target patches [B,Q,V,V,1].
-        ema=True: BYOL-style stable target -- slots predict the EMA color_head's (stop-grad) embeddings
-        (trains slots), and the ONLINE color_head is trained to match the (stop-grad) slots (so the EMA
+    def _match_loss(self, slots, content, content_blur, *, soft_tau=None, soft_sim="model", ema=False, stats=None):
+        """Slot<->content matching loss. `content` = held/target patches [B,Q,V,V,1]. `stats`
+        [B,Q,SCAN_STATS_DIM] -> shared scan-context s = G(stats) feeds the scan-conditioned teacher (v3);
+        None for the blind ColorHead (arg ignored there).
+        ema=True: BYOL-style stable target -- slots predict the EMA target's (stop-grad) embeddings
+        (trains slots), and the ONLINE target is trained to match the (stop-grad) slots (so the EMA
         target keeps learning). Otherwise the standard symmetric InfoNCE (hard or similarity-softened)."""
         co = blur_contents(content, content_blur)
-        colors = F.normalize(self.color_head(co), dim=-1)
+        s = self.scan_ctx(stats) if stats is not None else None
+        colors = F.normalize(self.color_head(co, s), dim=-1)
         if ema:
             with torch.no_grad():
-                colors_t = F.normalize(self.color_head_ema(co), dim=-1)
+                colors_t = F.normalize(self.color_head_ema(co, s), dim=-1)
             s = self.match_logit_scale.exp().clamp(max=100.0); B, Q, _ = slots.shape
             tgt = torch.arange(Q, device=slots.device).expand(B, Q)
             la = s * torch.einsum("bqd,bkd->bqk", slots, colors_t)          # slots -> stable EMA target (trains slots)

@@ -16,7 +16,8 @@ import torch.nn.functional as F
 
 
 class ColorHead(nn.Module):
-    """Blind value encoder: patch contents -> embedding, no positional signal."""
+    """Blind value encoder: patch contents -> embedding, no positional signal. `s` (scan-context) is
+    accepted for interface-compat with ScanConditionedPatchTeacher and IGNORED."""
 
     def __init__(self, width, voxels):
         super().__init__()
@@ -24,11 +25,37 @@ class ColorHead(nn.Module):
         self.mlp = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(),
                                  nn.Linear(width, width))
 
-    def forward(self, patches):
+    def forward(self, patches, s=None):
         b, q = patches.shape[:2]
         x = patches.reshape(b * q, 1, *patches.shape[2:])
         z = self.embed(x).reshape(b * q, -1)
         return self.mlp(z).reshape(b, q, -1)
+
+
+class ScanConditionedPatchTeacher(nn.Module):
+    """Blind value encoder + scan-relative calibration (v3 §2). Same conv over patch pixels as ColorHead
+    (no coordinates/RoPE/stem -> no positional leak), then AdaLN modulation by a per-patch scan-context
+    vector `s` = G(scan stats). The scan histogram calibrates appearance (where the intensity sits among
+    the tissue modes) but, being global to the scan, cannot distinguish patches by location. Injected via
+    AdaLN, never cross-attention, so the target patch cannot localize itself in a scan map."""
+
+    def __init__(self, width, voxels):
+        super().__init__()
+        self.embed = nn.Conv3d(1, width, tuple(voxels), stride=tuple(voxels))
+        self.norm = nn.LayerNorm(width, elementwise_affine=False)     # AdaLN: affine comes from s
+        self.to_scale_shift = nn.Linear(width, 2 * width)
+        self.mlp = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, width))
+        nn.init.zeros_(self.to_scale_shift.weight)                   # start at identity (gamma=beta=0) ->
+        nn.init.zeros_(self.to_scale_shift.bias)                     # ~plain blind encoder, calibration grows
+
+    def forward(self, patches, s=None):
+        b, q = patches.shape[:2]
+        z = self.embed(patches.reshape(b * q, 1, *patches.shape[2:])).reshape(b, q, -1)   # [B,Q,W]
+        h = self.norm(z)
+        if s is not None:
+            gamma, beta = self.to_scale_shift(s).chunk(2, dim=-1)
+            h = h * (1 + gamma) + beta                              # AdaLN(z; s)
+        return self.mlp(h)
 
 
 def blur_contents(patches, kernel):

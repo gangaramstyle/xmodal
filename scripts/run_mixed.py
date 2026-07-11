@@ -53,6 +53,17 @@ def main():
     ap.add_argument("--hardneg-frac", type=float, default=0.0,
                     help="frac of held slots made same-position/different-series HARD-NEG pairs (probes whether "
                          "series_q_embed routes to modality appearance vs anatomy). 0=off.")
+    # v3 (docs/MIXED_V3_DESIGN.md)
+    ap.add_argument("--structured", action="store_true",
+                    help="structured 4-way targets: n_pos positions x 4 modalities, one size (kills the "
+                         "modality/size shortcut). Sets held_count=n_pos*4; source-breadth curriculum.")
+    ap.add_argument("--n-pos", type=int, default=12, help="structured: held positions per item (targets = n_pos*4)")
+    ap.add_argument("--target-size", type=float, default=8.0, help="structured: single target patch size (mm)")
+    ap.add_argument("--src-share-lo", type=float, default=0.3, help="structured curriculum: early (balanced) source share")
+    ap.add_argument("--src-share-hi", type=float, default=0.9, help="structured curriculum: late (peaked) source share")
+    ap.add_argument("--scan-context", action="store_true",
+                    help="scan-conditioned target teacher (AdaLN by per-scan histogram stats) + symmetric "
+                         "per-patch scan-context on encoder tokens.")
     # alignment curriculum
     ap.add_argument("--align-ramp-frac", type=float, default=0.8,
                     help="target-dom==source-dom prob ramps 1->floor over this fraction of steps")
@@ -87,18 +98,23 @@ def main():
     cache.start_prefetch(workers=args.prefetch_workers, depth=8)
     val_bundles = [D.load_local_bundle(p, pid2dir[p], device=dev)[0] for p in val_pids[:args.val_patients]]
 
+    held_count = args.n_pos * 4 if args.structured else args.held_count
     torch.manual_seed(args.seed)                                       # seed WEIGHT init (before encoder build)
-    enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
+    enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8,
+                                          scan_context=args.scan_context)).to(dev)
     cfg = T.TrainConfig(steps=args.steps, batch_size=args.batch_size, token_count=args.token_count,
-                        held_count=args.held_count, lr=args.lr, seed=args.seed, compile=not args.no_compile,
+                        held_count=held_count, lr=args.lr, seed=args.seed, compile=not args.no_compile,
                         size_per_bag=args.size_per_bag, patch_sizes=tuple(args.patch_sizes),
                         prism_choices=tuple(args.prism_choices), content_blur=args.content_blur, orient=args.orient,
                         ema_color=args.ema_color, align_ramp_frac=args.align_ramp_frac, align_floor=args.align_floor,
                         dom_lo=args.dom_lo, dom_hi=args.dom_hi, held_excl_frac=args.held_excl_frac,
-                        hardneg_frac=args.hardneg_frac,
+                        hardneg_frac=args.hardneg_frac, structured=args.structured, n_pos=args.n_pos,
+                        target_size=args.target_size, src_share_lo=args.src_share_lo, src_share_hi=args.src_share_hi,
+                        scan_context=args.scan_context,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | steps {args.steps} | "
-          f"ema {args.ema_color} | held {args.held_count} | excl {args.held_excl_frac} | hardneg {args.hardneg_frac}", flush=True)
+          f"ema {args.ema_color} | held {held_count} | excl {args.held_excl_frac} | "
+          f"structured {args.structured}(n_pos {args.n_pos}) | scan_ctx {args.scan_context}", flush=True)
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location=dev)
         enc.load_state_dict(ckpt["model"], strict=False)

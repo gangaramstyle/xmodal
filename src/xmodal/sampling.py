@@ -159,6 +159,25 @@ class CachedScan:
     series_idx: int = 0
     patient: str = ""
     spacing: tuple = (1.0, 1.0, 1.0)
+    stats: object = None    # [SCAN_STATS_DIM] float32 scan-calibration vector (v3 scan-context); None if unset
+
+
+SCAN_STATS_DIM = 28
+
+
+def scan_stats(voln, keep=None):
+    """Position-free per-scan calibration vector [SCAN_STATS_DIM] from the NORMALIZED foreground
+    (v3 §2): 9 percentiles [1,5,10,25,50,75,90,95,99] + mean + std + foreground-fraction + 16-bin
+    histogram over [0,1]. Captures the tissue-histogram SHAPE (CSF/GM/WM/tumor modes, contrast) for
+    scan-relative appearance conditioning — carries no spatial information."""
+    fg = voln[keep] if keep is not None else np.asarray(voln).reshape(-1)
+    if fg.size == 0:
+        return np.zeros(SCAN_STATS_DIM, dtype=np.float32)
+    pcts = np.percentile(fg, [1, 5, 10, 25, 50, 75, 90, 95, 99]).astype(np.float32)      # 9
+    frac = np.float32(float(keep.mean())) if keep is not None else np.float32(1.0)        # 1
+    hist, _ = np.histogram(fg, bins=16, range=(0.0, 1.0))                                 # 16
+    hist = (hist / max(hist.sum(), 1)).astype(np.float32)
+    return np.concatenate([pcts, [np.float32(fg.mean()), np.float32(fg.std()), frac], hist]).astype(np.float32)
 
 
 def _thick_and_plane(affine_R: np.ndarray, thick_axis):
@@ -187,8 +206,9 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
     if len(vox) > max_fg:
         vox = vox[np.random.default_rng(seed).choice(len(vox), max_fg, replace=False)]
     fg = vox @ R.T + t
+    keep = vol_np > fg_thresh * hi
     if normalize:  # simple per-scan robust scale to ~[0,1] (percentile window)
-        lo, hiP = np.percentile(vol_np[vol_np > fg_thresh * hi], [0.5, 99.5]) if (vol_np > fg_thresh * hi).any() else (0.0, hi)
+        lo, hiP = np.percentile(vol_np[keep], [0.5, 99.5]) if keep.any() else (0.0, hi)
         vol_np = np.clip((vol_np - lo) / max(hiP - lo, 1e-6), 0.0, 1.0)
     return CachedScan(
         volume=torch.as_tensor(np.ascontiguousarray(vol_np, dtype=np.float32), device=device, dtype=torch.float32),
@@ -196,7 +216,7 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
         affine_trans=torch.as_tensor(t.copy(), device=device),
         foreground_mm=torch.as_tensor(fg, device=device),
         thick_axis=thick, plane_id=plane, modality=modality, series_idx=series_idx,
-        patient=patient, spacing=spacing,
+        patient=patient, spacing=spacing, stats=scan_stats(vol_np, keep),
     )
 
 
@@ -392,6 +412,38 @@ def _apply_hardneg(oh, sh, sdh, present, frac, rng):
         sdh[i0], sdh[i1] = int(s0), int(s1)                       # differ ONLY in modality
 
 
+def _breadth_mix(rng, n_series, present, share):
+    """v3 structured curriculum: a source mixture [n_series] with ONE dominant series holding `share`
+    (ramps balanced->peaked over training), the rest Dirichlet-spread. Early low share => every target
+    modality has same-modality context (easy self); late high share => other modalities are cross."""
+    p = np.zeros(n_series, dtype=np.float64)
+    dom = int(rng.choice(present))
+    if len(present) == 1:
+        p[dom] = 1.0
+        return p
+    w = rng.dirichlet(np.ones(len(present)))
+    for s, wi in zip(present, w):
+        p[s] = (1.0 - share) * wi
+    p[dom] += share
+    return p / p.sum()
+
+
+def _apply_pos_exclusion(pos, tsize, oa, sa, half, thick_axis, frac, rng, max_tries=8):
+    """v3 structured exclusion: a target POSITION (present in all modalities) must not overlap ANY
+    source patch's in-plane footprint (any series, since every series is a target here). Redraws
+    violating positions in-place. frac<=0 disables."""
+    if frac <= 0 or len(oa) == 0:
+        return pos
+    ip = [a for a in (0, 1, 2) if a != thick_axis]
+    for _ in range(max_tries):
+        d = np.sqrt(((pos[:, None][:, :, ip] - oa[None, :][:, :, ip]) ** 2).sum(-1))   # [P,n]
+        viol = (d < frac * (tsize + sa[None, :]) / 2.0).any(1)                          # [P]
+        if not viol.any():
+            break
+        pos[viol] = (rng.random((int(viol.sum()), 3)) * 2 - 1) * half
+    return pos
+
+
 def _gather_slabs(scan, centers, sizes, thick_axis, voxels, device):
     """centers [K,3] world-mm, sizes [K] (mm) -> slab patches [K,V,V,1] from ONE scan (one grid_sample)."""
     import torch
@@ -407,7 +459,9 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                               size_per_bag=False, orient="native", rng, device,
                               pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1,
                               align_floor=0.1, dom_lo=0.7, dom_hi=0.95, ramp_frac=0.8,
-                              held_excl_frac=1.0, hardneg_frac=0.0, force_align=None):
+                              held_excl_frac=1.0, hardneg_frac=0.0, force_align=None,
+                              structured=False, n_pos=12, target_size=8.0, src_share_lo=0.3, src_share_hi=0.9,
+                              scan_context=False):
     """Mixed-modality paired batch. Per item: a fully-visible source bag `a` + `held_count` disjoint
     held targets (bag a) + a 2nd view `b` (view-CLS only). Per-patch series ~ Categorical(source_mix)
     for a,b and Categorical(target_mix) for held, from `sample_mixes(step,total)` on the item's bundle.
@@ -434,12 +488,21 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
     ssb = torch.zeros(batch_size, n, dtype=torch.long, device=device)
     tsr = torch.zeros(batch_size, m, dtype=torch.long, device=device)
     a_anch = torch.empty(batch_size, 3, device=device); b_anch = torch.empty(batch_size, 3, device=device)
+    st_a = st_b = st_h = None
+    if scan_context:                                                        # per-patch scan-stats [B,*,D]
+        st_a = torch.zeros(batch_size, n, SCAN_STATS_DIM, device=device)
+        st_b = torch.zeros(batch_size, n, SCAN_STATS_DIM, device=device)
+        st_h = torch.zeros(batch_size, m, SCAN_STATS_DIM, device=device)
+    share = src_share_lo + (src_share_hi - src_share_lo) * min(1.0, step / max(1.0, ramp_frac * total))
 
     G_ctr, G_siz, G_key, G_buf, G_i, G_k = [], [], [], [], [], []            # flat gather accumulators
     for i in range(batch_size):
         bnd = bundles[int(rng.integers(len(bundles)))]
         sid2 = {sc.series_idx: sc for sc in bnd.values()}
         present = sorted(sid2.keys())
+        while structured and len(present) < 4:                              # structured needs all 4 modalities
+            bnd = bundles[int(rng.integers(len(bundles)))]
+            sid2 = {sc.series_idx: sc for sc in bnd.values()}; present = sorted(sid2.keys())
         rep = sid2[present[0]]
         thick = resolve_thick_axis(rep, orient, rng)
         fg = rep.foreground_mm; Mf = fg.shape[0]
@@ -450,17 +513,30 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         band = torch.nonzero((dist >= 0.7 * dwant) & (dist <= 1.3 * dwant), as_tuple=False).flatten()
         b_a = fg[int(band[int(rng.integers(band.numel()))])] if band.numel() > 0 else fg[int((dist - dwant).abs().argmin())]
         a_anch[i] = a_a; b_anch[i] = b_a
-        smix, tmix = sample_mixes(rng, n_series, present, step, total, dom_lo=dom_lo, dom_hi=dom_hi,
-                                  floor=align_floor, ramp_frac=ramp_frac, force_align=force_align)
         sa = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
         sb = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
-        sh = _draw_sizes_np(rng, m, patch_sizes, size_per_bag)
-        sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix); sdh = _draw_series_np(rng, m, tmix)
         oa_np = (rng.random((n, 3)) * 2 - 1) * half
         ob_np = (rng.random((n, 3)) * 2 - 1) * half
-        oh_np = (rng.random((m, 3)) * 2 - 1) * half
-        oh_np = _apply_exclusion(oh_np, sh, sdh, oa_np, sa, sda, half, thick, held_excl_frac, rng)  # pt2: no same-series copy
-        _apply_hardneg(oh_np, sh, sdh, present, hardneg_frac, rng)                                   # pt3: same-pos/diff-series negs
+        if structured:
+            # source-breadth curriculum (share ramps balanced->peaked); panels: aligned=easy, cross=hard
+            sh_share = {"aligned": src_share_lo, "balanced": 1.0 / len(present), "cross": src_share_hi}.get(force_align, share)
+            smix = _breadth_mix(rng, n_series, present, sh_share)
+            sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix)
+            mods4 = present[:4]                                             # target = every position x 4 modalities
+            pos = _apply_pos_exclusion((rng.random((n_pos, 3)) * 2 - 1) * half, target_size, oa_np, sa, half,
+                                       thick, held_excl_frac, rng)
+            oh_np = np.repeat(pos, 4, axis=0)                              # [n_pos*4,3]
+            sdh = np.tile(np.asarray(mods4, dtype=np.int64), n_pos)        # series 0,1,2,3 per position
+            sh = np.full(n_pos * 4, float(target_size), dtype=np.float32)
+        else:
+            smix, tmix = sample_mixes(rng, n_series, present, step, total, dom_lo=dom_lo, dom_hi=dom_hi,
+                                      floor=align_floor, ramp_frac=ramp_frac, force_align=force_align)
+            sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix)
+            sh = _draw_sizes_np(rng, m, patch_sizes, size_per_bag)
+            sdh = _draw_series_np(rng, m, tmix)
+            oh_np = (rng.random((m, 3)) * 2 - 1) * half
+            oh_np = _apply_exclusion(oh_np, sh, sdh, oa_np, sa, sda, half, thick, held_excl_frac, rng)
+            _apply_hardneg(oh_np, sh, sdh, present, hardneg_frac, rng)
         oa = torch.as_tensor(oa_np, device=device, dtype=fg.dtype)
         ob = torch.as_tensor(ob_np, device=device, dtype=fg.dtype)
         oh = torch.as_tensor(oh_np, device=device, dtype=fg.dtype)
@@ -473,6 +549,14 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         bmap = np.zeros(n_series, dtype=np.int64)                            # series id -> global scan index (this bundle)
         for sid, sc in sid2.items():
             bmap[sid] = gid[id(sc)]
+        if scan_context:
+            smap = np.zeros((n_series, SCAN_STATS_DIM), dtype=np.float32)     # series id -> its scan's stats
+            for sid, sc in sid2.items():
+                if sc.stats is not None:
+                    smap[sid] = sc.stats
+            st_a[i] = torch.as_tensor(smap[sda], device=device)
+            st_b[i] = torch.as_tensor(smap[sdb], device=device)
+            st_h[i] = torch.as_tensor(smap[sdh], device=device)
         for ctr, siz, sids, buf in ((a_a[None] + oa, sa, sda, 0), (a_a[None] + oh, sh, sdh, 1), (b_a[None] + ob, sb, sdb, 2)):
             G_ctr.append(ctr); G_siz.append(torch.as_tensor(siz, device=device))
             G_key.append(bmap[sids] * 3 + thick); G_buf.append(np.full(len(sids), buf, np.int64))
@@ -511,6 +595,7 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                 coords_a=ca, coords_b=cb, held_coords=ch,
                 sizes_a=za, sizes_b=zb, held_sizes=zh,
                 source_series_a=ssa, source_series_b=ssb, target_series=tsr,
+                stats_a=st_a, stats_b=st_b, held_stats=st_h,   # None unless scan_context
                 rel_targets=rel)
 
 

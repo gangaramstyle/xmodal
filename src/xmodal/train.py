@@ -87,6 +87,13 @@ class TrainConfig:
     held_excl_frac: float = 1.0       # target<->source exclusion: no held target overlaps a SAME-series
                                       # source footprint (frac*(s_h+s_s)/2). 0 = off (allows local copy)
     hardneg_frac: float = 0.0         # frac of held slots made same-position/different-series HARD-NEG pairs
+    # v3 (docs/MIXED_V3_DESIGN.md): structured 4-way targets + scan-conditioned target teacher
+    structured: bool = False          # targets = n_pos positions x 4 modalities (kills modality/size shortcut)
+    n_pos: int = 12                   # structured: held positions (held_count must = n_pos*4)
+    target_size: float = 8.0          # structured: single target patch size (mm)
+    src_share_lo: float = 0.3         # structured curriculum: source dominant-share ramps lo(balanced/easy)->
+    src_share_hi: float = 0.9         #                        hi(peaked/cross) over align_ramp_frac
+    scan_context: bool = False        # scan-conditioned teacher (AdaLN) + per-patch scan-context on tokens
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -404,7 +411,9 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
             voxels=model.cfg.patch_voxels, prism_choices=cfg.prism_choices, size_per_bag=cfg.size_per_bag,
             orient=cfg.orient, rng=rng, device=device, align_floor=cfg.align_floor, dom_lo=cfg.dom_lo,
             dom_hi=cfg.dom_hi, ramp_frac=cfg.align_ramp_frac, held_excl_frac=cfg.held_excl_frac,
-            hardneg_frac=cfg.hardneg_frac, force_align=force_align)
+            hardneg_frac=cfg.hardneg_frac, force_align=force_align, structured=cfg.structured, n_pos=cfg.n_pos,
+            target_size=cfg.target_size, src_share_lo=cfg.src_share_lo, src_share_hi=cfg.src_share_hi,
+            scan_context=cfg.scan_context)
 
     def fwd(b):
         return model.forward_mixed(b, content_blur=cfg.content_blur, ema_color=cfg.ema_color,
