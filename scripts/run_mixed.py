@@ -47,6 +47,12 @@ def main():
     ap.add_argument("--ema-color", action="store_true",
                     help="BYOL/DINO-style: slots match an EMA (target) color_head (single shared head). "
                          "The ablation arm — pair on/off at matched seeds for a clean A/B.")
+    ap.add_argument("--held-excl-frac", type=float, default=1.0,
+                    help="target<->source exclusion radius: held targets don't overlap SAME-series source "
+                         "footprints (frac*(s_h+s_s)/2). 1.0=full non-overlap attempt, 0=off (allows local copy).")
+    ap.add_argument("--hardneg-frac", type=float, default=0.0,
+                    help="frac of held slots made same-position/different-series HARD-NEG pairs (probes whether "
+                         "series_q_embed routes to modality appearance vs anatomy). 0=off.")
     # alignment curriculum
     ap.add_argument("--align-ramp-frac", type=float, default=0.8,
                     help="target-dom==source-dom prob ramps 1->floor over this fraction of steps")
@@ -55,7 +61,9 @@ def main():
     ap.add_argument("--dom-hi", type=float, default=0.95, help="dominant-series share upper bound")
     ap.add_argument("--wandb", default=None)
     ap.add_argument("--wandb-run", default=None)
-    ap.add_argument("--resume", default=None, help="checkpoint to resume from (weights + step + optimizer if present)")
+    ap.add_argument("--init-from", default=None,
+                    help="load ONLY model weights from a checkpoint and start a FRESH schedule/optimizer at "
+                         "step 0 (warm start). This is NOT a resume — step/optimizer/LR position are not restored.")
     args = ap.parse_args()
     dev = args.device
     root = os.path.expanduser(args.data_root)
@@ -86,14 +94,15 @@ def main():
                         size_per_bag=args.size_per_bag, patch_sizes=tuple(args.patch_sizes),
                         prism_choices=tuple(args.prism_choices), content_blur=args.content_blur, orient=args.orient,
                         ema_color=args.ema_color, align_ramp_frac=args.align_ramp_frac, align_floor=args.align_floor,
-                        dom_lo=args.dom_lo, dom_hi=args.dom_hi,
+                        dom_lo=args.dom_lo, dom_hi=args.dom_hi, held_excl_frac=args.held_excl_frac,
+                        hardneg_frac=args.hardneg_frac,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
-    print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | "
-          f"steps {args.steps} | ema_color {args.ema_color} | held {args.held_count}", flush=True)
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=dev)
+    print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | steps {args.steps} | "
+          f"ema {args.ema_color} | held {args.held_count} | excl {args.held_excl_frac} | hardneg {args.hardneg_frac}", flush=True)
+    if args.init_from:
+        ckpt = torch.load(args.init_from, map_location=dev)
         enc.load_state_dict(ckpt["model"], strict=False)
-        print(f"RESUME from {args.resume}: step {ckpt.get('step')} (weights loaded; fresh optimizer/schedule)", flush=True)
+        print(f"INIT-FROM {args.init_from}: loaded weights (was step {ckpt.get('step')}); fresh optimizer/schedule", flush=True)
     T.train_mixed(enc, cache, val_bundles, {}, cfg, device=dev)
     cache.stop_prefetch()
 

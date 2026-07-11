@@ -413,6 +413,26 @@ class Phase0Encoder(nn.Module):
         loss, met = slot_match_loss(slots, colors, self.match_logit_scale, soft_tau=soft_tau, soft_feat=soft_feat)
         return loss, met, colors.detach()
 
+    @torch.no_grad()
+    def match_breakdown(self, slots, colors, series):
+        """Diagnostic (review pt 4): does match accuracy reflect anatomical correspondence or just
+        modality classification? `slots`,`colors` [B,Q,W] normalized, `series` [B,Q] target-series ids.
+        - acc_all: argmax over ALL Q candidates (easy — cross-modality candidates are eliminable by
+          appearance before anatomy).
+        - acc_same: argmax restricted to SAME-series candidates (+ the true one) — the hard anatomical
+          discrimination. acc_all >> acc_same means the score is inflated by modality elimination.
+        - n_same: avg same-series candidate-pool size (context for reading acc_all)."""
+        s = self.match_logit_scale.exp().clamp(max=100.0)
+        B, Q, _ = slots.shape
+        logits = s * torch.einsum("bqd,bkd->bqk", slots, colors)         # [B,Q,Q]
+        tgt = torch.arange(Q, device=slots.device)[None]
+        acc_all = (logits.argmax(-1) == tgt).float().mean()
+        same = series[:, :, None] == series[:, None, :]                  # [B,Q,Q] candidate k same series as query q
+        eye = torch.eye(Q, dtype=torch.bool, device=slots.device)[None]
+        masked = logits.masked_fill(~(same | eye), float("-inf"))        # keep same-series + always the true target
+        acc_same = (masked.argmax(-1) == tgt).float().mean()
+        return dict(acc_all=float(acc_all), acc_same=float(acc_same), n_same=float(same.float().sum(-1).mean()))
+
     def fuse_series(self, patch_enc, series_cls):
         """Fuse each patch encoding with its (broadcast) series-CLS -> 'content + which series'."""
         B, n, W = patch_enc.shape

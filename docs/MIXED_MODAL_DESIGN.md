@@ -133,14 +133,21 @@ Tunables: `dom_lo/hi` (how peaked the bag is), `floor`, ramp fraction (`0.8*tota
 
 ---
 
-## 4. Masking invariant (the thing that makes or breaks it)
+## 4. Masking invariant + exclusion radius (the thing that makes or breaks it)
 
 "Same series early" is about the **distribution**, never about showing the answer. Held/target
-patches are **always disjoint from the encoder bag** (the existing held-out mechanism). With series on
-both token and query, an overlapping (position, series) target would let the decoder key-lookup the
-visible token and copy — InfoNCE → 0, encoder gets ~no gradient. So: source positions and held
-positions are drawn disjoint, and a held position that *coincides* spatially with a source position
-must differ in series (cross-modal), never be the identical visible patch.
+patches are **always disjoint from the encoder bag**. With series on both token and query, an
+overlapping (position, series) target would let the decoder key-lookup the visible token and copy —
+InfoNCE → 0, encoder gets ~no gradient.
+
+Independent continuous sampling makes exact coincidence measure-zero, but **footprint overlap** is the
+real risk: a held target can still be reconstructed by local interpolation/partial copy of a nearby
+**same-series** source patch (acute for 16 mm patches in a 32 mm prism). So we enforce an explicit
+**exclusion radius** (`held_excl_frac`, `_apply_exclusion`): every held target is redrawn until its
+in-plane center is farther than `frac·(s_held + s_src)/2` from *every same-series source patch* —
+i.e. their footprints don't overlap. Cross-series overlaps are **allowed** (different modality
+appearance carries no copy — that's the cross-modal task). Best-effort in dense small prisms; `frac=0`
+disables (reproduces the leaky v1 behavior).
 
 ---
 
@@ -150,10 +157,21 @@ Matching InfoNCE (`_match_loss`, `slot_match_loss`) is **unchanged**. `color_hea
 **series-agnostic** — it embeds blurred raw pixels, and pixel appearance already carries modality
 (T1 ≠ FLAIR intensities), so the target is implicitly series-typed without conditioning the head.
 
-Negatives = other held patches in the prism. With mixed target series this now includes
-**same-position / different-series** pairs — free hard negatives that force `series_q_embed` to route
-the query to modality-specific appearance. Pixel-MAE head kept as aux/viz. Latent path dropped for
-this experiment.
+Negatives = other held patches in the prism. Note: independently-drawn held positions rarely coincide,
+so same-position/different-series negatives do **not** arise automatically (a v1 overstatement — review
+pt 3). To generate them deliberately, `hardneg_frac` (`_apply_hardneg`) places a fraction of held slots
+as pairs at an **identical center + size but distinct series** — a direct test of whether `series_q_embed`
+routes to modality appearance vs mere anatomy. Default off (opt-in probe). Pixel-MAE head kept as
+aux/viz. Latent path dropped for this experiment.
+
+**Diagnostics (review pt 4/5).** Match accuracy can partly measure modality *classification* (a FLAIR
+query eliminates T1c candidates by appearance before anatomy). `model.match_breakdown` reports
+`acc_all` (all candidates) vs `acc_same` (restricted to same-series candidates — the hard anatomical
+discrimination); `acc_all ≫ acc_same` flags inflation. Validation uses **fixed panels** (`sample_mixes(
+force_align=…)`): `aligned` / `cross` / `balanced` are step-independent and comparable across the whole
+run, while the curriculum-conditioned `cur` panel is a "current task" metric only (not comparable across
+steps). The decision metric remains held-out patch-F1 (`eval_battery`, a fixed set — unaffected by the
+curriculum).
 
 `--ema-color` retained as the ablation arm: online vs BYOL-style EMA `color_head` target
 (`update_color_ema`, `_match_loss(..., ema=True)`), single shared head across all series.
