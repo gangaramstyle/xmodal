@@ -22,10 +22,12 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 EMA_FLAG=""; TAG="noema"
 if [ "${EMA:-0}" = "1" ]; then EMA_FLAG="--ema-color"; TAG="ema"; fi
+VER="${VER:-v2}"                       # run-name version tag (avoids clobbering an earlier batch's dirs/runs)
+NAME="mixed_${VER}_${TAG}_s${SEED:-0}"
 
 .venv/bin/python -u scripts/run_mixed.py \
     --batch-size 224 --token-count 128 --held-count 48 --cache-size 32 \
     --patch-sizes 4 8 16 --content-blur 3 --orient native --seed ${SEED:-0} \
     --steps 70000 ${EMA_FLAG} \
-    --ckpt-dir runs/mixed_${TAG}_s${SEED:-0} \
-    --wandb xmodal-mixed --wandb-run "mixed_${TAG}_s${SEED:-0}_${SLURM_JOB_ID:-manual}"
+    --ckpt-dir runs/${NAME} \
+    --wandb xmodal-mixed --wandb-run "${NAME}_${SLURM_JOB_ID:-manual}"

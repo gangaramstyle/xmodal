@@ -5,7 +5,23 @@ One distilled, GPU-efficient implementation of the pieces that worked, runnable 
 `src/xmodal/`; notebooks `import xmodal.*`. See [`docs/CATALOG.md`](docs/CATALOG.md) for the
 map of the old strains and the cleanup plan.
 
-## Status
+## Current architecture (authoritative)
+
+The **code** and [`docs/MIXED_MODAL_DESIGN.md`](docs/MIXED_MODAL_DESIGN.md) are authoritative; the
+status log below is **historical** and describes earlier strains (per-spec stems, mixed cubes/slabs,
+older param counts) that no longer match the code.
+
+- **One shared 2.5D stem** `Conv3d(1, W, 16×16×1)` — every patch is a V×V×1 slab regardless of
+  physical size; scale rides in via a **per-patch size embedding** (MLP of per-axis mm extent).
+- **One shared pixel head**, **one shared color head** (blind, for matching).
+- **Series as per-patch conditioning** (mixed-modality design): two static embeddings —
+  `series_in_embed` on encoder tokens (Site A), `series_q_embed` on decoder queries (Site B) —
+  replacing the old dynamic series-CLS. Bags are variable mixed-modality; self↔cross is a stochastic
+  dominant-series alignment curriculum. Encoder ~30.7M params (`width=384, depth=12, heads=6`).
+- Entry point: `scripts/run_mixed.py` (`train_mixed`); the phased `run_phased.py`/`train_phased`
+  path is retained but superseded.
+
+## Status (historical)
 
 **Done — `xmodal/sampling.py` (GPU-efficient physical-mm 2.5D sampler, CT + MR):**
 - Physical-mm coordinates; anisotropic / mixed-orientation scans handled uniformly.

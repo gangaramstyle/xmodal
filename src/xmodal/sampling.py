@@ -301,17 +301,33 @@ def sample_cross_batch(bundles, *, batch_size, token_count, patch_spec, prism_mm
 # Per-patch series drawn from a mixture; self<->cross is a stochastic dominant-series ALIGNMENT ramp.
 # ---------------------------------------------------------------------------
 
-def sample_mixes(rng, n_series, present, step, total, *, dom_lo=0.7, dom_hi=0.95, floor=0.1, ramp_frac=0.8):
+def sample_mixes(rng, n_series, present, step, total, *, dom_lo=0.7, dom_hi=0.95, floor=0.1, ramp_frac=0.8,
+                 force_align=None):
     """Per-item source/target series distributions [n_series] over `present` (the bundle's series ids).
     Both have ONE dominant series with a sampled share in [dom_lo,dom_hi]; the rest is Dirichlet spread.
     Curriculum: early the target-dominant == source-dominant (aligned/easy same-modal); an alignment
     prob ramps 1->`floor` over `ramp_frac*total` so late the dominants diverge (cross-modal). All
-    proportions + the aligned coin are stochastic per item. Floors ensure no series cold-starts."""
+    proportions + the aligned coin are stochastic per item. Floors ensure no series cold-starts.
+
+    `force_align` overrides the curriculum for FIXED validation panels (step-independent, comparable
+    across training): 'aligned' (tgt_dom==src_dom), 'cross' (tgt_dom!=src_dom), 'balanced' (uniform
+    mix over present for both). None = the training curriculum."""
     present = list(present)
+    if force_align == "balanced":
+        u = np.zeros(n_series, dtype=np.float64)
+        for s in present:
+            u[s] = 1.0
+        u = u / u.sum()
+        return u.copy(), u.copy()
     s_dom = int(rng.choice(present))
-    align_p = max(floor, 1.0 - step / max(1.0, ramp_frac * total))
     others = [s for s in present if s != s_dom]
-    aligned = (rng.random() < align_p) or (not others)
+    if force_align == "aligned":
+        aligned = True
+    elif force_align == "cross":
+        aligned = not others            # can't be cross with one series present
+    else:
+        align_p = max(floor, 1.0 - step / max(1.0, ramp_frac * total))
+        aligned = (rng.random() < align_p) or (not others)
     t_dom = s_dom if aligned else int(rng.choice(others))
 
     def mix(dom):
@@ -341,6 +357,41 @@ def _draw_series_np(rng, k, mix):
     return rng.choice(len(p), size=k, p=p).astype(np.int64)
 
 
+def _apply_exclusion(oh, sh, sdh, oa, sa, sda, half, thick_axis, frac, rng, max_tries=8):
+    """Enforce a target<->source EXCLUSION radius (design doc §4): a held target must not overlap the
+    in-plane footprint of any SAME-SERIES source patch (else it's reconstructable by local copy /
+    interpolation). Overlap = in-plane center distance < frac*(s_held+s_src)/2. Cross-series overlaps
+    are allowed (different modality appearance carries no copy). Redraws violating held centers in-place
+    (best effort; dense small prisms may not fully satisfy it). frac<=0 disables. oh [m,3] world-mm off."""
+    if frac <= 0 or len(oa) == 0:
+        return oh
+    ip = [a for a in (0, 1, 2) if a != thick_axis]
+    for _ in range(max_tries):
+        d = np.sqrt(((oh[:, None][:, :, ip] - oa[None, :][:, :, ip]) ** 2).sum(-1))   # [m,n] in-plane dist
+        thr = frac * (sh[:, None] + sa[None, :]) / 2.0                                 # [m,n] overlap radius
+        viol = ((d < thr) & (sdh[:, None] == sda[None, :])).any(1)                     # [m] same-series overlap
+        if not viol.any():
+            break
+        oh[viol] = (rng.random((int(viol.sum()), 3)) * 2 - 1) * half
+    return oh
+
+
+def _apply_hardneg(oh, sh, sdh, present, frac, rng):
+    """Paired same-position/different-series HARD NEGATIVES (design doc §5 / review pt 3): for `frac` of
+    held slots, place two targets at the IDENTICAL center + size but DISTINCT series, so the InfoNCE
+    prism contains same-anatomy/different-modality negatives — a direct test of whether series_q_embed
+    routes to modality-specific appearance vs mere anatomy. In-place; frac<=0 or <2 series disables."""
+    present = list(present)
+    if frac <= 0 or len(present) < 2:
+        return
+    npair = int(frac * len(oh) // 2)
+    for p in range(npair):
+        i0, i1 = 2 * p, 2 * p + 1
+        oh[i1] = oh[i0]; sh[i1] = sh[i0]                          # identical anatomy + scale
+        s0, s1 = rng.choice(present, size=2, replace=False)
+        sdh[i0], sdh[i1] = int(s0), int(s1)                       # differ ONLY in modality
+
+
 def _gather_slabs(scan, centers, sizes, thick_axis, voxels, device):
     """centers [K,3] world-mm, sizes [K] (mm) -> slab patches [K,V,V,1] from ONE scan (one grid_sample)."""
     import torch
@@ -355,7 +406,8 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                               patch_sizes=(4., 8., 16.), voxels=16, prism_choices=(32., 64., 128.),
                               size_per_bag=False, orient="native", rng, device,
                               pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1,
-                              align_floor=0.1, dom_lo=0.7, dom_hi=0.95, ramp_frac=0.8):
+                              align_floor=0.1, dom_lo=0.7, dom_hi=0.95, ramp_frac=0.8,
+                              held_excl_frac=1.0, hardneg_frac=0.0, force_align=None):
     """Mixed-modality paired batch. Per item: a fully-visible source bag `a` + `held_count` disjoint
     held targets (bag a) + a 2nd view `b` (view-CLS only). Per-patch series ~ Categorical(source_mix)
     for a,b and Categorical(target_mix) for held, from `sample_mixes(step,total)` on the item's bundle.
@@ -398,15 +450,20 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         band = torch.nonzero((dist >= 0.7 * dwant) & (dist <= 1.3 * dwant), as_tuple=False).flatten()
         b_a = fg[int(band[int(rng.integers(band.numel()))])] if band.numel() > 0 else fg[int((dist - dwant).abs().argmin())]
         a_anch[i] = a_a; b_anch[i] = b_a
-        smix, tmix = sample_mixes(rng, n_series, present, step, total,
-                                  dom_lo=dom_lo, dom_hi=dom_hi, floor=align_floor, ramp_frac=ramp_frac)
+        smix, tmix = sample_mixes(rng, n_series, present, step, total, dom_lo=dom_lo, dom_hi=dom_hi,
+                                  floor=align_floor, ramp_frac=ramp_frac, force_align=force_align)
         sa = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
         sb = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
         sh = _draw_sizes_np(rng, m, patch_sizes, size_per_bag)
-        oa = torch.as_tensor((rng.random((n, 3)) * 2 - 1) * half, device=device, dtype=fg.dtype)
-        ob = torch.as_tensor((rng.random((n, 3)) * 2 - 1) * half, device=device, dtype=fg.dtype)
-        oh = torch.as_tensor((rng.random((m, 3)) * 2 - 1) * half, device=device, dtype=fg.dtype)
         sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix); sdh = _draw_series_np(rng, m, tmix)
+        oa_np = (rng.random((n, 3)) * 2 - 1) * half
+        ob_np = (rng.random((n, 3)) * 2 - 1) * half
+        oh_np = (rng.random((m, 3)) * 2 - 1) * half
+        oh_np = _apply_exclusion(oh_np, sh, sdh, oa_np, sa, sda, half, thick, held_excl_frac, rng)  # pt2: no same-series copy
+        _apply_hardneg(oh_np, sh, sdh, present, hardneg_frac, rng)                                   # pt3: same-pos/diff-series negs
+        oa = torch.as_tensor(oa_np, device=device, dtype=fg.dtype)
+        ob = torch.as_tensor(ob_np, device=device, dtype=fg.dtype)
+        oh = torch.as_tensor(oh_np, device=device, dtype=fg.dtype)
         ca[i] = oa; cb[i] = ob; ch[i] = oh
         za[i] = size_to_extent(torch.as_tensor(sa[None], device=device), thick)[0]
         zb[i] = size_to_extent(torch.as_tensor(sb[None], device=device), thick)[0]

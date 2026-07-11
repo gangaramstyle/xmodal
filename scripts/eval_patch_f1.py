@@ -70,7 +70,7 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda"):
     print(f"cache built: {used} patients, {len(np.concatenate(LAB))} patches -> {out}", flush=True)
 
 
-def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda"):
+def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda", mixed=False):
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import f1_score
     from sklearn.model_selection import GroupKFold
@@ -85,10 +85,11 @@ def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda"):
         for g in gids:
             idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=device)[None].float()
             sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=device), 2)   # native axis=2 (as notebook)
-            for m in MODS:
+            for mi, m in enumerate(MODS):
                 pt = torch.as_tensor(Z[f"{s}_{m}"][idx], device=device).float()[None, ..., None]
+                sid = torch.full((1, len(idx)), mi, device=device, dtype=torch.long) if mixed else None
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, lat = E.teacher_readout(pt, co, sz3)
+                    _, lat = E.teacher_readout(pt, co, sz3, sid)
                 cols[m].append(lat[0].float().cpu().numpy())
         return {m: np.concatenate(cols[m]) for m in MODS}
 
@@ -120,11 +121,14 @@ def main():
     ap.add_argument("--build", action="store_true", help="(re)build the patch cache before eval")
     ap.add_argument("--sizes", type=int, nargs="+", default=[4, 8])
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--mixed", action="store_true",
+                    help="mixed-modality checkpoint: pass per-patch series_ids to teacher_readout (Site A "
+                         "conditioning) so the readout matches training. Off for legacy phased checkpoints.")
     a = ap.parse_args()
     if a.build or not os.path.exists(a.cache):
         build_cache(a.data_root, a.tracks, a.cache, device=a.device)
     if a.checkpoint:
-        print(eval_ckpt(a.cache, a.checkpoint, sizes=tuple(a.sizes), device=a.device))
+        print(eval_ckpt(a.cache, a.checkpoint, sizes=tuple(a.sizes), device=a.device, mixed=a.mixed))
 
 
 if __name__ == "__main__":

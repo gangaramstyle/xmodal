@@ -84,6 +84,9 @@ class TrainConfig:
     align_floor: float = 0.1          # min alignment prob (keeps some easy same-modal signal late)
     dom_lo: float = 0.7               # dominant-series share ~ Uniform(dom_lo, dom_hi), sampled per item
     dom_hi: float = 0.95
+    held_excl_frac: float = 1.0       # target<->source exclusion: no held target overlaps a SAME-series
+                                      # source footprint (frac*(s_h+s_s)/2). 0 = off (allows local copy)
+    hardneg_frac: float = 0.0         # frac of held slots made same-position/different-series HARD-NEG pairs
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -394,34 +397,53 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
         except Exception as e:
             log(f"[wandb] disabled: {e}"); wb = None
 
-    def draw(bundles, step):
+    def draw(bundles, step, force_align=None):
         return S.sample_mixed_paired_batch(
             bundles, batch_size=cfg.batch_size, token_count=cfg.token_count, held_count=cfg.held_count,
             n_series=n_series, step=step, total=cfg.steps, patch_sizes=cfg.patch_sizes,
             voxels=model.cfg.patch_voxels, prism_choices=cfg.prism_choices, size_per_bag=cfg.size_per_bag,
             orient=cfg.orient, rng=rng, device=device, align_floor=cfg.align_floor, dom_lo=cfg.dom_lo,
-            dom_hi=cfg.dom_hi, ramp_frac=cfg.align_ramp_frac)
+            dom_hi=cfg.dom_hi, ramp_frac=cfg.align_ramp_frac, held_excl_frac=cfg.held_excl_frac,
+            hardneg_frac=cfg.hardneg_frac, force_align=force_align)
 
     def fwd(b):
         return model.forward_mixed(b, content_blur=cfg.content_blur, ema_color=cfg.ema_color,
                                    mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
                                    rel_spatial_weight=cfg.rel_spatial_weight, rel_window_weight=cfg.rel_window_weight)
 
+    # FIXED validation panels (review pt 5): 'cur' is the curriculum task (step-conditioned, NOT
+    # comparable across steps); aligned/cross/balanced are step-INDEPENDENT so their curves are
+    # comparable over the whole run. Each reports acc_same (hard anatomical match) alongside acc_all.
+    PANELS = {"cur": None, "aligned": "aligned", "cross": "cross", "balanced": "balanced"}
+    piters = max(4, cfg.val_iters // 2)
+
     @torch.no_grad()
     def validate(step):
-        model.eval(); maes = []; accs = []; macc = []
-        for _ in range(cfg.val_iters):
-            b = draw(val_bundles, step)
-            with torch.autocast(**amp):
-                out = fwd(b)
-            maes.append(float(out["mae"])); accs.append(out["rel_acc"]); macc.append(out["match_acc"])
-        model.train(); return float(np.mean(maes)), float(np.mean(accs)), float(np.mean(macc))
+        model.eval(); res = {}
+        for name, fa in PANELS.items():
+            mae = []; aall = []; asame = []; rel = []
+            for _ in range(piters):
+                b = draw(val_bundles, step, force_align=fa)
+                with torch.autocast(**amp):
+                    o = fwd(b)
+                bd = model.match_breakdown(o["slots"], o["colors"], b["target_series"])
+                mae.append(float(o["mae"])); aall.append(bd["acc_all"]); asame.append(bd["acc_same"]); rel.append(o["rel_acc"])
+            res[name] = dict(mae=float(np.mean(mae)), acc_all=float(np.mean(aall)),
+                             acc_same=float(np.mean(asame)), rel=float(np.mean(rel)))
+        model.train(); return res
+
+    def _wandb_val(res, step):
+        if not wb:
+            return
+        wb.log({f"val/{p}/{k}": res[p][k] for p in res for k in ("mae", "acc_all", "acc_same", "rel")}, step=step)
 
     torch.cuda.synchronize() if device == "cuda" else None
     t0 = time.time()
-    vm, va, vmatch = validate(0)
-    log(f"{'step':>6} {'total':>8} {'mae':>7} {'match':>7} {'macc':>6} {'relacc':>7} {'val_mae':>8} {'val_macc':>8} {'lr':>8}")
-    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {'-':>6} {'-':>7} {vm:>8.4f} {vmatch:>8.3f} {'-':>8}")
+    v = validate(0); _wandb_val(v, 0)
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'match':>7} {'macc':>6} {'relacc':>7} "
+        f"{'al_mae':>7} {'cr_mae':>7} {'al_same':>7} {'cr_same':>7} {'lr':>8}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {'-':>6} {'-':>7} "
+        f"{v['aligned']['mae']:>7.4f} {v['cross']['mae']:>7.4f} {v['aligned']['acc_same']:>7.3f} {v['cross']['acc_same']:>7.3f} {'-':>8}")
     for step in range(1, cfg.steps + 1):
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
@@ -443,11 +465,11 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
                     "train/match_acc": out["match_acc"], "train/rel_spatial": float(out["rel_spatial"]),
                     "train/rel_window": float(out["rel_window"]), "train/rel_acc": out["rel_acc"], "lr": lr}, step=step)
         if step % cfg.val_every == 0:
-            vm, va, vmatch = validate(step)
+            v = validate(step); _wandb_val(v, step)
             log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {float(out['match']):>7.4f} "
-                f"{out['match_acc']:>6.3f} {out['rel_acc']:>7.3f} {vm:>8.4f} {vmatch:>8.3f} {lr:>8.2e}")
-            if wb:
-                wb.log({"val/mae": vm, "val/rel_acc": va, "val/match_acc": vmatch}, step=step)
+                f"{out['match_acc']:>6.3f} {out['rel_acc']:>7.3f} "
+                f"{v['aligned']['mae']:>7.4f} {v['cross']['mae']:>7.4f} "
+                f"{v['aligned']['acc_same']:>7.3f} {v['cross']['acc_same']:>7.3f} {lr:>8.2e}")
         if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
             os.makedirs(cfg.ckpt_dir, exist_ok=True)
             ckpt_path = f"{cfg.ckpt_dir}/step_{step:06d}.pt"
