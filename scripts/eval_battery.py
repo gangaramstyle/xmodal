@@ -30,10 +30,37 @@ def main():
     if a.build or not os.path.exists(a.cache):
         print("building cache...", flush=True)
         EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev)
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import f1_score
-    from sklearn.model_selection import GroupKFold
     Z = np.load(a.cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
+    CLASSES = [0, 2, 3]                                              # non-tumor, edema, ET (necrosis dropped)
+
+    def torch_probe(X, Y, G, steps=300):
+        """GPU class-balanced multinomial logistic regression, GroupKFold-5. Replaces sklearn (no dep,
+        faster). Returns per-class F1 [non-tumor, edema, ET]. enh=ET, macro=mean."""
+        cmap = {c: i for i, c in enumerate(CLASSES)}
+        Xt = torch.tensor(X, device=dev, dtype=torch.float32)
+        Yt = torch.tensor([cmap[int(y)] for y in Y], device=dev)
+        gids = sorted(set(G.tolist())); fold_of = {g: i % 5 for i, g in enumerate(gids)}
+        foldY = np.array([fold_of[int(g)] for g in G])
+        pred = np.zeros(len(Y), int)
+        for f in range(5):
+            tr = torch.tensor(foldY != f, device=dev); te = torch.tensor(foldY == f, device=dev)
+            Xtr, Ytr = Xt[tr], Yt[tr]
+            mu = Xtr.mean(0, keepdim=True); sd = Xtr.std(0, keepdim=True) + 1e-6
+            cnt = torch.bincount(Ytr, minlength=len(CLASSES)).float()
+            w = (len(Ytr) / (len(CLASSES) * cnt.clamp(min=1))).to(dev)
+            clf = torch.nn.Linear(Xt.shape[1], len(CLASSES)).to(dev)
+            opt = torch.optim.Adam(clf.parameters(), lr=1e-2, weight_decay=1e-4)
+            for _ in range(steps):
+                opt.zero_grad()
+                loss = torch.nn.functional.cross_entropy(clf((Xtr - mu) / sd), Ytr, weight=w)
+                loss.backward(); opt.step()
+            with torch.no_grad():
+                pred[foldY == f] = clf((Xt[te] - mu) / sd).argmax(1).cpu().numpy()
+        Yn = np.array([cmap[int(y)] for y in Y]); f1 = []
+        for c in range(len(CLASSES)):
+            tp = ((pred == c) & (Yn == c)).sum(); fp = ((pred == c) & (Yn != c)).sum(); fn = ((pred != c) & (Yn == c)).sum()
+            p = tp / (tp + fp + 1e-9); r = tp / (tp + fn + 1e-9); f1.append(2 * p * r / (p + r + 1e-9))
+        return f1
 
     def ev(ckpt):
         ck = torch.load(ckpt, map_location=dev); step = int(ck.get("step", -1))
@@ -50,13 +77,8 @@ def main():
                 cols[m].append(lat[0].float().cpu().numpy())
         Fm = {m: np.concatenate(cols[m]) for m in MODS}
         keep = labels != 1; Y = labels[keep]; G = groups[keep]; X = np.concatenate([Fm[m] for m in MODS], -1)[keep]
-        yt, yp = [], []
-        for tr, te in GroupKFold(5).split(X, Y, G):
-            clf = LogisticRegression(max_iter=150, class_weight="balanced").fit(X[tr], Y[tr])
-            yt.append(Y[te]); yp.append(clf.predict(X[te]))
-        yt = np.concatenate(yt); yp = np.concatenate(yp)
-        per = f1_score(yt, yp, labels=[0, 2, 3], average=None, zero_division=0)
-        return step, float(per[2]), float(per.mean())
+        f1 = torch_probe(X, Y, G)
+        return step, float(f1[2]), float(sum(f1) / len(f1))
 
     for spec in a.checkpoints:
         nm, path = spec.split("=", 1)

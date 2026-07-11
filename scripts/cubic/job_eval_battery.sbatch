@@ -18,8 +18,7 @@ cd ~/xmodal
 git pull -q || true
 nvidia-smi --query-gpu=name --format=csv,noheader
 
-# sklearn (not in the base venv)
-.venv/bin/python -m pip install -q scikit-learn 2>&1 | tail -1 || true
+# (readout is now GPU torch logistic regression -- no sklearn dependency)
 
 # pull the 51-METS held-out set (same set the molab baselines used) from wandb, extract
 .venv/bin/python - <<'PY'
