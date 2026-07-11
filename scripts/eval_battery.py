@@ -25,6 +25,9 @@ def main():
     ap.add_argument("--build", action="store_true")
     ap.add_argument("--checkpoints", nargs="+", required=True, help="name=globpath ...")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--mixed", action="store_true",
+                    help="mixed-modality checkpoints: pass per-patch series_ids to teacher_readout so the "
+                         "encoder is conditioned the SAME way training was (Site A). Off for legacy phased ckpts.")
     a = ap.parse_args()
     dev = a.device
     if a.build or not os.path.exists(a.cache):
@@ -70,10 +73,11 @@ def main():
         for g in sorted(set(groups.tolist())):
             idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
             sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=dev), 2)
-            for m in MODS:
+            for mi, m in enumerate(MODS):
                 pt = torch.as_tensor(Z["%d_%s" % (s, m)][idx], device=dev).float()[None, ..., None]
+                sid = torch.full((1, len(idx)), mi, device=dev, dtype=torch.long) if a.mixed else None
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    _, lat = E.teacher_readout(pt, co, sz3)
+                    _, lat = E.teacher_readout(pt, co, sz3, sid)
                 cols[m].append(lat[0].float().cpu().numpy())
         Fm = {m: np.concatenate(cols[m]) for m in MODS}
         keep = labels != 1; Y = labels[keep]; G = groups[keep]; X = np.concatenate([Fm[m] for m in MODS], -1)[keep]
