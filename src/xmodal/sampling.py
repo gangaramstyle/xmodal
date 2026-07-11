@@ -434,20 +434,25 @@ def _local_fg(common_fg, anchor, half):
     return common_fg[d <= half]
 
 
-def _fps(points, k, rng):
-    """Farthest-point sample k well-separated indices from `points` [K,3] (greedy). Returns [k] LongTensor.
-    Ensures the 12 target positions are distinct so position|modality isn't confused by near-duplicates."""
+def _pick_targets(points, k, min_sep, rng, max_tries=8):
+    """Pick k target indices from foreground `points` [K,3] that are mutually >= min_sep apart. RANDOM
+    (not farthest-point): FPS parks targets on the brain rim -> low-foreground 8mm patches (audit: PED
+    tgt_ok 62%); random is interior-weighted (foreground is denser inside) so validity stays high, while
+    the separation floor keeps the 12 positions distinct for position|modality. Best-effort after tries."""
     import torch
     K = points.shape[0]
     if K <= k:
         return torch.arange(K, device=points.device)
-    idx = torch.empty(k, dtype=torch.long, device=points.device)
-    idx[0] = int(rng.integers(K))
-    d = (points - points[idx[0]][None]).pow(2).sum(-1)
-    for i in range(1, k):
-        idx[i] = int(d.argmax())
-        d = torch.minimum(d, (points - points[idx[i]][None]).pow(2).sum(-1))
-    return idx
+    best = None
+    for _ in range(max_tries):
+        idx = torch.as_tensor(rng.choice(K, size=k, replace=False), device=points.device)
+        if min_sep <= 0:
+            return idx
+        d = torch.cdist(points[idx], points[idx]) + torch.eye(k, device=points.device) * 1e9
+        if float(d.min()) >= min_sep:
+            return idx
+        best = idx
+    return best
 
 
 def _band_anchor(fg, a_a, dmin, dmax, rng):
@@ -618,7 +623,7 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                 if local.shape[0] >= n_pos:
                     break
             local_np = (local - a_a[None]).cpu().numpy().astype(np.float32)
-            pos = (local[_fps(local, n_pos, rng)] - a_a[None]).cpu().numpy().astype(np.float32)   # [n_pos,3] FPS targets
+            pos = (local[_pick_targets(local, n_pos, target_size, rng)] - a_a[None]).cpu().numpy().astype(np.float32)  # [n_pos,3]
             oa_np, va_np, sda, sa, orate = _fg_source(local_np, n, sizes_pool, present, sh_share, n_hard_min,
                                                       source_dropout, pos, target_size, thick, held_excl_frac, rng)
             overlap_rates.append(orate)
