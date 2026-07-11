@@ -75,7 +75,21 @@ def main():
     ap.add_argument("--init-from", default=None,
                     help="load ONLY model weights from a checkpoint and start a FRESH schedule/optimizer at "
                          "step 0 (warm start). This is NOT a resume — step/optimizer/LR position are not restored.")
+    ap.add_argument("--assert-v3", action="store_true",
+                    help="fail unless the intended v3 config (--structured --scan-context --ema-color) is active. "
+                         "Guards against the job silently running v2 behavior.")
     args = ap.parse_args()
+    if args.assert_v3:                                                  # review Blocker 1: fail fast on wrong config
+        assert args.structured and args.scan_context and args.ema_color, \
+            f"--assert-v3: need --structured --scan-context --ema-color (got {args.structured}/{args.scan_context}/{args.ema_color})"
+    import subprocess
+    try:
+        git = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__) or ".").decode().strip()
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=os.path.dirname(__file__) or ".").decode().strip()
+    except Exception:
+        git = branch = "unknown"
+    print(f"GIT branch={branch} commit={git} | structured={args.structured} scan_context={args.scan_context} "
+          f"ema_color={args.ema_color}", flush=True)
     dev = args.device
     root = os.path.expanduser(args.data_root)
 
@@ -110,7 +124,7 @@ def main():
                         dom_lo=args.dom_lo, dom_hi=args.dom_hi, held_excl_frac=args.held_excl_frac,
                         hardneg_frac=args.hardneg_frac, structured=args.structured, n_pos=args.n_pos,
                         target_size=args.target_size, src_share_lo=args.src_share_lo, src_share_hi=args.src_share_hi,
-                        scan_context=args.scan_context,
+                        scan_context=args.scan_context, git_commit=git, git_branch=branch,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | bs {args.batch_size} | steps {args.steps} | "
           f"ema {args.ema_color} | held {held_count} | excl {args.held_excl_frac} | "

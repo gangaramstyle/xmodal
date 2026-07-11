@@ -23,8 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xmodal.matching import (ColorHead, ScanConditionedPatchTeacher, blur_contents,
-                             default_log_logit_scale, slot_match_loss)
+from xmodal.matching import (ColorHead, blur_contents, default_log_logit_scale,
+                             slot_match_loss, structured_match_loss)
 from xmodal.sampling import SCAN_STATS_DIM
 
 
@@ -144,7 +144,12 @@ class Phase0Encoder(nn.Module):
         V = cfg.patch_voxels
         self.grid = (V, V, 1)
         self.pv = V * V
-        self.stem = nn.Conv3d(1, cfg.width, self.grid, stride=self.grid)
+        # v3 scan-context A (normalization): patch input carries 3 deterministic scan-RELATIVE channels
+        # (raw, robust z-score, histogram-CDF) computed from the scan's stats. Interpretation A -> the
+        # target is scan-invariant, so NO learned scan network (no EMA-completeness gap) and the query
+        # needs no scan-context. in_ch=1 when scan_context is off.
+        self.in_ch = 3 if cfg.scan_context else 1
+        self.stem = nn.Conv3d(self.in_ch, cfg.width, self.grid, stride=self.grid)
         # per-axis physical extent (mm) [.,.,3] -> W. For a 2.5D slab two axes = the size, the thin
         # (through-plane) axis ~= 0, so this encodes BOTH scale AND orientation (which plane the slab is).
         self.size_embed = nn.Sequential(nn.Linear(3, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
@@ -172,12 +177,9 @@ class Phase0Encoder(nn.Module):
         self.dec_pixel_head = nn.Linear(cfg.width, self.pv)
         self.match_slot_proj = nn.Linear(cfg.width, cfg.width)
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
-        # target (value) encoder: v3 scan-conditioned teacher (AdaLN by scan-context) or blind ColorHead.
-        # `scan_ctx` (G) maps per-scan stats -> context vector, SHARED between the teacher's AdaLN and the
-        # encoder-token conditioning (symmetry: both sides scan-calibrated).
-        self.scan_ctx = nn.Sequential(nn.Linear(SCAN_STATS_DIM, cfg.width), nn.GELU(), nn.Linear(cfg.width, cfg.width))
-        self.color_head = (ScanConditionedPatchTeacher(cfg.width, self.grid) if cfg.scan_context
-                           else ColorHead(cfg.width, self.grid))
+        # target (value) encoder: blind ColorHead over the (scan-relative) patch channels. Scan context
+        # is deterministic input channels (scan-context A) -> the ENTIRE target side is EMA'd cleanly.
+        self.color_head = ColorHead(cfg.width, self.grid, in_ch=self.in_ch)
         # EMA (target) copy of the SINGLE shared target encoder (BYOL/DINO-style stable matching target).
         # Init identical; updated by EMA (never by grad). Used only when ema_color is enabled.
         self.color_head_ema = copy.deepcopy(self.color_head)
@@ -192,19 +194,35 @@ class Phase0Encoder(nn.Module):
         """Per-patch per-axis physical extent (mm) [B,k,3] -> additive size+orientation embedding [B,k,W]."""
         return self.size_embed(sizes)
 
+    def _scan_channels(self, patches, stats):
+        """v3 scan-context A: patches [B,Q,V,V,1] + per-patch scan stats [B,Q,SCAN_STATS_DIM] -> 3-channel
+        scan-RELATIVE input [B,Q,3,V,V,1]: (raw, robust z-score = (x-median)/IQR, histogram-CDF at x).
+        Deterministic (no learned scan net) and position-free — pure intensity calibration."""
+        B, Q = patches.shape[:2]
+        x = patches                                                       # [B,Q,V,V,1]
+        med = stats[..., 4].view(B, Q, 1, 1, 1)                           # p50
+        iqr = (stats[..., 5] - stats[..., 3]).clamp_min(1e-3).view(B, Q, 1, 1, 1)   # p75-p25
+        z = (x - med) / iqr
+        cumh = stats[..., 12:28].cumsum(-1)                               # [B,Q,16] CDF over the 16-bin histogram
+        idx = (x.reshape(B, Q, -1) * 16).long().clamp(0, 15)             # [B,Q,V*V]
+        cdf = torch.gather(cumh, -1, idx).reshape_as(x)
+        return torch.stack([x, z, cdf], dim=2)                           # [B,Q,3,V,V,1]
+
+    def _stem_in(self, patches, stats):
+        """Prepare stem/color input: 3 scan-relative channels when scan_context, else the raw patch."""
+        return self._scan_channels(patches, stats) if (self.in_ch == 3 and stats is not None) else patches
+
     def embed(self, patches, sizes, series_ids=None, stats=None):
-        """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n,3] -> tokens [B,n,W]. Single stem (all patches
-        are V×V×1 grids regardless of physical size); physical scale rides in via the additive size
-        embedding. `series_ids` [B,n] (long) additively injects the patch's modality (Site A). `stats`
-        [B,n,SCAN_STATS_DIM] additively injects the v3 per-patch scan-context (symmetry with the target
-        teacher). None on either keeps the earlier behavior."""
+        """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n,3] -> tokens [B,n,W]. Single stem; scale rides
+        in via the additive size embedding. `series_ids` [B,n] additively injects modality (Site A).
+        `stats` [B,n,SCAN_STATS_DIM] turns the stem input into 3 scan-relative channels (scan-context A)."""
         B, n = patches.shape[:2]
-        tok = self.stem(patches.reshape(B * n, 1, *patches.shape[2:])).reshape(B, n, self.cfg.width)
+        inp = self._stem_in(patches, stats)                              # [B,n,C,V,V,1] or [B,n,V,V,1]
+        inp = inp.reshape(B * n, self.in_ch, *self.grid)
+        tok = self.stem(inp).reshape(B, n, self.cfg.width)
         tok = tok + self._size_emb(sizes).to(tok.dtype)
         if series_ids is not None:
             tok = tok + self.series_in_embed(series_ids).to(tok.dtype)
-        if stats is not None:
-            tok = tok + self.scan_ctx(stats).to(tok.dtype)
         return tok
 
     def encode(self, tokens, coords):
@@ -326,29 +344,40 @@ class Phase0Encoder(nn.Module):
         return self.encode(toks, ccs)[:, 1]
 
     def forward_mixed(self, batch, *, content_blur=0, ema_color=False, mae_weight=0.25, match_weight=1.0,
-                      rel_spatial_weight=0.25, rel_window_weight=0.25):
-        """One continuous objective (no phases). Bag `a` (per-patch source series at Site A) is fully
-        encoded as decoder context; disjoint held positions carry per-patch TARGET series at the query
-        (Site B) and are reconstructed (pixel MAE) + matched (slot<->blind color). Bag `b` supplies the
-        2nd view for view-CLS. Series identity is the static embeddings on tokens+queries — NO series-CLS,
-        rank-hinge, fuse, or teacher pass. The self↔cross curriculum lives in the sampler's series mixes."""
+                      rel_spatial_weight=0.25, rel_window_weight=0.25, structured=False, n_pos=12,
+                      drop_source=False, shuffle_coords=False):
+        """One continuous objective (no phases). Bag `a` (Site A + scan-relative channels) is encoded as
+        decoder context; disjoint held positions carry per-patch TARGET series at the query (Site B) and
+        are matched (+ pixel MAE). `structured` -> the P×4 CONDITIONAL loss (position|modality +
+        modality|position) instead of the global 48-way. `drop_source`/`shuffle_coords` are validation
+        CONTROLS (source removed / target coords permuted) — position accuracy should fall to chance."""
         dev = batch["patches_a"].device
         nreg = 2 + self.registers.shape[0]
         pa, ca, za, ssa = batch["patches_a"], batch["coords_a"], batch["sizes_a"], batch["source_series_a"]
         sta = batch.get("stats_a")                                                  # v3 scan-context (None if off)
         B, n = pa.shape[:2]
-        x = self.encode(*self._context([self.embed(pa, za, ssa, sta)], [ca], dev, B))   # Site A + scan-context on tokens
+        x = self.encode(*self._context([self.embed(pa, za, ssa, sta)], [ca], dev, B))
         src_enc = x[:, nreg:]; va = x[:, 1]
+        if drop_source:                                                             # CONTROL: no anatomical context
+            src_enc = torch.zeros_like(src_enc)
         ctx, cc = self._context([src_enc], [ca], dev, B)                            # decoder context = bag a
         hp, hc, hz, tser = batch["held_patches"], batch["held_coords"], batch["held_sizes"], batch["target_series"]
         m = hp.shape[1]
+        if shuffle_coords:                                                          # CONTROL: destroy position signal
+            hc = hc[:, torch.randperm(m, device=dev)]
         query = (self.query_seed[None, None, :] + self._size_emb(hz)
                  + self.series_q_embed(tser)).contiguous()                          # Site B: position+size+want-series
         query = self._decode(query, ctx, cc, hc)
         recon = self.dec_pixel_head(query)
         mae = F.l1_loss(recon, hp.reshape(B, m, self.pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
-        m_loss, m_met, colors = self._match_loss(slots, hp, content_blur, ema=ema_color, stats=batch.get("held_stats"))
+        hstats = batch.get("held_stats")
+        if structured:
+            m_loss, m_met, colors = self._structured_match(slots, hp, content_blur, hstats, n_pos, ema=ema_color)
+            match_acc = m_met["acc_pos"]                                            # position|modality is the headline
+        else:
+            m_loss, m_met, colors = self._match_loss(slots, hp, content_blur, ema=ema_color, stats=hstats)
+            match_acc = m_met["match_acc"]
         vb = self._view_repr(batch["patches_b"], batch["coords_b"], batch["sizes_b"],
                              batch["source_series_b"], batch.get("stats_b"))
         rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
@@ -358,9 +387,11 @@ class Phase0Encoder(nn.Module):
                  + rel_spatial_weight * spatial + rel_window_weight * window)
         with torch.no_grad():
             rel_acc = float(((rel_logits > 0).float() == batch["rel_targets"]).float().mean())
-        return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=m_met["match_acc"],
+        return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=match_acc,
+                    acc_pos=m_met.get("acc_pos"), acc_mod=m_met.get("acc_mod"),
                     rel_spatial=spatial.detach(), rel_window=window.detach(), rel_acc=rel_acc,
-                    recon=recon.detach(), held_patches=hp.detach(), slots=slots.detach(), colors=colors)
+                    recon=recon.detach(), held_patches=hp.detach(),
+                    slots=slots.detach(), colors=colors, target_series=tser)
 
     # ---- cross-modal ---------------------------------------------------------------
     def _gather(self, x, idx, d):
@@ -403,20 +434,33 @@ class Phase0Encoder(nn.Module):
         for pe, po in zip(self.color_head_ema.parameters(), self.color_head.parameters()):
             pe.mul_(m).add_(po.detach(), alpha=1.0 - m)
 
+    @torch.no_grad()
+    def ema_drift(self, batch, content_blur=0):
+        """Diagnostic: how far the EMA target lags the online target. cos = mean online·EMA; agree =
+        fraction of held patches whose in-bag nearest neighbor is the same under online vs EMA."""
+        hp, st = batch["held_patches"], batch.get("held_stats")
+        on = self.color_embed(hp, content_blur, st, ema=False)
+        em = self.color_embed(hp, content_blur, st, ema=True)
+        cos = (on * em).sum(-1).mean()
+        son = torch.einsum("bqd,bkd->bqk", on, on).argmax(-1)
+        sem = torch.einsum("bqd,bkd->bqk", em, em).argmax(-1)
+        return dict(cos=float(cos), agree=float((son == sem).float().mean()))
+
+    def color_embed(self, content, content_blur, stats, ema=False):
+        """Blurred (scan-relative) target patch -> L2-normalized appearance embedding [B,Q,W].
+        ema=True uses the stop-grad EMA target head (the WHOLE target side is EMA'd under scan-context A)."""
+        co = self._stem_in(blur_contents(content, content_blur), stats)
+        head = self.color_head_ema if ema else self.color_head
+        return F.normalize(head(co), dim=-1)
+
     def _match_loss(self, slots, content, content_blur, *, soft_tau=None, soft_sim="model", ema=False, stats=None):
-        """Slot<->content matching loss. `content` = held/target patches [B,Q,V,V,1]. `stats`
-        [B,Q,SCAN_STATS_DIM] -> shared scan-context s = G(stats) feeds the scan-conditioned teacher (v3);
-        None for the blind ColorHead (arg ignored there).
-        ema=True: BYOL-style stable target -- slots predict the EMA target's (stop-grad) embeddings
-        (trains slots), and the ONLINE target is trained to match the (stop-grad) slots (so the EMA
-        target keeps learning). Otherwise the standard symmetric InfoNCE (hard or similarity-softened)."""
-        co = blur_contents(content, content_blur)
-        s = self.scan_ctx(stats) if stats is not None else None
-        colors = F.normalize(self.color_head(co, s), dim=-1)
+        """Global slot<->content matching (v2 mixed path — NOT the structured objective). `content` =
+        held patches [B,Q,V,V,1]; `stats` -> scan-relative channels. ema=True: BYOL two-direction. Returns
+        (loss, met, target_embed) where target_embed is the space the METRICS should use (EMA when ema)."""
+        colors = self.color_embed(content, content_blur, stats, ema=False)
         if ema:
-            with torch.no_grad():
-                colors_t = F.normalize(self.color_head_ema(co, s), dim=-1)
-            s = self.match_logit_scale.exp().clamp(max=100.0); B, Q, _ = slots.shape
+            colors_t = self.color_embed(content, content_blur, stats, ema=True).detach()
+            s = self.match_logit_scale.exp().clamp(min=1.0, max=100.0); B, Q, _ = slots.shape
             tgt = torch.arange(Q, device=slots.device).expand(B, Q)
             la = s * torch.einsum("bqd,bkd->bqk", slots, colors_t)          # slots -> stable EMA target (trains slots)
             lb = s * torch.einsum("bqd,bkd->bqk", colors, slots.detach())   # online colors -> slots (trains color_head)
@@ -424,9 +468,23 @@ class Phase0Encoder(nn.Module):
                           + F.cross_entropy(lb.reshape(B * Q, Q), tgt.reshape(-1)))
             with torch.no_grad():
                 acc = float((la.argmax(1) == tgt).float().mean())
-            return loss, {"match_acc": acc}, colors.detach()
+            return loss, {"match_acc": acc}, colors_t                       # metrics use the EMA target space
+        co = blur_contents(content, content_blur)
         soft_feat = co.reshape(slots.shape[0], slots.shape[1], -1) if (soft_tau is not None and soft_sim == "pixel") else None
         loss, met = slot_match_loss(slots, colors, self.match_logit_scale, soft_tau=soft_tau, soft_feat=soft_feat)
+        return loss, met, colors.detach()
+
+    def _structured_match(self, slots, content, content_blur, stats, n_pos, ema=False):
+        """v3 conditional matching over the P×4 grid (position|modality + modality|position). EMA gives
+        the two-direction BYOL form (slots -> stop-grad EMA target; online target -> stop-grad slots).
+        Returns (loss, met, target_embed) with target_embed = the space metrics/breakdown should use."""
+        colors = self.color_embed(content, content_blur, stats, ema=False)
+        if ema:
+            colors_t = self.color_embed(content, content_blur, stats, ema=True).detach()
+            l1, met = structured_match_loss(slots, colors_t, n_pos, self.match_logit_scale)         # trains slots
+            l2, _ = structured_match_loss(colors, slots.detach(), n_pos, self.match_logit_scale)    # trains online head
+            return 0.5 * (l1 + l2), met, colors_t
+        loss, met = structured_match_loss(slots, colors, n_pos, self.match_logit_scale)
         return loss, met, colors.detach()
 
     @torch.no_grad()

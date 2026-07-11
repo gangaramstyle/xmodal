@@ -16,46 +16,55 @@ import torch.nn.functional as F
 
 
 class ColorHead(nn.Module):
-    """Blind value encoder: patch contents -> embedding, no positional signal. `s` (scan-context) is
-    accepted for interface-compat with ScanConditionedPatchTeacher and IGNORED."""
+    """Blind value encoder: patch contents -> embedding, no positional signal (no coords/RoPE/stem).
+    `in_ch` > 1 carries the v3 scan-relative channels (raw + z-score + CDF) so the target is a scan-
+    CALIBRATED appearance (interpretation A: normalization, not style injection) — still position-free."""
 
-    def __init__(self, width, voxels):
+    def __init__(self, width, voxels, in_ch=1):
         super().__init__()
-        self.embed = nn.Conv3d(1, width, tuple(voxels), stride=tuple(voxels))
+        self.embed = nn.Conv3d(in_ch, width, tuple(voxels), stride=tuple(voxels))
         self.mlp = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(),
                                  nn.Linear(width, width))
 
-    def forward(self, patches, s=None):
+    def forward(self, patches):
+        # patches [B,Q,C,V,V,1] (multi-channel) or [B,Q,V,V,1] (single)
         b, q = patches.shape[:2]
-        x = patches.reshape(b * q, 1, *patches.shape[2:])
+        x = patches.reshape(b * q, *patches.shape[2:]) if patches.dim() == 6 else patches.reshape(b * q, 1, *patches.shape[2:])
         z = self.embed(x).reshape(b * q, -1)
         return self.mlp(z).reshape(b, q, -1)
 
 
-class ScanConditionedPatchTeacher(nn.Module):
-    """Blind value encoder + scan-relative calibration (v3 §2). Same conv over patch pixels as ColorHead
-    (no coordinates/RoPE/stem -> no positional leak), then AdaLN modulation by a per-patch scan-context
-    vector `s` = G(scan stats). The scan histogram calibrates appearance (where the intensity sits among
-    the tissue modes) but, being global to the scan, cannot distinguish patches by location. Injected via
-    AdaLN, never cross-attention, so the target patch cannot localize itself in a scan map."""
+def _ce_last(logits, target):
+    """Cross-entropy where `logits` [..., K] retrieve index `target` [...] over the last axis."""
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
 
-    def __init__(self, width, voxels):
-        super().__init__()
-        self.embed = nn.Conv3d(1, width, tuple(voxels), stride=tuple(voxels))
-        self.norm = nn.LayerNorm(width, elementwise_affine=False)     # AdaLN: affine comes from s
-        self.to_scale_shift = nn.Linear(width, 2 * width)
-        self.mlp = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, width))
-        nn.init.zeros_(self.to_scale_shift.weight)                   # start at identity (gamma=beta=0) ->
-        nn.init.zeros_(self.to_scale_shift.bias)                     # ~plain blind encoder, calibration grows
 
-    def forward(self, patches, s=None):
-        b, q = patches.shape[:2]
-        z = self.embed(patches.reshape(b * q, 1, *patches.shape[2:])).reshape(b, q, -1)   # [B,Q,W]
-        h = self.norm(z)
-        if s is not None:
-            gamma, beta = self.to_scale_shift(s).chunk(2, dim=-1)
-            h = h * (1 + gamma) + beta                              # AdaLN(z; s)
-        return self.mlp(h)
+def structured_match_loss(slots, colors, n_pos, logit_scale, *, w_pos=1.0, w_mod=0.25):
+    """v3 CONDITIONAL matching (review Blocker 2). slots/colors [B, P*M, D] L2-normalized, ordered
+    position-major (index = p*M + m; M=4 modalities). Two conditional objectives so the 12x4 structure
+    actually trains the model — a global P*M softmax lets modality be eliminated for free (log48->log12
+    with zero anatomy learned):
+      position|modality: fix modality, retrieve the right POSITION among P (chance 1/P).
+      modality|position: fix position, retrieve the right MODALITY among M (chance 1/M).
+    Both slot->target and target->slot directions. Returns (loss, metrics)."""
+    B, Q, D = slots.shape
+    P = n_pos; M = Q // P
+    s = logit_scale.exp().clamp(min=1.0, max=100.0)
+    zs = slots.reshape(B, P, M, D); hs = colors.reshape(B, P, M, D)
+    zp, hp = zs.permute(0, 2, 1, 3), hs.permute(0, 2, 1, 3)              # [B,M,P,D]
+    Lp = s * torch.einsum("bmpd,bmqd->bmpq", zp, hp)                     # [B,M,P(query),P(cand)]
+    tp = torch.arange(P, device=slots.device).expand(B, M, P)
+    loss_pos = 0.5 * (_ce_last(Lp, tp) + _ce_last(Lp.transpose(-1, -2), tp))
+    Lm = s * torch.einsum("bpmd,bpnd->bpmn", zs, hs)                     # [B,P,M(query),M(cand)]
+    tm = torch.arange(M, device=slots.device).expand(B, P, M)
+    loss_mod = 0.5 * (_ce_last(Lm, tm) + _ce_last(Lm.transpose(-1, -2), tm))
+    loss = w_pos * loss_pos + w_mod * loss_mod
+    with torch.no_grad():
+        acc_pos = (Lp.argmax(-1) == tp).float().mean()
+        acc_mod = (Lm.argmax(-1) == tm).float().mean()
+    return loss, {"loss_pos": float(loss_pos.detach()), "loss_mod": float(loss_mod.detach()),
+                  "acc_pos": float(acc_pos), "acc_mod": float(acc_mod),
+                  "chance_pos": 1.0 / P, "chance_mod": 1.0 / M}
 
 
 def blur_contents(patches, kernel):

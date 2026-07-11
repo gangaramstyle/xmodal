@@ -93,7 +93,9 @@ class TrainConfig:
     target_size: float = 8.0          # structured: single target patch size (mm)
     src_share_lo: float = 0.3         # structured curriculum: source dominant-share ramps lo(balanced/easy)->
     src_share_hi: float = 0.9         #                        hi(peaked/cross) over align_ramp_frac
-    scan_context: bool = False        # scan-conditioned teacher (AdaLN) + per-patch scan-context on tokens
+    scan_context: bool = False        # scan-relative input channels (scan-context A) on stem + target
+    git_commit: str = ""              # provenance recorded in the checkpoint cfg
+    git_branch: str = ""
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -415,44 +417,66 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
             target_size=cfg.target_size, src_share_lo=cfg.src_share_lo, src_share_hi=cfg.src_share_hi,
             scan_context=cfg.scan_context)
 
-    def fwd(b):
+    def fwd(b, **kw):
         return model.forward_mixed(b, content_blur=cfg.content_blur, ema_color=cfg.ema_color,
                                    mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
-                                   rel_spatial_weight=cfg.rel_spatial_weight, rel_window_weight=cfg.rel_window_weight)
+                                   rel_spatial_weight=cfg.rel_spatial_weight, rel_window_weight=cfg.rel_window_weight,
+                                   structured=cfg.structured, n_pos=cfg.n_pos, **kw)
 
     # FIXED validation panels (review pt 5): 'cur' is the curriculum task (step-conditioned, NOT
     # comparable across steps); aligned/cross/balanced are step-INDEPENDENT so their curves are
-    # comparable over the whole run. Each reports acc_same (hard anatomical match) alongside acc_all.
+    # comparable over the whole run. Structured -> report acc_pos (position|modality, chance 1/n_pos) +
+    # acc_mod (modality|position, 1/4); mixed -> acc_all/acc_same. AKEY = the headline accuracy key.
+    from collections import defaultdict
     PANELS = {"cur": None, "aligned": "aligned", "cross": "cross", "balanced": "balanced"}
     piters = max(4, cfg.val_iters // 2)
+    AKEY = "acc_pos" if cfg.structured else "acc_same"
 
     @torch.no_grad()
     def validate(step):
         model.eval(); res = {}
         for name, fa in PANELS.items():
-            mae = []; aall = []; asame = []; rel = []
+            acc = defaultdict(list)
             for _ in range(piters):
                 b = draw(val_bundles, step, force_align=fa)
                 with torch.autocast(**amp):
                     o = fwd(b)
-                bd = model.match_breakdown(o["slots"], o["colors"], b["target_series"])
-                mae.append(float(o["mae"])); aall.append(bd["acc_all"]); asame.append(bd["acc_same"]); rel.append(o["rel_acc"])
-            res[name] = dict(mae=float(np.mean(mae)), acc_all=float(np.mean(aall)),
-                             acc_same=float(np.mean(asame)), rel=float(np.mean(rel)))
+                acc["mae"].append(float(o["mae"])); acc["rel"].append(o["rel_acc"]); acc["overlap"].append(b["overlap_rate"])
+                if cfg.structured:
+                    acc["acc_pos"].append(o["acc_pos"]); acc["acc_mod"].append(o["acc_mod"])
+                else:
+                    bd = model.match_breakdown(o["slots"], o["colors"], b["target_series"])
+                    acc["acc_all"].append(bd["acc_all"]); acc["acc_same"].append(bd["acc_same"])
+            res[name] = {k: float(np.mean(v)) for k, v in acc.items()}
+        if cfg.structured:                                                  # CONTROLS: acc_pos must fall to ~1/n_pos
+            ctrl = {}
+            for cname, kw in (("dropsrc", dict(drop_source=True)), ("shufcoord", dict(shuffle_coords=True))):
+                a = [fwd(draw(val_bundles, step, force_align="balanced"), **kw)["acc_pos"] for _ in range(piters)]
+                ctrl[cname] = float(np.mean(a))
+            ctrl["chance"] = 1.0 / cfg.n_pos
+            res["_ctrl"] = ctrl
+        if cfg.ema_color:                                                   # EMA drift diagnostic
+            b = draw(val_bundles, step, force_align="balanced" if cfg.structured else None)
+            with torch.autocast(**amp):
+                res["_drift"] = model.ema_drift(b, content_blur=cfg.content_blur)
         model.train(); return res
 
     def _wandb_val(res, step):
         if not wb:
             return
-        wb.log({f"val/{p}/{k}": res[p][k] for p in res for k in ("mae", "acc_all", "acc_same", "rel")}, step=step)
+        d = {f"val/{p}/{k}": v for p, kv in res.items() if not p.startswith("_") for k, v in kv.items()}
+        for blk in ("_ctrl", "_drift"):
+            if blk in res:
+                d.update({f"val/{blk.strip('_')}/{k}": v for k, v in res[blk].items()})
+        wb.log(d, step=step)
 
     torch.cuda.synchronize() if device == "cuda" else None
     t0 = time.time()
     v = validate(0); _wandb_val(v, 0)
-    log(f"{'step':>6} {'total':>8} {'mae':>7} {'match':>7} {'macc':>6} {'relacc':>7} "
-        f"{'al_mae':>7} {'cr_mae':>7} {'al_same':>7} {'cr_same':>7} {'lr':>8}")
-    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {'-':>6} {'-':>7} "
-        f"{v['aligned']['mae']:>7.4f} {v['cross']['mae']:>7.4f} {v['aligned']['acc_same']:>7.3f} {v['cross']['acc_same']:>7.3f} {'-':>8}")
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'match':>7} {'macc':>6} {'overlap':>7} "
+        f"{'al_mae':>7} {'cr_mae':>7} {'al_'+AKEY[-3:]:>7} {'cr_'+AKEY[-3:]:>7} {'lr':>8}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {'-':>6} {v['balanced']['overlap']:>7.3f} "
+        f"{v['aligned']['mae']:>7.4f} {v['cross']['mae']:>7.4f} {v['aligned'][AKEY]:>7.3f} {v['cross'][AKEY]:>7.3f} {'-':>8}")
     for step in range(1, cfg.steps + 1):
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
@@ -470,15 +494,21 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
         if _is_cache:
             train_bundles.step()
         if wb and step % cfg.log_every == 0:
-            wb.log({"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
-                    "train/match_acc": out["match_acc"], "train/rel_spatial": float(out["rel_spatial"]),
-                    "train/rel_window": float(out["rel_window"]), "train/rel_acc": out["rel_acc"], "lr": lr}, step=step)
+            tmp = float(model.match_logit_scale.exp().clamp(min=1.0, max=100.0))
+            d = {"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
+                 "train/match_acc": out["match_acc"], "train/rel_spatial": float(out["rel_spatial"]),
+                 "train/rel_window": float(out["rel_window"]), "train/rel_acc": out["rel_acc"],
+                 "train/logit_scale": tmp, "train/overlap": b["overlap_rate"], "lr": lr}
+            if out.get("acc_mod") is not None:
+                d["train/acc_mod"] = out["acc_mod"]
+            wb.log(d, step=step)
         if step % cfg.val_every == 0:
             v = validate(step); _wandb_val(v, step)
+            ctrl = v.get("_ctrl", {}); ctrl_s = f" ctrl[drop {ctrl.get('dropsrc', 0):.3f}/shuf {ctrl.get('shufcoord', 0):.3f}]" if ctrl else ""
             log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {float(out['match']):>7.4f} "
-                f"{out['match_acc']:>6.3f} {out['rel_acc']:>7.3f} "
+                f"{out['match_acc']:>6.3f} {v['balanced']['overlap']:>7.3f} "
                 f"{v['aligned']['mae']:>7.4f} {v['cross']['mae']:>7.4f} "
-                f"{v['aligned']['acc_same']:>7.3f} {v['cross']['acc_same']:>7.3f} {lr:>8.2e}")
+                f"{v['aligned'][AKEY]:>7.3f} {v['cross'][AKEY]:>7.3f} {lr:>8.2e}{ctrl_s}")
         if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
             os.makedirs(cfg.ckpt_dir, exist_ok=True)
             ckpt_path = f"{cfg.ckpt_dir}/step_{step:06d}.pt"

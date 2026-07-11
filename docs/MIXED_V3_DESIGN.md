@@ -31,51 +31,81 @@ moves to the **source** side: the source bag's dominant-modality share ramps fro
 (`src_share_hi`, ~0.9 → only the dominant modality's targets have context; the other three are genuine
 cross-modal prediction). Stochastic per item, floored. Replaces the v2 alignment coin in structured mode.
 
-## 2. Scan-conditioned target encoder — Version A, symmetric  (`--scan-context`)
+## 1b. Conditional matching loss — the structure must live in the LOSS  (review Blocker 2)
 
-**Per-scan stats** (deterministic, position-free, computed once at load on the normalized foreground):
-9 percentiles `[1,5,10,25,50,75,90,95,99]` + mean + std + foreground-fraction + 16-bin histogram = **28
-dims** → `CachedScan.stats`. This is exactly the histogram calibration the critique asks for and, being
-global, cannot reveal any patch's location.
+The 12×4 layout in the sampler is not enough: a **global 48-way InfoNCE** lets modality be eliminated
+for free (a T1c query rejects the 36 non-T1c candidates and ties among 12 T1c → loss log48→log12,
+top-1 2.1%→8.3%, with *zero* anatomy learned). So the objective is **conditional**
+(`structured_match_loss`):
 
-**Context vector** `s = G(stats)` — a small MLP `28→W→W`. `s` is **per-patch** (each patch's stats come
-from its own modality's scan).
+- **position | modality**: fix the modality, retrieve the right POSITION among P (chance **1/P**) —
+  weight **1.0**. This is the anatomical-correspondence signal.
+- **modality | position**: fix the position, retrieve the right MODALITY among M=4 (chance **1/4**) —
+  weight **0.25**. Contrast held fixed on anatomy.
+- global 48-way: **0** (may return later at 0.05–0.1 if it helps).
 
-**Target teacher** `ScanConditionedPatchTeacher` replaces `ColorHead`: same blind conv over patch pixels,
-then **AdaLN** modulation `γ(s)⊙LN(f)+β(s)` — a global calibration knob that cannot localize the patch
-(no cross-attention to spatial scan tokens; that path is a position-leak trap and is avoided). `s` is
-shared across all patches of a scan, so it calibrates appearance but cannot distinguish the P positions.
+Both slot→target and target→slot directions; EMA uses the two-direction BYOL form (slots ↦ stop-grad
+EMA target; online target ↦ stop-grad slots). This is the CAPI flavor (stable target encoder defines
+what a masked patch contains) with a **continuous** target — no prototypes, Sinkhorn, or codebook.
 
-**Symmetry (the review's correction).** The main encoder **also** receives `s` — added to each token
-alongside size+series (`_add_cond`). Otherwise the encoder must predict a scan-calibrated target from
-information it structurally can't see → irreducible error. Both sides scan-calibrated → the gap closes.
+## 2. Scan-conditioned target — Version A: scan-RELATIVE channels  (`--scan-context`)
 
-## 3. What's unchanged
+Semantics fixed to **normalization** (review): the target should mean "this patch is bright *relative
+to this scan's tissue distribution*". We implement that as deterministic **scan-relative input
+channels**, not a learned AdaLN style vector (AdaLN could as easily inject scanner style as remove it).
 
-Matching InfoNCE + `ema_color` arm; per-patch series conditioning (Sites A/B); view-CLS; exclusion;
-fixed val panels + `match_breakdown`. **No** prototypes, Sinkhorn, or cluster prediction.
+**Per-scan stats** (position-free, computed once at load on the normalized foreground): 9 percentiles
+`[1,5,10,25,50,75,90,95,99]` + mean + std + foreground-fraction + 16-bin histogram = **28 dims** →
+`CachedScan.stats`.
 
-## 4. Build map
+**Channels** (`_scan_channels`, deterministic from stats): every patch becomes **3 channels** —
+`[raw, robust z-score = (x−median)/IQR, histogram-CDF(x)]`. The stem and the target `ColorHead` take
+`in_ch=3`. Both source and target get the same transform (symmetry), so the encoder reasons in scan-
+relative space and the target is scan-*invariant*.
 
-1. `data.py`/`sampling.py`: `_scan_stats(voln, keep)` (28-d); plumb through `_cpu_payload`/`to_device_scan`
-   → `CachedScan.stats`.
-2. `sampling.py`: structured-target branch in `sample_mixed_paired_batch` (`P` positions × 4 modalities,
-   one size, source-breadth curriculum) + emit per-patch `*_stats` tensors.
-3. `matching.py`: `ScanConditionedPatchTeacher` (conv + AdaLN(γ,β from s)).
-4. `model.py`: `scan_ctx` MLP (`G`); `_add_cond` adds `G(stats)`; `forward_mixed` uses the teacher +
-   passes held stats; `teacher_readout` accepts stats (eval symmetry).
-5. `train.py`/`run_mixed.py`: `--structured-targets`, `--target-positions`, `--target-size`,
-   `--scan-context`, `src_share_lo/hi`; wire configs.
-6. `eval_battery`/`eval_patch_f1`: pass per-scan stats when `--scan-context`.
+**Consequences.** (a) The decoder query needs **no** scan-context (the target is scan-invariant). (b)
+There is **no learned scan network on the target side**, so the whole target encoder is EMA'd cleanly —
+the review's "EMA is only partially EMA" problem simply doesn't arise. (c) No cross-attention to a scan
+thumbnail (position-leak trap) — channels are per-voxel and global-stat-derived.
 
-## 5. Ablation plan (2×2, once v2 gives a first F1 read)
+## 3. What's unchanged / removed
 
-`{mixed, structured} × {no-scan-ctx, scan-ctx}` at a fixed seed + `ema_color`, so each piece's F1 delta
-is isolated. Then pick the winner and add seeds.
+Kept: per-patch series (Sites A/B), view-CLS, EMA target, fixed val panels. **Removed** vs the first v3
+cut: the global 48-way loss as primary (→ conditional, §1b), the AdaLN `ScanConditionedPatchTeacher` and
+`scan_ctx` MLP (→ scan-relative channels), the Dirichlet breadth-mix (→ exact counts, §1), the circular
+in-plane exclusion (→ inverted slab geometry, §4). **No** prototypes, Sinkhorn, or cluster prediction.
 
-## 6. Open risks
+## 4. Exclusion — inverted + slab geometry  (review pt 3)
 
-- Structured mode assumes complete 4-modality bundles; incomplete ones are skipped (log the count).
-- Scan-stats are computed on the already-normalized volume, so they capture histogram *shape* not raw
-  units — intended (shape carries the tissue modes; raw units are the nuisance we already removed).
-- `held = P×4 = 48` matches v2's `held_count`, so memory/throughput are ~unchanged.
+Targets placed **first** (only P), then source patches whose **axis-aligned slab** footprint overlaps a
+target are redrawn (`_reject_source_overlap`). Slab overlap = both in-plane axes within `(s_src+s_tgt)/2`
+AND the thin through-plane axis within ~1 mm — a 2.5D slab is thin, so thick-separated patches don't
+overlap even when in-plane-close (the old circular in-plane test massively over-counted). Because only P
+small footprints must be avoided, this reaches **overlap_rate = 0** in practice (logged every step;
+`val/*/overlap`). Launch gate requires it at 0.
+
+## 5. Build map (as implemented)
+
+1. `sampling.py`: `scan_stats` (28-d) on `CachedScan.stats` (via `data._cpu_payload` / `to_device_scan`);
+   structured branch (targets-first, exact counts `_exact_source_series`, slab exclusion, per-patch
+   `*_stats`), `overlap_rate` returned.
+2. `matching.py`: `structured_match_loss` (position|modality + modality|position); `ColorHead(in_ch)`.
+3. `model.py`: `_scan_channels` (raw/z/CDF), `in_ch`, `_structured_match`, EMA-target metrics,
+   `ema_drift`, control flags (`drop_source`/`shuffle_coords`), temperature clamp ≥1.
+4. `train.py`: structured metrics + fixed panels + controls + drift + overlap logging; git provenance.
+5. `run_mixed.py` `--structured --scan-context --assert-v3`; `scripts/cubic/job_mixed_v3.sbatch`.
+6. `eval_battery`/`eval_patch_f1`: read `scan_context` from ckpt cfg, cache+pass per-scan `sstats`.
+
+## 6. Launch gate (small run before 70k)  — all must hold
+
+- saved cfg shows `structured/scan_context/ema_color` all true (+ branch/commit).
+- every target bag exactly 12×4; **source–target overlap_rate = 0**.
+- balanced panel exactly 32/32/32/32; `position|modality` chance = 1/12, `modality|position` = 1/4.
+- **controls**: `drop_source` and `shuffle_coords` acc_pos stay at ~1/12 (no context/position shortcut).
+- effective rank / within-modality diversity not collapsing; `logit_scale` in [1,100]; EMA drift bounded.
+- an eval checkpoint reloads with `scan_context` from cfg and passes stats.
+
+## 7. Ablation plan (once v2 gives a first F1 read)
+
+`{mixed, structured} × {no-scan-ctx, scan-ctx}` at a fixed seed + `ema_color`, isolating each piece's F1
+delta; then pick the winner and add seeds.

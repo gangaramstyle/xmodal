@@ -412,36 +412,43 @@ def _apply_hardneg(oh, sh, sdh, present, frac, rng):
         sdh[i0], sdh[i1] = int(s0), int(s1)                       # differ ONLY in modality
 
 
-def _breadth_mix(rng, n_series, present, share):
-    """v3 structured curriculum: a source mixture [n_series] with ONE dominant series holding `share`
-    (ramps balanced->peaked over training), the rest Dirichlet-spread. Early low share => every target
-    modality has same-modality context (easy self); late high share => other modalities are cross."""
-    p = np.zeros(n_series, dtype=np.float64)
+def _exact_source_series(rng, present, n, share):
+    """v3 structured curriculum (review pt 4): EXACT per-modality source counts, not Dirichlet+share.
+    The dominant modality gets exactly round(share*n); the remainder is split as evenly as possible over
+    the others (so every modality is present until share is very high). Order shuffled. Returns [n] ids."""
+    present = list(present)
     dom = int(rng.choice(present))
-    if len(present) == 1:
-        p[dom] = 1.0
-        return p
-    w = rng.dirichlet(np.ones(len(present)))
-    for s, wi in zip(present, w):
-        p[s] = (1.0 - share) * wi
-    p[dom] += share
-    return p / p.sum()
+    others = [s for s in present if s != dom]
+    dom_c = int(round(share * n))
+    rem = n - dom_c
+    base, extra = divmod(rem, max(1, len(others)))
+    counts = {dom: dom_c}
+    for j, s in enumerate(others):
+        counts[s] = base + (1 if j < extra else 0)
+    arr = np.concatenate([np.full(c, s, dtype=np.int64) for s, c in counts.items()]) if n else np.zeros(0, np.int64)
+    rng.shuffle(arr)
+    return arr
 
 
-def _apply_pos_exclusion(pos, tsize, oa, sa, half, thick_axis, frac, rng, max_tries=8):
-    """v3 structured exclusion: a target POSITION (present in all modalities) must not overlap ANY
-    source patch's in-plane footprint (any series, since every series is a target here). Redraws
-    violating positions in-place. frac<=0 disables."""
-    if frac <= 0 or len(oa) == 0:
-        return pos
+def _reject_source_overlap(oa, sa, pos, tsize, thick_axis, half, rng, max_tries=8):
+    """v3 exclusion, INVERTED + slab geometry (review pt 3): targets placed first (few); redraw the SOURCE
+    patches whose AXIS-ALIGNED slab footprint overlaps ANY target's. Overlap needs both in-plane axes AND
+    the thin through-plane axis within half-extent sums (a 2.5D slab is thin, so thick-separated patches
+    don't overlap even when in-plane-close). Returns (oa, residual_overlap_fraction)."""
+    if len(oa) == 0 or len(pos) == 0:
+        return oa, 0.0
     ip = [a for a in (0, 1, 2) if a != thick_axis]
+    viol = np.zeros(len(oa), dtype=bool)
     for _ in range(max_tries):
-        d = np.sqrt(((pos[:, None][:, :, ip] - oa[None, :][:, :, ip]) ** 2).sum(-1))   # [P,n]
-        viol = (d < frac * (tsize + sa[None, :]) / 2.0).any(1)                          # [P]
+        d = np.abs(oa[:, None, :] - pos[None, :, :])                        # [n,P,3]
+        ovu = d[:, :, ip[0]] < (sa[:, None] + tsize) / 2.0
+        ovv = d[:, :, ip[1]] < (sa[:, None] + tsize) / 2.0
+        ovw = d[:, :, thick_axis] < 1.0                                     # thin extents ~1mm -> sum/2 ~1mm
+        viol = (ovu & ovv & ovw).any(1)                                     # [n]
         if not viol.any():
             break
-        pos[viol] = (rng.random((int(viol.sum()), 3)) * 2 - 1) * half
-    return pos
+        oa[viol] = (rng.random((int(viol.sum()), 3)) * 2 - 1) * half
+    return oa, float(viol.mean())
 
 
 def _gather_slabs(scan, centers, sizes, thick_axis, voxels, device):
@@ -494,15 +501,21 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         st_b = torch.zeros(batch_size, n, SCAN_STATS_DIM, device=device)
         st_h = torch.zeros(batch_size, m, SCAN_STATS_DIM, device=device)
     share = src_share_lo + (src_share_hi - src_share_lo) * min(1.0, step / max(1.0, ramp_frac * total))
+    if structured:                                                          # prefilter complete {0,1,2,3} bundles (review pt 5)
+        req = {0, 1, 2, 3}
+        elig = [b for b in bundles if req.issubset({sc.series_idx for sc in b.values()})]
+        if not elig:
+            raise RuntimeError(f"Structured v3 needs complete T1/T1c/T2/FLAIR bundles; none of {len(bundles)} qualify")
+        pool = elig
+    else:
+        pool = bundles
+    overlap_rates = []
 
     G_ctr, G_siz, G_key, G_buf, G_i, G_k = [], [], [], [], [], []            # flat gather accumulators
     for i in range(batch_size):
-        bnd = bundles[int(rng.integers(len(bundles)))]
+        bnd = pool[int(rng.integers(len(pool)))]
         sid2 = {sc.series_idx: sc for sc in bnd.values()}
         present = sorted(sid2.keys())
-        while structured and len(present) < 4:                              # structured needs all 4 modalities
-            bnd = bundles[int(rng.integers(len(bundles)))]
-            sid2 = {sc.series_idx: sc for sc in bnd.values()}; present = sorted(sid2.keys())
         rep = sid2[present[0]]
         thick = resolve_thick_axis(rep, orient, rng)
         fg = rep.foreground_mm; Mf = fg.shape[0]
@@ -515,20 +528,22 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         a_anch[i] = a_a; b_anch[i] = b_a
         sa = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
         sb = _draw_sizes_np(rng, n, patch_sizes, size_per_bag)
-        oa_np = (rng.random((n, 3)) * 2 - 1) * half
         ob_np = (rng.random((n, 3)) * 2 - 1) * half
         if structured:
-            # source-breadth curriculum (share ramps balanced->peaked); panels: aligned=easy, cross=hard
+            # TARGETS FIRST: 12 positions x 4 modalities, one size; then place source AVOIDING their slabs
+            pos = (rng.random((n_pos, 3)) * 2 - 1) * half
+            oa_np = (rng.random((n, 3)) * 2 - 1) * half
+            if held_excl_frac > 0:
+                oa_np, orate = _reject_source_overlap(oa_np, sa, pos, target_size, thick, half, rng)
+                overlap_rates.append(orate)
+            # source-breadth curriculum with EXACT counts; panels: balanced=easy (0.25), cross=hard (share_hi)
             sh_share = {"aligned": src_share_lo, "balanced": 1.0 / len(present), "cross": src_share_hi}.get(force_align, share)
-            smix = _breadth_mix(rng, n_series, present, sh_share)
-            sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix)
-            mods4 = present[:4]                                             # target = every position x 4 modalities
-            pos = _apply_pos_exclusion((rng.random((n_pos, 3)) * 2 - 1) * half, target_size, oa_np, sa, half,
-                                       thick, held_excl_frac, rng)
+            sda = _exact_source_series(rng, present, n, sh_share); sdb = _exact_source_series(rng, present, n, sh_share)
             oh_np = np.repeat(pos, 4, axis=0)                              # [n_pos*4,3]
-            sdh = np.tile(np.asarray(mods4, dtype=np.int64), n_pos)        # series 0,1,2,3 per position
+            sdh = np.tile(np.asarray(present[:4], dtype=np.int64), n_pos)  # series 0,1,2,3 per position
             sh = np.full(n_pos * 4, float(target_size), dtype=np.float32)
         else:
+            oa_np = (rng.random((n, 3)) * 2 - 1) * half
             smix, tmix = sample_mixes(rng, n_series, present, step, total, dom_lo=dom_lo, dom_hi=dom_hi,
                                       floor=align_floor, ramp_frac=ramp_frac, force_align=force_align)
             sda = _draw_series_np(rng, n, smix); sdb = _draw_series_np(rng, n, smix)
@@ -596,6 +611,7 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                 sizes_a=za, sizes_b=zb, held_sizes=zh,
                 source_series_a=ssa, source_series_b=ssb, target_series=tsr,
                 stats_a=st_a, stats_b=st_b, held_stats=st_h,   # None unless scan_context
+                overlap_rate=float(np.mean(overlap_rates)) if overlap_rates else 0.0,
                 rel_targets=rel)
 
 

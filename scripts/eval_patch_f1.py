@@ -35,6 +35,7 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda"):
     for tr in tracks:
         dirs += sorted(glob.glob(os.path.join(os.path.expanduser(data_root), tr, "BraTS-*")))
     store = {f"{s}_{m}": [] for s in SIZES for m in MODS}
+    SST = {m: [] for m in MODS}                                    # per-used-patient scan stats (v3 scan-context)
     COORD, LAB, GRP = [], [], []
     used = 0
     for gi, d in enumerate(dirs):
@@ -62,9 +63,13 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda"):
             for m in MODS:
                 pt = S.sample_patches_group(b[m].volume, S.mixed_bag_vox(b[m], c[None], torch.full((1, K), float(s), device=device), unit))[0, :, :, :, 0]
                 store[f"{s}_{m}"].append(pt.half().cpu().numpy())
+        for m in MODS:
+            st = b[m].stats
+            SST[m].append(np.zeros(S.SCAN_STATS_DIM, np.float32) if st is None else np.asarray(st, np.float32))
         COORD.append((c - cm).cpu().numpy()); LAB.append(lab); GRP.append(np.full(K, gi))
         used += 1; del b, segt; torch.cuda.empty_cache()
     arrs = {k: np.concatenate(v).astype(np.float16) for k, v in store.items()}
+    arrs.update({f"sstats_{m}": np.stack(SST[m]).astype(np.float32) for m in MODS})   # [used, 28] in group order
     np.savez(out, coords=np.concatenate(COORD).astype(np.float32), labels=np.concatenate(LAB).astype(np.int8),
              groups=np.concatenate(GRP).astype(np.int16), **arrs)
     print(f"cache built: {used} patients, {len(np.concatenate(LAB))} patches -> {out}", flush=True)
@@ -76,20 +81,22 @@ def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda", mixed=False):
     from sklearn.model_selection import GroupKFold
     Z = np.load(cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
     ck = torch.load(ckpt, map_location=device); step = int(ck.get("step", -1))
-    E = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(device)
-    E.load_state_dict(ck["model"]); E.eval()
+    scan_ctx = bool((ck.get("cfg", {}) or {}).get("scan_context", False))
+    E = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8, scan_context=scan_ctx)).to(device)
+    E.load_state_dict(ck["model"], strict=False); E.eval()
     gids = sorted(set(groups.tolist()))
 
     def feats_for(s):
         cols = {m: [] for m in MODS}
-        for g in gids:
+        for k, g in enumerate(gids):
             idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=device)[None].float()
             sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=device), 2)   # native axis=2 (as notebook)
             for mi, m in enumerate(MODS):
                 pt = torch.as_tensor(Z[f"{s}_{m}"][idx], device=device).float()[None, ..., None]
-                sid = torch.full((1, len(idx)), mi, device=device, dtype=torch.long) if mixed else None
+                sid = torch.full((1, len(idx)), mi, device=device, dtype=torch.long) if (mixed or scan_ctx) else None
+                st = torch.as_tensor(Z[f"sstats_{m}"][k], device=device).float()[None, None].expand(1, len(idx), -1) if scan_ctx else None
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, lat = E.teacher_readout(pt, co, sz3, sid)
+                    _, lat = E.teacher_readout(pt, co, sz3, sid, st)
                 cols[m].append(lat[0].float().cpu().numpy())
         return {m: np.concatenate(cols[m]) for m in MODS}
 

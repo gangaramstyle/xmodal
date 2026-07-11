@@ -67,17 +67,23 @@ def main():
 
     def ev(ckpt):
         ck = torch.load(ckpt, map_location=dev); step = int(ck.get("step", -1))
-        E = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
+        ccfg = ck.get("cfg", {}) or {}
+        scan_ctx = bool(ccfg.get("scan_context", False))              # instantiate to MATCH the checkpoint
+        E = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8, scan_context=scan_ctx)).to(dev)
         E.load_state_dict(ck["model"], strict=False); E.eval()
-        s = 8; cols = {m: [] for m in MODS}
-        for g in sorted(set(groups.tolist())):
+        gids = sorted(set(groups.tolist())); s = 8; cols = {m: [] for m in MODS}
+        for k, g in enumerate(gids):
             idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
             sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=dev), 2)
             for mi, m in enumerate(MODS):
                 pt = torch.as_tensor(Z["%d_%s" % (s, m)][idx], device=dev).float()[None, ..., None]
-                sid = torch.full((1, len(idx)), mi, device=dev, dtype=torch.long) if a.mixed else None
+                sid = torch.full((1, len(idx)), mi, device=dev, dtype=torch.long) if (a.mixed or scan_ctx) else None
+                st = None
+                if scan_ctx:                                          # per-scan stats for this (patient, modality)
+                    row = torch.as_tensor(Z["sstats_%s" % m][k], device=dev).float()
+                    st = row[None, None].expand(1, len(idx), -1)
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    _, lat = E.teacher_readout(pt, co, sz3, sid)
+                    _, lat = E.teacher_readout(pt, co, sz3, sid, st)
                 cols[m].append(lat[0].float().cpu().numpy())
         Fm = {m: np.concatenate(cols[m]) for m in MODS}
         keep = labels != 1; Y = labels[keep]; G = groups[keep]; X = np.concatenate([Fm[m] for m in MODS], -1)[keep]
