@@ -113,5 +113,23 @@ def slot_match_loss(slots, colors, logit_scale, soft_tau=None, soft_feat=None):
     return loss, {"match_acc": float(acc), "match_chance": 1.0 / max(q, 1)}
 
 
+def modality_completion_loss(slots, colors, n_mod, logit_scale):
+    """v4 modality completion (docs/MIXED_V4_DESIGN.md). slots/colors [B, n_mod*n_per, D] L2-normalized,
+    ordered MODALITY-major (idx = m*n_per + p). For each target modality, retrieve the right POSITION
+    among the n_per targets of THAT modality (chance 1/n_per). Modality can't help — every candidate in
+    the comparison is already the requested modality. Both slot->target and target->slot. (loss, met)."""
+    B, Q, D = slots.shape
+    M = n_mod; P = Q // M
+    s = logit_scale.exp().clamp(min=1.0, max=100.0)
+    zs = slots.reshape(B, M, P, D); hs = colors.reshape(B, M, P, D)
+    L = s * torch.einsum("bmpd,bmqd->bmpq", zs, hs)                      # [B,M,P(query),P(cand)]
+    tp = torch.arange(P, device=slots.device).expand(B, M, P)
+    loss = 0.5 * (_ce_last(L, tp) + _ce_last(L.transpose(-1, -2), tp))
+    with torch.no_grad():
+        acc = (L.argmax(-1) == tp).float().mean()
+        acc_t2s = (L.transpose(-1, -2).argmax(-1) == tp).float().mean()
+    return loss, {"acc_pos": float(acc), "acc_pos_t2s": float(acc_t2s), "chance_pos": 1.0 / P}
+
+
 def default_log_logit_scale(temperature=0.07):
     return math.log(1.0 / max(temperature, 1e-6))

@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xmodal.matching import (ColorHead, blur_contents, default_log_logit_scale,
+from xmodal.matching import (ColorHead, blur_contents, default_log_logit_scale, modality_completion_loss,
                              slot_match_loss, structured_match_loss)
 from xmodal.sampling import SCAN_STATS_DIM
 
@@ -407,6 +407,40 @@ class Phase0Encoder(nn.Module):
                     rel_spatial=spatial.detach(), rel_window=window.detach(), rel_acc=rel_acc,
                     recon=recon.detach(), held_semantic=hsem.detach(),
                     slots=slots.detach(), colors=colors, target_series=tser)
+
+    # ---- v4 modality completion (docs/MIXED_V4_DESIGN.md) -----------------------------
+    def forward_modality_completion(self, batch, *, content_blur=0, ema_color=False, mae_weight=0.25, match_weight=1.0):
+        """Modality completion: encode 3*P visible co-located patches (the 3 non-target modalities at P
+        positions), decode the P hidden targets (query = position + size + requested modality), match
+        position|target-modality (chance 1/(P/4)) + pixel MAE. No view-CLS, curriculum, or registers."""
+        dev = batch["patches_src_raw"].device
+        nreg = 2 + self.registers.shape[0]
+        ps, refs = batch["patches_src_raw"], batch.get("patches_src_ref")
+        cs, zs, sers, sts = batch["coords_src"], batch["sizes_src"], batch["series_src"], batch.get("stats_src")
+        B = ps.shape[0]
+        x = self.encode(*self._context([self.embed(ps, zs, sers, refs, sts)], [cs], dev, B))
+        ctx, cc = self._context([x[:, nreg:]], [cs], dev, B)                       # decoder context = visible bag
+        hsem, hpix = batch["held_semantic"], batch["held_pixel_target"]
+        ct, zt, modt, hstats = batch["coords_tgt"], batch["sizes_tgt"], batch["mod_tgt"], batch.get("stats_tgt")
+        m = hsem.shape[1]
+        query = (self.query_seed[None, None, :] + self._size_emb(zt) + self.series_q_embed(modt)).contiguous()
+        query = self._decode(query, ctx, cc, ct)
+        recon = self.dec_pixel_head(query)
+        mae = F.l1_loss(recon, hpix.reshape(B, m, self.pv))
+        slots = F.normalize(self.match_slot_proj(query), dim=-1)
+        if ema_color:                                                             # BYOL two-direction
+            colors_t = self.color_embed(hsem, content_blur, hstats, ema=True).detach()
+            colors_o = self.color_embed(hsem, content_blur, hstats, ema=False)
+            l1, met = modality_completion_loss(slots, colors_t, 4, self.match_logit_scale)
+            l2, _ = modality_completion_loss(colors_o, slots.detach(), 4, self.match_logit_scale)
+            m_loss = 0.5 * (l1 + l2); colors = colors_t
+        else:
+            colors = self.color_embed(hsem, content_blur, hstats, ema=False)
+            m_loss, met = modality_completion_loss(slots, colors, 4, self.match_logit_scale)
+        total = mae_weight * mae + match_weight * m_loss
+        return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), acc_pos=met["acc_pos"],
+                    acc_pos_t2s=met["acc_pos_t2s"], chance_pos=met["chance_pos"],
+                    slots=slots.detach(), colors=colors, mod_tgt=modt)
 
     # ---- cross-modal ---------------------------------------------------------------
     def _gather(self, x, idx, d):

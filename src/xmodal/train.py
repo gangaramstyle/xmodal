@@ -96,6 +96,9 @@ class TrainConfig:
     scan_context: bool = False        # scan-relative input channels (scan-context A) on stem + target
     n_hard_min: int = 64              # structured: allow down to this many real source patches (rest = registers)
     source_dropout: float = 0.1       # structured: random source-token dropout -> variable register count
+    # v4 modality completion (docs/MIXED_V4_DESIGN.md): 32 co-located positions, one hidden modality each
+    mc_prism: float = 64.0            # fixed prism size (mm)
+    mc_patch: float = 8.0             # fixed patch size (mm)
     git_commit: str = ""              # provenance recorded in the checkpoint cfg
     git_branch: str = ""
 
@@ -531,3 +534,103 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
     if wb:
         wb.finish()
     log(f"mixed run done: {cfg.steps} steps in {time.time()-t0:.0f}s")
+
+
+def train_modality(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, device="cuda", log=print):
+    """v4 modality-completion trainer (docs/MIXED_V4_DESIGN.md). One loss: position|target-modality
+    matching + pixel MAE. No panels/curriculum/view-CLS. Val logs acc_pos (chance 1/(n_pos/4)), a
+    coord-shuffle control (should fall to chance), collapse diagnostics, and EMA drift."""
+    import os
+    torch.manual_seed(cfg.seed)
+    _is_cache = hasattr(train_bundles, "resident")
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+                            fused=(device == "cuda"))
+    if cfg.compile:
+        try:
+            model.encode = torch.compile(model.encode, dynamic=True)
+        except Exception as e:
+            log(f"[compile] skipped: {e}")
+    rng = np.random.default_rng(cfg.seed)
+    warmup = int(cfg.warmup_frac * cfg.steps)
+    amp = dict(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.amp_bf16 and device == "cuda")
+    chance = 4.0 / cfg.n_pos
+    wb = None
+    if cfg.wandb:
+        try:
+            import wandb as wb
+            wb.init(project=cfg.wandb, name=cfg.wandb_run, config=cfg.__dict__)
+        except Exception as e:
+            log(f"[wandb] disabled: {e}"); wb = None
+
+    def draw(bundles):
+        return S.sample_modality_completion_batch(
+            bundles, batch_size=cfg.batch_size, n_pos=cfg.n_pos, prism=cfg.mc_prism, patch_size=cfg.mc_patch,
+            voxels=model.cfg.patch_voxels, orient=cfg.orient, rng=rng, device=device, scan_context=cfg.scan_context)
+
+    def fwd(b):
+        return model.forward_modality_completion(b, content_blur=cfg.content_blur, ema_color=cfg.ema_color,
+                                                 mae_weight=cfg.mae_weight, match_weight=cfg.match_weight)
+
+    @torch.no_grad()
+    def validate():
+        model.eval(); mae = []; ap = []; apt = []
+        for _ in range(cfg.val_iters):
+            b = draw(val_bundles)
+            with torch.autocast(**amp):
+                o = fwd(b)
+            mae.append(float(o["mae"])); ap.append(o["acc_pos"]); apt.append(o["acc_pos_t2s"])
+        # controls + diagnostics on one batch
+        b = draw(val_bundles)
+        with torch.autocast(**amp):
+            o = fwd(b)
+            bshuf = {**b, "coords_tgt": b["coords_tgt"][:, torch.randperm(cfg.n_pos, device=device)]}
+            ctrl = fwd(bshuf)["acc_pos"]
+        div = model.repr_diag(o["slots"], o["mod_tgt"])
+        drift = model.ema_drift({"held_semantic": b["held_semantic"], "held_stats": b.get("stats_tgt")},
+                                content_blur=cfg.content_blur) if cfg.ema_color else {}
+        model.train()
+        return dict(mae=float(np.mean(mae)), acc_pos=float(np.mean(ap)), acc_pos_t2s=float(np.mean(apt)),
+                    ctrl_shuf=float(ctrl), **{f"div_{k}": v for k, v in div.items()},
+                    **{f"drift_{k}": v for k, v in drift.items()})
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    t0 = time.time()
+    v = validate()
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'acc_pos':>8} {'val_ap':>7} {'shufctl':>7} {'chance':>7} {'lr':>8}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>8} {v['acc_pos']:>7.3f} {v['ctrl_shuf']:>7.3f} {chance:>7.3f} {'-':>8}")
+    for step in range(1, cfg.steps + 1):
+        lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
+        for g in opt.param_groups:
+            g["lr"] = lr
+        b = draw(train_bundles.resident() if _is_cache else train_bundles)
+        with torch.autocast(**amp):
+            out = fwd(b); total = out["loss"]
+        opt.zero_grad(set_to_none=True); total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip); opt.step()
+        if cfg.ema_color:
+            model.update_color_ema(cfg.ema_color_m)
+        if _is_cache:
+            train_bundles.step()
+        if wb and step % cfg.log_every == 0:
+            wb.log({"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
+                    "train/acc_pos": out["acc_pos"], "train/acc_pos_t2s": out["acc_pos_t2s"],
+                    "train/logit_scale": float(model.match_logit_scale.exp().clamp(min=1.0, max=100.0)), "lr": lr}, step=step)
+        if step % cfg.val_every == 0:
+            v = validate()
+            if wb:
+                wb.log({f"val/{k}": val for k, val in v.items()}, step=step)
+            log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {out['acc_pos']:>8.3f} "
+                f"{v['acc_pos']:>7.3f} {v['ctrl_shuf']:>7.3f} {chance:>7.3f} {lr:>8.2e}")
+        if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
+            os.makedirs(cfg.ckpt_dir, exist_ok=True)
+            ckpt_path = f"{cfg.ckpt_dir}/step_{step:06d}.pt"
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": cfg.__dict__}, ckpt_path)
+            if wb and cfg.artifact_every and step % cfg.artifact_every == 0:
+                try:
+                    art = wb.Artifact(f"ckpt-{cfg.wandb_run or 'run'}", type="model", metadata={"step": step})
+                    art.add_file(ckpt_path); wb.log_artifact(art)
+                except Exception as e:
+                    log(f"[wandb] artifact log skipped: {e}")
+    if wb:
+        wb.finish()
+    log(f"modality-completion run done: {cfg.steps} steps in {time.time()-t0:.0f}s")

@@ -434,25 +434,28 @@ def _local_fg(common_fg, anchor, half):
     return common_fg[d <= half]
 
 
-def _pick_targets(points, k, min_sep, rng, max_tries=8):
-    """Pick k target indices from foreground `points` [K,3] that are mutually >= min_sep apart. RANDOM
-    (not farthest-point): FPS parks targets on the brain rim -> low-foreground 8mm patches (audit: PED
-    tgt_ok 62%); random is interior-weighted (foreground is denser inside) so validity stays high, while
-    the separation floor keeps the 12 positions distinct for position|modality. Best-effort after tries."""
+def _pick_targets(points, k, min_sep, rng):
+    """Pick k target indices from foreground `points` [K,3], GREEDILY enforcing mutual >= min_sep (a
+    Poisson-disk accept in random order). Interior-weighted (random, not FPS which parks targets on the
+    brain rim -> low-foreground patches, audit PED 62%). If the region can't fit k separated points,
+    the shortfall is filled with random remaining points (rare on a 64mm prism; caller should log the
+    achieved min-dist). Returns [k] indices."""
     import torch
     K = points.shape[0]
     if K <= k:
         return torch.arange(K, device=points.device)
-    best = None
-    for _ in range(max_tries):
-        idx = torch.as_tensor(rng.choice(K, size=k, replace=False), device=points.device)
-        if min_sep <= 0:
-            return idx
-        d = torch.cdist(points[idx], points[idx]) + torch.eye(k, device=points.device) * 1e9
-        if float(d.min()) >= min_sep:
-            return idx
-        best = idx
-    return best
+    perm = rng.permutation(K)
+    ms2 = float(min_sep) ** 2
+    sel = [int(perm[0])]
+    for idx in perm[1:]:
+        if len(sel) >= k:
+            break
+        if min_sep <= 0 or bool(((points[torch.as_tensor(sel, device=points.device)] - points[int(idx)]).pow(2).sum(-1) >= ms2).all()):
+            sel.append(int(idx))
+    if len(sel) < k:                                                     # region too tight: fill remainder randomly
+        rest = [int(x) for x in perm if int(x) not in set(sel)]
+        sel += rest[: k - len(sel)]
+    return torch.as_tensor(sel[:k], device=points.device)
 
 
 def _band_anchor(fg, a_a, dmin, dmax, rng):
@@ -715,6 +718,104 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                 overlap_rate=float(np.mean(overlap_rates)) if overlap_rates else 0.0,
                 reg_frac=float((~sva).float().mean()),         # fraction of source slots that are registers
                 rel_targets=rel)
+
+
+# ---------------------------------------------------------------------------
+# v4 modality completion (docs/MIXED_V4_DESIGN.md): 32 co-located positions, ONE hidden modality each.
+# ---------------------------------------------------------------------------
+
+def sample_modality_completion_batch(bundles, *, batch_size, n_pos=32, prism=64.0, patch_size=8.0,
+                                     voxels=16, orient="native", rng, device, scan_context=True,
+                                     win_center_std=0.0, win_width_log_std=0.0):
+    """Per item: `n_pos` foreground positions in a `prism`; at each position ONE modality is the hidden
+    TARGET (balanced: n_pos/4 per modality) and the other 3 are VISIBLE source. -> 3*n_pos visible +
+    n_pos targets. Positions are >= patch_size apart, so no source footprint overlaps a target (modality-
+    aware exclusion is automatic; no registers/exclusion). Targets ordered MODALITY-major for the loss.
+    Returns patches_src_raw/_ref [B,3P,V,V,1], held_semantic/_pixel [B,P,V,V,1], coords_src/_tgt,
+    series_src [B,3P], mod_tgt [B,P], stats_src/_tgt (None unless scan_context)."""
+    import torch
+    P, V = n_pos, voxels; nS = 3 * P; half = prism / 2.0
+    assert P % 4 == 0, "n_pos must be divisible by 4 for balanced target modalities"
+    req = {0, 1, 2, 3}
+    elig = [b for b in bundles if req.issubset({sc.series_idx for sc in b.values()})]
+    if not elig:
+        raise RuntimeError(f"v4 needs complete T1/T1c/T2/FLAIR bundles; none of {len(bundles)} qualify")
+    scan_list, gid = [], {}
+    for bnd in elig:
+        for sc in bnd.values():
+            if id(sc) not in gid:
+                gid[id(sc)] = len(scan_list); scan_list.append(sc)
+
+    S_raw = torch.empty(batch_size, nS, V, V, 1, device=device); T_all = torch.empty(batch_size, P, V, V, 1, device=device)
+    csrc = torch.empty(batch_size, nS, 3, device=device); ctgt = torch.empty(batch_size, P, 3, device=device)
+    zsrc = torch.empty(batch_size, nS, 3, device=device); ztgt = torch.empty(batch_size, P, 3, device=device)
+    ser_src = torch.zeros(batch_size, nS, dtype=torch.long, device=device)
+    mod_tgt = torch.zeros(batch_size, P, dtype=torch.long, device=device)
+    a_anch = torch.empty(batch_size, 3, device=device)
+    st_src = torch.zeros(batch_size, nS, SCAN_STATS_DIM, device=device) if scan_context else None
+    st_tgt = torch.zeros(batch_size, P, SCAN_STATS_DIM, device=device) if scan_context else None
+    common_cache = {}
+    G_ctr, G_key, G_buf, G_i, G_k = [], [], [], [], []
+    for i in range(batch_size):
+        bnd = elig[int(rng.integers(len(elig)))]
+        sid2 = {sc.series_idx: sc for sc in bnd.values()}; present = sorted(sid2.keys())
+        rep = sid2[present[0]]; thick = resolve_thick_axis(rep, orient, rng); fg = rep.foreground_mm
+        bid = id(bnd)
+        if bid not in common_cache:
+            common_cache[bid] = _common_fg(sid2)
+        cfg = common_cache[bid]
+        for _t in range(8):
+            a_a = fg[int(rng.integers(fg.shape[0]))]; local = _local_fg(cfg, a_a, half)
+            if local.shape[0] >= P:
+                break
+        posw = local[_pick_targets(local, P, patch_size, rng)]           # [P,3] world foreground positions
+        posr = (posw - a_a[None]).cpu().numpy().astype(np.float32)
+        posw_np = posw.cpu().numpy().astype(np.float32)
+        tmod = np.tile(np.arange(4, dtype=np.int64), P // 4); rng.shuffle(tmod)   # balanced hidden modality per position
+        order = np.argsort(tmod, kind="stable")                          # MODALITY-major target order
+        tmod_o = tmod[order]; ctgt[i] = torch.as_tensor(posr[order], device=device); mod_tgt[i] = torch.as_tensor(tmod_o, device=device)
+        vis_m, vis_p = np.where(np.arange(4)[:, None] != tmod[None, :])   # [3P] visible (modality, position)
+        csrc[i] = torch.as_tensor(posr[vis_p], device=device); ser_src[i] = torch.as_tensor(vis_m, device=device)
+        ztgt[i] = size_to_extent(torch.full((1, P), float(patch_size), device=device), thick)[0]
+        zsrc[i] = size_to_extent(torch.full((1, nS), float(patch_size), device=device), thick)[0]
+        bmap = np.zeros(8, dtype=np.int64)
+        for sid, sc in sid2.items():
+            bmap[sid] = gid[id(sc)]
+        if scan_context:
+            smap = np.zeros((8, SCAN_STATS_DIM), dtype=np.float32)
+            for sid, sc in sid2.items():
+                assert sc.stats is not None and np.isfinite(sc.stats).all(), f"v4 bad stats {sid}"
+                smap[sid] = sc.stats
+            st_tgt[i] = torch.as_tensor(smap[tmod_o], device=device); st_src[i] = torch.as_tensor(smap[vis_m], device=device)
+        for ctr, sids, buf in ((posw_np[order], tmod_o, 1), (posw_np[vis_p], vis_m, 0)):   # 1=target, 0=source
+            G_ctr.append(torch.as_tensor(ctr, device=device, dtype=fg.dtype))
+            G_key.append(bmap[sids] * 3 + thick); G_buf.append(np.full(len(sids), buf, np.int64))
+            G_i.append(np.full(len(sids), i, np.int64)); G_k.append(np.arange(len(sids), dtype=np.int64))
+        a_anch[i] = a_a
+
+    allctr = torch.cat(G_ctr); allsiz = torch.full((allctr.shape[0],), float(patch_size), device=device)
+    allkey = np.concatenate(G_key); allbuf = np.concatenate(G_buf); alli = np.concatenate(G_i); allk = np.concatenate(G_k)
+    bufs = {0: S_raw, 1: T_all}
+    for u in np.unique(allkey):
+        sel = np.nonzero(allkey == u)[0]; scan = scan_list[int(u) // 3]; th = int(u) % 3
+        patches = _gather_slabs(scan, allctr[torch.as_tensor(sel, device=device)], allsiz[torch.as_tensor(sel, device=device)], th, V, device)
+        bsel, isel, ksel = allbuf[sel], alli[sel], allk[sel]
+        for bb, buf in bufs.items():
+            mb = np.nonzero(bsel == bb)[0]
+            if mb.size:
+                buf[torch.as_tensor(isel[mb], device=device), torch.as_tensor(ksel[mb], device=device)] = patches[torch.as_tensor(mb, device=device)]
+
+    # optional window jitter (student-side): source raw + pixel target augmented; SEMANTIC target clean
+    def _jit(std_c, std_w):
+        c = torch.as_tensor(rng.normal(0.0, std_c, size=batch_size), device=device, dtype=S_raw.dtype) if std_c > 0 else torch.zeros(batch_size, device=device, dtype=S_raw.dtype)
+        w = torch.as_tensor(np.clip(rng.normal(0.0, std_w, size=batch_size), -3 * std_w, 3 * std_w), device=device, dtype=S_raw.dtype) if std_w > 0 else torch.zeros(batch_size, device=device, dtype=S_raw.dtype)
+        return c, w
+    ac, aw = _jit(win_center_std, win_width_log_std); ea = aw.exp()[:, None, None, None, None]
+    S_aug = (S_raw - ac[:, None, None, None, None]) / ea
+    T_pixel = (T_all - ac[:, None, None, None, None]) / ea
+    return dict(patches_src_raw=S_aug, patches_src_ref=S_raw, held_semantic=T_all, held_pixel_target=T_pixel,
+                coords_src=csrc, coords_tgt=ctgt, sizes_src=zsrc, sizes_tgt=ztgt,
+                series_src=ser_src, mod_tgt=mod_tgt, stats_src=st_src, stats_tgt=st_tgt, n_pos=P)
 
 
 def apply_window_jitter(patches, *, center_std, width_log_std):
