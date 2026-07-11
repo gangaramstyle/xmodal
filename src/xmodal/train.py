@@ -64,6 +64,8 @@ class TrainConfig:
     match_weight: float = 1.0         # matching vs pixel weight inside forward_cross
     soft_match_tau: float | None = None  # similarity-softened matching target (None=hard identity). ~0.1-0.2
     soft_match_sim: str = "model"        # soft-target similarity source: "pixel" (FIXED, collapse-safe) | "model"
+    ema_color: bool = False              # BYOL-style: slots match an EMA (target) color_head instead of the online one
+    ema_color_m: float = 0.996           # EMA momentum for the target color_head
     anchor_frac: float = 0.05
     freeze_encoder: bool = False      # phase-4 faithful: freeze the encoder during the LATENT phase and train
                                       # only the decoder + latent_head (no self-MAE). Teacher==frozen encoder.
@@ -242,7 +244,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
                                     mae_weight=cfg.mae_weight, match_weight=cfg.match_weight,
                                     series_weight=cfg.series_weight, rel_spatial_weight=cfg.rel_spatial_weight,
                                     rel_window_weight=cfg.rel_window_weight, n_xmod=cfg.n_xmod,
-                                    soft_match_tau=cfg.soft_match_tau, soft_match_sim=cfg.soft_match_sim)
+                                    soft_match_tau=cfg.soft_match_tau, soft_match_sim=cfg.soft_match_sim,
+                                    ema_color=cfg.ema_color)
 
     @torch.no_grad()
     def validate():
@@ -314,7 +317,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
                     bc = crossb(pool()); s_scls, t_scls, _ = teach(bc)
                     outc = model.forward_cross(bc["source"], bc["target"], bc["coords"], bc["sizes"], s_scls, t_scls,
                                                objective="both", anchor_frac=cfg.anchor_frac,
-                                               match_weight=cfg.match_weight, content_blur=cfg.content_blur)
+                                               match_weight=cfg.match_weight, content_blur=cfg.content_blur,
+                                               ema_color=cfg.ema_color)
                     loss = loss + cfg.cross_weight * outc["loss"]
                     m.update(cross_mae=float(outc["mae"]), match_acc=outc["match_acc"])
                 elif pname == "latent":
@@ -327,6 +331,8 @@ def train_phased(model, train_source, val_bundles, specs, cfg: TrainConfig, *, p
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
+            if cfg.ema_color:
+                model.update_color_ema(cfg.ema_color_m)
             if is_cache:
                 train_source.step()
             if wb and gstep % cfg.log_every == 0:

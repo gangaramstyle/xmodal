@@ -14,6 +14,7 @@ series-CLS / view-CLS tokens are returned for the downstream heads (added later)
 """
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 
@@ -162,6 +163,11 @@ class Phase0Encoder(nn.Module):
         self.match_slot_proj = nn.Linear(cfg.width, cfg.width)
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
         self.color_head = ColorHead(cfg.width, self.grid)
+        # EMA (target) copy of the SINGLE shared color_head (BYOL/DINO-style stable matching target).
+        # Init identical; updated by EMA (never by grad). Used only when ema_color is enabled.
+        self.color_head_ema = copy.deepcopy(self.color_head)
+        for p in self.color_head_ema.parameters():
+            p.requires_grad_(False)
         self.latent_head = nn.Linear(cfg.width, cfg.width)
         # view-CLS head: 3 spatial-ordering + 2 window signs (rotation dropped) = 5-way BCE
         self.rel_view_head = nn.Sequential(nn.Linear(2 * cfg.width, cfg.width), nn.GELU(),
@@ -224,7 +230,7 @@ class Phase0Encoder(nn.Module):
         return x[:, 0], x[:, 1]
 
     def forward_self(self, patches, coords, sizes, *, mask_ratio=0.5, content_blur=0, held_size=None,
-                     soft_match_tau=None, soft_match_sim="model"):
+                     soft_match_tau=None, soft_match_sim="model", ema_color=False):
         """MAE-style self task: hold out `mask_ratio` of patches; the encoder sees ONLY the visible
         patches (held-out ones NEVER enter the encoder); the DECODER queries the held-out positions
         to reconstruct pixels (MAE) and match position <-> blind content. Held contents are optionally
@@ -260,26 +266,22 @@ class Phase0Encoder(nn.Module):
         recon = self.dec_pixel_head(query)
         mae = F.l1_loss(recon, held_patches.reshape(B, n_held, self.pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
-        colors = F.normalize(self.color_head(blur_contents(held_patches, content_blur)), dim=-1)  # blind + blurred
-        # soft-target similarity source: "pixel" = FIXED raw blurred pixels (non-circular, collapse-safe);
-        # "model" = the trainable color_head (circular / collapse-prone). Only used when soft_match_tau set.
-        soft_feat = blur_contents(held_patches, content_blur).reshape(B, held_patches.shape[1], -1) \
-            if (soft_match_tau is not None and soft_match_sim == "pixel") else None
-        m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale, soft_tau=soft_match_tau, soft_feat=soft_feat)
+        m_loss, m_met, colors = self._match_loss(slots, held_patches, content_blur,
+                                                 soft_tau=soft_match_tau, soft_sim=soft_match_sim, ema=ema_color)
         return dict(mae=mae, match=m_loss, match_acc=m_met["match_acc"],
                     series_repr=x[:, 0], view_repr=x[:, 1],
                     recon=recon.detach(), held_patches=held_patches.detach(),   # viz: predicted vs truth pixels
-                    slots=slots.detach(), colors=colors.detach())               # viz: match assignment
+                    slots=slots.detach(), colors=colors)                        # viz: match assignment
 
     def forward_phase0(self, batch, spec=None, *, mask_ratio=0.5, content_blur=0, held_size=None, mae_weight=0.25,
                        match_weight=1.0, series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25, n_xmod=1,
-                       soft_match_tau=None, soft_match_sim="model"):
+                       soft_match_tau=None, soft_match_sim="model", ema_color=False):
         """Phase-0 self: decoder MAE + matching (view a) + series-CLS (rank_hinge_xmod) + view-CLS
         (5-way BCE) across views a,b. `spec` is unused (size is per-patch) — kept for call compat."""
         from xmodal.losses import rank_hinge_xmod_loss
         out = self.forward_self(batch["patches_a"], batch["coords_a"], batch["sizes_a"],
                                 mask_ratio=mask_ratio, content_blur=content_blur, held_size=held_size,
-                                soft_match_tau=soft_match_tau, soft_match_sim=soft_match_sim)
+                                soft_match_tau=soft_match_tau, soft_match_sim=soft_match_sim, ema_color=ema_color)
         sa, va = out["series_repr"], out["view_repr"]
         sb, vb = self._readout(batch["patches_b"], batch["coords_b"], batch["sizes_b"], mask_ratio=mask_ratio)
         series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"], batch["patient"], n_xmod=n_xmod)
@@ -330,6 +332,35 @@ class Phase0Encoder(nn.Module):
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, nreg:]
 
+    @torch.no_grad()
+    def update_color_ema(self, m):
+        """EMA-update the (single, shared) target color_head from the online one. Call after opt.step()."""
+        for pe, po in zip(self.color_head_ema.parameters(), self.color_head.parameters()):
+            pe.mul_(m).add_(po.detach(), alpha=1.0 - m)
+
+    def _match_loss(self, slots, content, content_blur, *, soft_tau=None, soft_sim="model", ema=False):
+        """Slot<->content matching loss. `content` = held/target patches [B,Q,V,V,1].
+        ema=True: BYOL-style stable target -- slots predict the EMA color_head's (stop-grad) embeddings
+        (trains slots), and the ONLINE color_head is trained to match the (stop-grad) slots (so the EMA
+        target keeps learning). Otherwise the standard symmetric InfoNCE (hard or similarity-softened)."""
+        co = blur_contents(content, content_blur)
+        colors = F.normalize(self.color_head(co), dim=-1)
+        if ema:
+            with torch.no_grad():
+                colors_t = F.normalize(self.color_head_ema(co), dim=-1)
+            s = self.match_logit_scale.exp().clamp(max=100.0); B, Q, _ = slots.shape
+            tgt = torch.arange(Q, device=slots.device).expand(B, Q)
+            la = s * torch.einsum("bqd,bkd->bqk", slots, colors_t)          # slots -> stable EMA target (trains slots)
+            lb = s * torch.einsum("bqd,bkd->bqk", colors, slots.detach())   # online colors -> slots (trains color_head)
+            loss = 0.5 * (F.cross_entropy(la.reshape(B * Q, Q), tgt.reshape(-1))
+                          + F.cross_entropy(lb.reshape(B * Q, Q), tgt.reshape(-1)))
+            with torch.no_grad():
+                acc = float((la.argmax(1) == tgt).float().mean())
+            return loss, {"match_acc": acc}, colors.detach()
+        soft_feat = co.reshape(slots.shape[0], slots.shape[1], -1) if (soft_tau is not None and soft_sim == "pixel") else None
+        loss, met = slot_match_loss(slots, colors, self.match_logit_scale, soft_tau=soft_tau, soft_feat=soft_feat)
+        return loss, met, colors.detach()
+
     def fuse_series(self, patch_enc, series_cls):
         """Fuse each patch encoding with its (broadcast) series-CLS -> 'content + which series'."""
         B, n, W = patch_enc.shape
@@ -341,7 +372,7 @@ class Phase0Encoder(nn.Module):
         return query
 
     def forward_cross(self, source_patches, target_patches, coords, sizes, src_series_cls, tgt_series_cls,
-                      *, anchor_frac=0.05, objective="both", match_weight=1.0, content_blur=0):
+                      *, anchor_frac=0.05, objective="both", match_weight=1.0, content_blur=0, ema_color=False):
         """Cross-modal. Online-encode source + target; decoder context = fused(source, its series-CLS)
         [all positions] + fused(target anchors, its series-CLS) [few, disjoint from the masked recon];
         queries = position + target series-CLS + target SIZE. Predict held-out target patches (pixel
@@ -365,8 +396,7 @@ class Phase0Encoder(nn.Module):
         match_acc = 0.0
         if objective in ("match", "both"):
             slots = F.normalize(self.match_slot_proj(query), dim=-1)
-            colors = F.normalize(self.color_head(blur_contents(tgt_recon.reshape(B, n_recon, *self.grid), content_blur)), dim=-1)
-            m_loss, m_met = slot_match_loss(slots, colors, self.match_logit_scale)
+            m_loss, m_met, _ = self._match_loss(slots, tgt_recon.reshape(B, n_recon, *self.grid), content_blur, ema=ema_color)
             match_acc = m_met["match_acc"]
             loss = mae + match_weight * m_loss if objective == "both" else m_loss
         else:
