@@ -194,31 +194,33 @@ class Phase0Encoder(nn.Module):
         """Per-patch per-axis physical extent (mm) [B,k,3] -> additive size+orientation embedding [B,k,W]."""
         return self.size_embed(sizes)
 
-    def _scan_channels(self, patches, stats):
-        """v3 scan-context A: patches [B,Q,V,V,1] + per-patch scan stats [B,Q,SCAN_STATS_DIM] -> 3-channel
-        scan-RELATIVE input [B,Q,3,V,V,1]: (raw, robust z-score = (x-median)/IQR, histogram-CDF at x).
-        Deterministic (no learned scan net) and position-free — pure intensity calibration."""
-        B, Q = patches.shape[:2]
-        x = patches                                                       # [B,Q,V,V,1]
+    def _scan_channels(self, raw, reference, stats):
+        """v3 scan-context A -> 3-channel scan-RELATIVE input [B,Q,3,V,V,1]. The RAW channel is the
+        PRESENTED intensity (may be window-augmented, for student robustness); z-score and CDF are
+        computed from the CANONICAL `reference` (clean) intensity against the scan's stats, so the
+        calibration channels are invariant to the augmentation (review). Position-free."""
+        B, Q = raw.shape[:2]
         med = stats[..., 4].view(B, Q, 1, 1, 1)                           # p50
-        iqr = (stats[..., 5] - stats[..., 3]).clamp_min(1e-3).view(B, Q, 1, 1, 1)   # p75-p25
-        z = (x - med) / iqr
+        iqr = (stats[..., 5] - stats[..., 3]).clamp_min(1e-3).view(B, Q, 1, 1, 1)   # p75-p25 (numerical floor)
+        z = (reference - med) / iqr
         cumh = stats[..., 12:28].cumsum(-1)                               # [B,Q,16] CDF over the 16-bin histogram
-        idx = (x.reshape(B, Q, -1) * 16).long().clamp(0, 15)             # [B,Q,V*V]
-        cdf = torch.gather(cumh, -1, idx).reshape_as(x)
-        return torch.stack([x, z, cdf], dim=2)                           # [B,Q,3,V,V,1]
+        idx = (reference.reshape(B, Q, -1) * 16).long().clamp(0, 15)      # [B,Q,V*V]
+        cdf = torch.gather(cumh, -1, idx).reshape_as(reference)
+        return torch.stack([raw, z, cdf], dim=2)                          # [B,Q,3,V,V,1]
 
-    def _stem_in(self, patches, stats):
-        """Prepare stem/color input: 3 scan-relative channels when scan_context, else the raw patch."""
-        return self._scan_channels(patches, stats) if (self.in_ch == 3 and stats is not None) else patches
+    def _stem_in(self, raw, reference, stats):
+        """Prepare stem/color input: 3 scan-relative channels when scan_context (raw=presented, z/CDF from
+        `reference`), else the raw patch. `reference` defaults to `raw` (clean = no augmentation)."""
+        if self.in_ch == 3 and stats is not None:
+            return self._scan_channels(raw, raw if reference is None else reference, stats)
+        return raw
 
-    def embed(self, patches, sizes, series_ids=None, stats=None):
-        """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n,3] -> tokens [B,n,W]. Single stem; scale rides
-        in via the additive size embedding. `series_ids` [B,n] additively injects modality (Site A).
-        `stats` [B,n,SCAN_STATS_DIM] turns the stem input into 3 scan-relative channels (scan-context A)."""
+    def embed(self, patches, sizes, series_ids=None, reference=None, stats=None):
+        """patches [B,n,V,V,1] (PRESENTED raw) + sizes [B,n,3] -> tokens [B,n,W]. `series_ids` additively
+        injects modality (Site A). `reference`+`stats` build the scan-relative channels (scan-context A);
+        `reference` is the CLEAN intensity for z/CDF (defaults to `patches` when there is no augmentation)."""
         B, n = patches.shape[:2]
-        inp = self._stem_in(patches, stats)                              # [B,n,C,V,V,1] or [B,n,V,V,1]
-        inp = inp.reshape(B * n, self.in_ch, *self.grid)
+        inp = self._stem_in(patches, reference, stats).reshape(B * n, self.in_ch, *self.grid)
         tok = self.stem(inp).reshape(B, n, self.cfg.width)
         tok = tok + self._size_emb(sizes).to(tok.dtype)
         if series_ids is not None:
@@ -337,10 +339,10 @@ class Phase0Encoder(nn.Module):
                     rel_acc=float(rel_acc), series_viol=float(series_viol))
 
     # ---- mixed-modality conditioned SSL (docs/MIXED_MODAL_DESIGN.md) ------------------
-    def _view_repr(self, patches, coords, sizes, series_ids, stats=None):
+    def _view_repr(self, patches, coords, sizes, series_ids, reference=None, stats=None):
         """Encode a bag (per-patch source series, Site A) -> its view-CLS output [B,W] (for view-CLS)."""
         B = patches.shape[0]
-        toks, ccs = self._context([self.embed(patches, sizes, series_ids, stats)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids, reference, stats)], [coords], patches.device, B)
         return self.encode(toks, ccs)[:, 1]
 
     def forward_mixed(self, batch, *, content_blur=0, ema_color=False, mae_weight=0.25, match_weight=1.0,
@@ -351,35 +353,37 @@ class Phase0Encoder(nn.Module):
         are matched (+ pixel MAE). `structured` -> the P×4 CONDITIONAL loss (position|modality +
         modality|position) instead of the global 48-way. `drop_source`/`shuffle_coords` are validation
         CONTROLS (source removed / target coords permuted) — position accuracy should fall to chance."""
-        dev = batch["patches_a"].device
+        dev = batch["patches_a_raw"].device
         nreg = 2 + self.registers.shape[0]
-        pa, ca, za, ssa = batch["patches_a"], batch["coords_a"], batch["sizes_a"], batch["source_series_a"]
+        pa, ref_a = batch["patches_a_raw"], batch.get("patches_a_reference")         # presented (aug) + clean ref
+        ca, za, ssa = batch["coords_a"], batch["sizes_a"], batch["source_series_a"]
         sta = batch.get("stats_a")                                                  # v3 scan-context (None if off)
         B, n = pa.shape[:2]
-        x = self.encode(*self._context([self.embed(pa, za, ssa, sta)], [ca], dev, B))
+        x = self.encode(*self._context([self.embed(pa, za, ssa, ref_a, sta)], [ca], dev, B))
         src_enc = x[:, nreg:]; va = x[:, 1]
         if drop_source:                                                             # CONTROL: no anatomical context
             src_enc = torch.zeros_like(src_enc)
         ctx, cc = self._context([src_enc], [ca], dev, B)                            # decoder context = bag a
-        hp, hc, hz, tser = batch["held_patches"], batch["held_coords"], batch["held_sizes"], batch["target_series"]
-        m = hp.shape[1]
+        hsem, hpix = batch["held_semantic"], batch["held_pixel_target"]             # clean target vs view-A pixel target
+        hc, hz, tser = batch["held_coords"], batch["held_sizes"], batch["target_series"]
+        m = hsem.shape[1]
         if shuffle_coords:                                                          # CONTROL: destroy position signal
             hc = hc[:, torch.randperm(m, device=dev)]
         query = (self.query_seed[None, None, :] + self._size_emb(hz)
                  + self.series_q_embed(tser)).contiguous()                          # Site B: position+size+want-series
         query = self._decode(query, ctx, cc, hc)
         recon = self.dec_pixel_head(query)
-        mae = F.l1_loss(recon, hp.reshape(B, m, self.pv))
+        mae = F.l1_loss(recon, hpix.reshape(B, m, self.pv))                         # pixel: view-A domain
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
         hstats = batch.get("held_stats")
-        if structured:
-            m_loss, m_met, colors = self._structured_match(slots, hp, content_blur, hstats, n_pos, ema=ema_color)
+        if structured:                                                             # match: CLEAN semantic target
+            m_loss, m_met, colors = self._structured_match(slots, hsem, content_blur, hstats, n_pos, ema=ema_color)
             match_acc = m_met["acc_pos"]                                            # position|modality is the headline
         else:
-            m_loss, m_met, colors = self._match_loss(slots, hp, content_blur, ema=ema_color, stats=hstats)
+            m_loss, m_met, colors = self._match_loss(slots, hsem, content_blur, ema=ema_color, stats=hstats)
             match_acc = m_met["match_acc"]
-        vb = self._view_repr(batch["patches_b"], batch["coords_b"], batch["sizes_b"],
-                             batch["source_series_b"], batch.get("stats_b"))
+        vb = self._view_repr(batch["patches_b_raw"], batch["coords_b"], batch["sizes_b"],
+                             batch["source_series_b"], batch.get("patches_b_reference"), batch.get("stats_b"))
         rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
         rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
         spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()
@@ -389,8 +393,10 @@ class Phase0Encoder(nn.Module):
             rel_acc = float(((rel_logits > 0).float() == batch["rel_targets"]).float().mean())
         return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=match_acc,
                     acc_pos=m_met.get("acc_pos"), acc_mod=m_met.get("acc_mod"),
+                    loss_pos=m_met.get("loss_pos"), loss_mod=m_met.get("loss_mod"),
+                    acc_pos_t2s=m_met.get("acc_pos_t2s"), acc_mod_t2s=m_met.get("acc_mod_t2s"),
                     rel_spatial=spatial.detach(), rel_window=window.detach(), rel_acc=rel_acc,
-                    recon=recon.detach(), held_patches=hp.detach(),
+                    recon=recon.detach(), held_semantic=hsem.detach(),
                     slots=slots.detach(), colors=colors, target_series=tser)
 
     # ---- cross-modal ---------------------------------------------------------------
@@ -424,7 +430,7 @@ class Phase0Encoder(nn.Module):
         conditions the encoder the SAME way training did (Site A + scan-context); leave None for legacy."""
         B = patches.shape[0]
         nreg = 2 + self.registers.shape[0]
-        toks, ccs = self._context([self.embed(patches, sizes, series_ids, stats)], [coords], patches.device, B)
+        toks, ccs = self._context([self.embed(patches, sizes, series_ids, patches, stats)], [coords], patches.device, B)
         x = self.encode(toks, ccs)
         return x[:, 0], x[:, nreg:]
 
@@ -435,23 +441,75 @@ class Phase0Encoder(nn.Module):
             pe.mul_(m).add_(po.detach(), alpha=1.0 - m)
 
     @torch.no_grad()
-    def ema_drift(self, batch, content_blur=0):
-        """Diagnostic: how far the EMA target lags the online target. cos = mean online·EMA; agree =
-        fraction of held patches whose in-bag nearest neighbor is the same under online vs EMA."""
-        hp, st = batch["held_patches"], batch.get("held_stats")
-        on = self.color_embed(hp, content_blur, st, ema=False)
-        em = self.color_embed(hp, content_blur, st, ema=True)
+    def ema_drift(self, batch, content_blur=0, n_pos=None):
+        """EMA vs online target diagnostic (review): all CROSS-space (self-similarity would be trivially 1).
+        cos = paired online·EMA; cross_agree = online query retrieves the same EMA target (over all Q);
+        for structured, xspace_acc_pos = online→EMA position|modality retrieval, and pos_margin = positive
+        cosine minus the hardest same-modality/different-position negative (unsolvable by modality)."""
+        hsem, st = batch["held_semantic"], batch.get("held_stats")
+        on = self.color_embed(hsem, content_blur, st, ema=False)
+        em = self.color_embed(hsem, content_blur, st, ema=True)
+        B, Q, D = on.shape
         cos = (on * em).sum(-1).mean()
-        son = torch.einsum("bqd,bkd->bqk", on, on).argmax(-1)
-        sem = torch.einsum("bqd,bkd->bqk", em, em).argmax(-1)
-        return dict(cos=float(cos), agree=float((son == sem).float().mean()))
+        S = torch.einsum("bqd,bkd->bqk", on, em)                            # online query vs EMA candidates
+        tgt = torch.arange(Q, device=on.device).expand(B, Q)
+        out = dict(cos=float(cos), cross_agree=float((S.argmax(-1) == tgt).float().mean()))
+        if n_pos and Q % n_pos == 0:
+            P, Mn = n_pos, Q // n_pos
+            o = on.reshape(B, P, Mn, D).permute(0, 2, 1, 3); e = em.reshape(B, P, Mn, D).permute(0, 2, 1, 3)  # [B,M,P,D]
+            Lp = torch.einsum("bmpd,bmqd->bmpq", o, e)                      # online pos vs EMA pos, same modality
+            pos = torch.arange(P, device=on.device)
+            posc = Lp[..., pos, pos]                                        # [B,M,P] positive
+            neg = Lp.masked_fill(torch.eye(P, dtype=torch.bool, device=on.device)[None, None], -1e9).max(-1).values
+            out["xspace_acc_pos"] = float((Lp.argmax(-1) == pos).float().mean())
+            out["pos_margin"] = float((posc - neg).mean())
+        return out
+
+    @staticmethod
+    def _eff_rank(x):
+        """Participation-ratio effective rank of the centered rows of x [N,D]: (Σσ²)² / Σσ⁴."""
+        x = (x - x.mean(0, keepdim=True)).float()
+        s2 = torch.linalg.svdvals(x) ** 2
+        return float((s2.sum() ** 2) / (s2.square().sum() + 1e-9))
+
+    @torch.no_grad()
+    def repr_diag(self, embeds, series):
+        """Collapse instrumentation (review): global effective rank + WITHIN-modality effective rank and
+        mean off-diagonal cosine (4 modality centroids can look healthy globally while each modality has
+        collapsed). `embeds` [B,Q,D] L2-normalized, `series` [B,Q]."""
+        B, Q, D = embeds.shape
+        flat = embeds.reshape(-1, D); ser = series.reshape(-1)
+        ers, coss = [], []
+        for s in ser.unique():
+            e = flat[ser == s]
+            if e.shape[0] >= 8:
+                ers.append(self._eff_rank(e))
+                g = e @ e.T; nk = g.shape[0]
+                coss.append(float((g.sum() - g.diagonal().sum()) / (nk * (nk - 1))))
+        return dict(eff_rank=self._eff_rank(flat), prenorm_std=float(embeds.std()),
+                    eff_rank_mod=float(sum(ers) / len(ers)) if ers else 0.0,
+                    offdiag_cos_mod=float(sum(coss) / len(coss)) if coss else 0.0)
+
+    @torch.no_grad()
+    def assert_structured(self, batch, n_pos, tol=1e-4):
+        """Fail-fast on the position-major 12×4 layout the structured loss reshapes assume (review)."""
+        tser = batch["target_series"]; B, Q = tser.shape
+        assert Q == n_pos * 4, f"held {Q} != n_pos*4 ({n_pos*4})"
+        exp = torch.arange(4, device=tser.device)
+        assert (tser.reshape(B, n_pos, 4) == exp).all(), "target_series not position-major [0,1,2,3]"
+        hc = batch["held_coords"].reshape(B, n_pos, 4, 3)
+        assert float(hc.std(dim=2).max()) < tol, "4-way targets don't share a center"
+        hz = batch["held_sizes"].reshape(B, n_pos, 4, 3)
+        assert float(hz.std(dim=2).max()) < tol, "4-way targets don't share a size"
 
     def color_embed(self, content, content_blur, stats, ema=False):
-        """Blurred (scan-relative) target patch -> L2-normalized appearance embedding [B,Q,W].
-        ema=True uses the stop-grad EMA target head (the WHOLE target side is EMA'd under scan-context A)."""
-        co = self._stem_in(blur_contents(content, content_blur), stats)
+        """CLEAN target patch (held_semantic) -> L2-normalized appearance embedding [B,Q,W]. content is
+        canonical (no window jitter); a deterministic blur sets bandwidth. raw=reference=content, so z/CDF
+        are canonical. ema=True uses the stop-grad EMA head (whole target side EMA'd under scan-context A)."""
+        co = blur_contents(content, content_blur)
+        inp = self._stem_in(co, co, stats)
         head = self.color_head_ema if ema else self.color_head
-        return F.normalize(head(co), dim=-1)
+        return F.normalize(head(inp), dim=-1)
 
     def _match_loss(self, slots, content, content_blur, *, soft_tau=None, soft_sim="model", ema=False, stats=None):
         """Global slot<->content matching (v2 mixed path — NOT the structured objective). `content` =

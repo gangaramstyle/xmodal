@@ -68,6 +68,29 @@ There is **no learned scan network on the target side**, so the whole target enc
 the review's "EMA is only partially EMA" problem simply doesn't arise. (c) No cross-attention to a scan
 thumbnail (position-leak trap) — channels are per-voxel and global-stat-derived.
 
+## 2b. Clean semantic target vs view-specific pixel target (final data-flow fix)
+
+Window jitter is a **student-side** augmentation only. The held patch plays two roles that must not be
+the same tensor:
+- **Semantic (EMA) target** = the **clean** held patch (`held_semantic`). Jittering it would inject
+  random label noise into the BYOL target; a deterministic `content_blur` sets bandwidth, nothing more.
+- **Pixel-reconstruction target** = the held patch under **view-A's** window (`held_pixel_target`), so
+  MAE is well-posed: predict the held patch in the same intensity domain as the view-A context.
+
+And the scan-relative channels: the **raw** channel is the presented (possibly view-augmented) intensity;
+**z-score and CDF come from the clean `reference`**, so calibration is invariant to the augmentation
+(the old code computed all three from the jittered tensor → corrupted z, saturated CDF). Data flow:
+
+```
+clean scans → visible A: window-A → raw-A channel ;  clean → z/CDF channels   (student, robust)
+            → visible B: window-B → raw-B channel ;  clean → z/CDF channels
+            → held clean → EMA SEMANTIC target (raw=ref=clean)
+                        → window-A → PIXEL recon target
+```
+
+Batch fields: `patches_a_raw`/`patches_a_reference`, `patches_b_raw`/`patches_b_reference`,
+`held_semantic`, `held_pixel_target`. At eval there is no augmentation → `reference = raw = patches`.
+
 ## 3. What's unchanged / removed
 
 Kept: per-patch series (Sites A/B), view-CLS, EMA target, fixed val panels. **Removed** vs the first v3

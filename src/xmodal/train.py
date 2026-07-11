@@ -443,31 +443,38 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
                     o = fwd(b)
                 acc["mae"].append(float(o["mae"])); acc["rel"].append(o["rel_acc"]); acc["overlap"].append(b["overlap_rate"])
                 if cfg.structured:
-                    acc["acc_pos"].append(o["acc_pos"]); acc["acc_mod"].append(o["acc_mod"])
+                    for k in ("acc_pos", "acc_mod", "acc_pos_t2s", "acc_mod_t2s", "loss_pos", "loss_mod"):
+                        acc[k].append(o[k])
                 else:
                     bd = model.match_breakdown(o["slots"], o["colors"], b["target_series"])
                     acc["acc_all"].append(bd["acc_all"]); acc["acc_same"].append(bd["acc_same"])
             res[name] = {k: float(np.mean(v)) for k, v in acc.items()}
         if cfg.structured:                                                  # CONTROLS: acc_pos must fall to ~1/n_pos
+            b0 = draw(val_bundles, step, force_align="balanced")
+            model.assert_structured(b0, cfg.n_pos)                          # fail-fast on the 12x4 layout
             ctrl = {}
             for cname, kw in (("dropsrc", dict(drop_source=True)), ("shufcoord", dict(shuffle_coords=True))):
                 a = [fwd(draw(val_bundles, step, force_align="balanced"), **kw)["acc_pos"] for _ in range(piters)]
                 ctrl[cname] = float(np.mean(a))
             ctrl["chance"] = 1.0 / cfg.n_pos
             res["_ctrl"] = ctrl
-        if cfg.ema_color:                                                   # EMA drift diagnostic
+            with torch.autocast(**amp):                                     # collapse instrumentation (slots + EMA target)
+                o = fwd(b0)
+            res["_div_slot"] = model.repr_diag(o["slots"], o["target_series"])
+            res["_div_tgt"] = model.repr_diag(o["colors"], o["target_series"])
+        if cfg.ema_color:                                                   # EMA vs online target drift
             b = draw(val_bundles, step, force_align="balanced" if cfg.structured else None)
             with torch.autocast(**amp):
-                res["_drift"] = model.ema_drift(b, content_blur=cfg.content_blur)
+                res["_drift"] = model.ema_drift(b, content_blur=cfg.content_blur, n_pos=cfg.n_pos if cfg.structured else None)
         model.train(); return res
 
     def _wandb_val(res, step):
         if not wb:
             return
         d = {f"val/{p}/{k}": v for p, kv in res.items() if not p.startswith("_") for k, v in kv.items()}
-        for blk in ("_ctrl", "_drift"):
-            if blk in res:
-                d.update({f"val/{blk.strip('_')}/{k}": v for k, v in res[blk].items()})
+        for blk, kv in res.items():
+            if blk.startswith("_"):
+                d.update({f"val/{blk.lstrip('_')}/{k}": v for k, v in kv.items()})
         wb.log(d, step=step)
 
     torch.cuda.synchronize() if device == "cuda" else None
@@ -499,8 +506,8 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
                  "train/match_acc": out["match_acc"], "train/rel_spatial": float(out["rel_spatial"]),
                  "train/rel_window": float(out["rel_window"]), "train/rel_acc": out["rel_acc"],
                  "train/logit_scale": tmp, "train/overlap": b["overlap_rate"], "lr": lr}
-            if out.get("acc_mod") is not None:
-                d["train/acc_mod"] = out["acc_mod"]
+            if out.get("acc_mod") is not None:                             # structured: log both objectives + directions
+                d.update({f"train/{k}": out[k] for k in ("acc_mod", "acc_pos_t2s", "acc_mod_t2s", "loss_pos", "loss_mod")})
             wb.log(d, step=step)
         if step % cfg.val_every == 0:
             v = validate(step); _wandb_val(v, step)

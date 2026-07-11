@@ -100,6 +100,13 @@ def main():
             found = D.find_brats_patients(d)
             pid2dir.update(found)
             print(f"{tr}: {len(found)} patients", flush=True)
+    if args.structured:                                                # prefilter BEFORE the cache (review): only
+        import glob as _glob                                           # complete T1/T1c/T2/FLAIR patients qualify
+        def _complete(dd):
+            return all(_glob.glob(os.path.join(dd, "**", f"*-{suf}.nii.gz"), recursive=True) for suf in D.LOCAL_SUFFIX.values())
+        n0 = len(pid2dir); pid2dir = {p: dd for p, dd in pid2dir.items() if _complete(dd)}
+        print(f"structured: {len(pid2dir)}/{n0} complete 4-modality patients ({n0 - len(pid2dir)} excluded)", flush=True)
+        assert pid2dir, "structured v3 requires complete T1/T1c/T2/FLAIR patients; none found"
     all_pids = sorted(pid2dir)
     train_pids, val_pids = H.split_patients(all_pids, seed=args.holdout_seed, val_frac=args.holdout_frac)
     bad = H.contamination_check(train_pids, val_pids)

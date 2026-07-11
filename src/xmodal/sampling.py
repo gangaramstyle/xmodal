@@ -567,8 +567,9 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         if scan_context:
             smap = np.zeros((n_series, SCAN_STATS_DIM), dtype=np.float32)     # series id -> its scan's stats
             for sid, sc in sid2.items():
-                if sc.stats is not None:
-                    smap[sid] = sc.stats
+                assert sc.stats is not None and np.isfinite(sc.stats).all() and sc.stats[12:28].sum() > 0, \
+                    f"scan_context: bad/missing stats for {getattr(sc, 'patient', '?')} series {sid}"
+                smap[sid] = sc.stats
             st_a[i] = torch.as_tensor(smap[sda], device=device)
             st_b[i] = torch.as_tensor(smap[sdb], device=device)
             st_h[i] = torch.as_tensor(smap[sdh], device=device)
@@ -600,13 +601,18 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
         return c, w
     ac, aw = _jit(win_center_std, win_width_log_std); bc, bw = _jit(win_center_std, win_width_log_std)
     ea = aw.exp()[:, None, None, None, None]; eb = bw.exp()[:, None, None, None, None]
-    A_src = (A_src - ac[:, None, None, None, None]) / ea                      # view a: source + held share a's window
-    A_held = (A_held - ac[:, None, None, None, None]) / ea
-    B_src = (B_src - bc[:, None, None, None, None]) / eb
+    # Window jitter is a STUDENT-side augmentation. Keep the CLEAN gathers as canonical references and
+    # produce augmented presentations separately (review): the raw source channel + the pixel-recon target
+    # are view-augmented; the EMA SEMANTIC target (held_semantic) and the z/CDF channels stay CLEAN.
+    A_src_aug = (A_src - ac[:, None, None, None, None]) / ea                  # view-A window on source-A raw
+    B_src_aug = (B_src - bc[:, None, None, None, None]) / eb                  # view-B window on source-B raw
+    A_held_pixel = (A_held - ac[:, None, None, None, None]) / ea             # pixel target: held in view-A domain
     spatial = (b_anch - a_anch > 0).float()                                  # [B,3] relative anchor order
     window = torch.stack([(bc > ac).float(), (bw > aw).float()], dim=1)      # [B,2] relative window sign
     rel = torch.cat([spatial, window], dim=1)                               # [B,5]
-    return dict(patches_a=A_src, patches_b=B_src, held_patches=A_held,
+    return dict(patches_a_raw=A_src_aug, patches_a_reference=A_src,          # student source: augmented raw + clean ref
+                patches_b_raw=B_src_aug, patches_b_reference=B_src,
+                held_semantic=A_held, held_pixel_target=A_held_pixel,        # clean EMA target vs view-A pixel target
                 coords_a=ca, coords_b=cb, held_coords=ch,
                 sizes_a=za, sizes_b=zb, held_sizes=zh,
                 source_series_a=ssa, source_series_b=ssb, target_series=tsr,

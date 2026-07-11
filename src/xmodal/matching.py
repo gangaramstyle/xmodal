@@ -60,10 +60,13 @@ def structured_match_loss(slots, colors, n_pos, logit_scale, *, w_pos=1.0, w_mod
     loss_mod = 0.5 * (_ce_last(Lm, tm) + _ce_last(Lm.transpose(-1, -2), tm))
     loss = w_pos * loss_pos + w_mod * loss_mod
     with torch.no_grad():
-        acc_pos = (Lp.argmax(-1) == tp).float().mean()
+        acc_pos = (Lp.argmax(-1) == tp).float().mean()                  # slot -> target (which position)
         acc_mod = (Lm.argmax(-1) == tm).float().mean()
+        acc_pos_t2s = (Lp.transpose(-1, -2).argmax(-1) == tp).float().mean()   # target -> slot
+        acc_mod_t2s = (Lm.transpose(-1, -2).argmax(-1) == tm).float().mean()
     return loss, {"loss_pos": float(loss_pos.detach()), "loss_mod": float(loss_mod.detach()),
                   "acc_pos": float(acc_pos), "acc_mod": float(acc_mod),
+                  "acc_pos_t2s": float(acc_pos_t2s), "acc_mod_t2s": float(acc_mod_t2s),
                   "chance_pos": 1.0 / P, "chance_mod": 1.0 / M}
 
 

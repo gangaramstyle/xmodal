@@ -16,8 +16,11 @@ export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd ~/xmodal
-git checkout -q mixed-v3 && git pull -q origin mixed-v3 || true
-echo "BRANCH $(git rev-parse --abbrev-ref HEAD) COMMIT $(git rev-parse --short HEAD)"
+git fetch -q origin mixed-v3                                   # PIN the exact launch commit (no silent stale code)
+SHA="${LAUNCH_SHA:-$(git rev-parse origin/mixed-v3)}"
+git checkout -q --detach "$SHA"
+test "$(git rev-parse HEAD)" = "$SHA" || { echo "FATAL: checkout SHA mismatch"; exit 1; }
+echo "PINNED COMMIT $SHA"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 NAME="mixed_v3_s${SEED:-0}"

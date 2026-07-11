@@ -70,7 +70,8 @@ def main():
         ccfg = ck.get("cfg", {}) or {}
         scan_ctx = bool(ccfg.get("scan_context", False))              # instantiate to MATCH the checkpoint
         E = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8, scan_context=scan_ctx)).to(dev)
-        E.load_state_dict(ck["model"], strict=False); E.eval()
+        sd = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v for k, v in ck["model"].items()}
+        E.load_state_dict(sd, strict=scan_ctx); E.eval()             # strict for native v3; tolerant for legacy
         gids = sorted(set(groups.tolist())); s = 8; cols = {m: [] for m in MODS}
         for k, g in enumerate(gids):
             idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
