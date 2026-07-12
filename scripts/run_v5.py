@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--match-weight", type=float, default=1.0, help="ordering loss weight (0 = MAE-only)")
     ap.add_argument("--mae-weight", type=float, default=0.25, help="pixel MAE weight (0 = ordering-only)")
     ap.add_argument("--tumor-frac", type=float, default=0.0, help="fraction of bags anchored on segmented tissue")
+    ap.add_argument("--sampler-workers", type=int, default=0, help="parallel CPU-geometry prefetch workers (0=sync)")
     ap.add_argument("--ckpt-dir", default="runs/v5")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-compile", action="store_true")
@@ -84,7 +85,8 @@ def main():
                         compile=not args.no_compile, content_blur=args.content_blur,
                         mae_weight=args.mae_weight, match_weight=args.match_weight,
                         v5_n_src=args.n_src, v5_n_anchor=args.n_anchor, v5_n_tgt=args.n_tgt, v5_voxels=args.voxels,
-                        v5_prisms=tuple(args.prisms), tumor_frac=args.tumor_frac, git_commit=git, git_branch=branch,
+                        v5_prisms=tuple(args.prisms), tumor_frac=args.tumor_frac, v5_sampler_workers=args.sampler_workers,
+                        git_commit=git, git_branch=branch,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | grid {enc.grid} pv {enc.pv} | bs {args.batch_size}", flush=True)
     T.train_v5(enc, cache, val_bundles, {}, cfg, device=dev)

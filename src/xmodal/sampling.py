@@ -579,15 +579,11 @@ def _gather_cubes(scan, centers, sizes, unit, device):
     return sample_patches(scan.volume, vox)                                        # [K,V,V,V]
 
 
-def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
-                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0):
-    """Per item: pick a target modality D; the source bag = `n_src` patches of the OTHER 3 modalities
-    (random position+modality) + `n_anchor` D anchors; the targets = `n_tgt` held D patches to ORDER.
-    Cube patches (voxels^3), prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common
-    foreground. Because every target is modality D, the ordering match is honest (no modality shortcut).
-    Returns patches_src/held [B,*,V,V,V], coords_src/tgt [B,*,3], series_src [B,nS], mod_tgt [B,P],
-    sizes_src/tgt [B,*,3]."""
-    import torch
+def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
+                 prism_patch=None, voxels=8, rng, tumor_frac=0.0):
+    """PURE-CPU geometry stage of v5 sampling (no GPU ops -> thread-safe & parallelizable for prefetch).
+    Builds per-item coords/sizes/series + a scan-sorted gather PLAN (numpy). Returns a dict consumed by
+    _v5_gather on the main thread. See sample_v5_batch for the task semantics."""
     prism_patch = prism_patch or {32.0: 4.0, 64.0: 8.0}
     P, V, nS = n_tgt, voxels, n_src + n_anchor
     req = {0, 1, 2, 3}
@@ -599,8 +595,6 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
         for sc in bnd.values():
             if id(sc) not in gid:
                 gid[id(sc)] = len(scan_list); scan_list.append(sc)
-    unit = _cube_unit(V, device)
-    Src = torch.empty(batch_size, nS, V, V, V, device=device); Tgt = torch.empty(batch_size, P, V, V, V, device=device)
     csrc_np = np.zeros((batch_size, nS, 3), np.float32); ctgt_np = np.zeros((batch_size, P, 3), np.float32)
     ser_np = np.zeros((batch_size, nS), np.int64); mod_np = np.zeros((batch_size, P), np.int64)
     zsrc_np = np.zeros((batch_size, nS, 3), np.float32); ztgt_np = np.zeros((batch_size, P, 3), np.float32)
@@ -682,27 +676,54 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
                 G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
                 G_sz.append(np.full(len(mm), ps, np.float32))
 
-    csrc = _h2d(csrc_np, device); ctgt = _h2d(ctgt_np, device)              # pinned + non_blocking single transfers
-    ser_src = _h2d(ser_np, device); mod_tgt = _h2d(mod_np, device)
-    zsrc = _h2d(zsrc_np, device); ztgt = _h2d(ztgt_np, device)
-    # sort the gather requests by scan so each scan's cubes are one contiguous segment (one grid_sample, no per-scan H2D)
+    # scan-sorted gather plan (all CPU numpy -> stays in the parallelizable stage)
     allkey = np.concatenate(G_key); order = np.argsort(allkey, kind="stable")
     allkey_s = allkey[order]
-    ctr_g = _h2d(np.concatenate(G_ctr)[order], device); sz_g = _h2d(np.concatenate(G_sz)[order], device)
-    alli_s = np.concatenate(G_i)[order]; allk_s = np.concatenate(G_k)[order]; allbuf_s = np.concatenate(G_buf)[order]
-    N = allkey_s.shape[0]
-    Patches = torch.empty(N, V, V, V, device=device)
     uniq, starts, counts = np.unique(allkey_s, return_index=True, return_counts=True)
-    for u, s, c in zip(uniq.tolist(), starts.tolist(), counts.tolist()):      # ONE grid_sample per resident scan
+    return dict(csrc_np=csrc_np, ctgt_np=ctgt_np, ser_np=ser_np, mod_np=mod_np, zsrc_np=zsrc_np, ztgt_np=ztgt_np,
+                ctr_s=np.concatenate(G_ctr)[order], sz_s=np.concatenate(G_sz)[order],
+                alli_s=np.concatenate(G_i)[order], allk_s=np.concatenate(G_k)[order],
+                allbuf_s=np.concatenate(G_buf)[order],
+                uniq=uniq, starts=starts, counts=counts, scan_list=scan_list,
+                batch_size=batch_size, nS=nS, P=P, V=V, tumor_hits=tumor_hits)
+
+
+def _v5_gather(geom, device):
+    """GPU stage of v5 sampling (main thread): H2D the geometry plan + gather cubes per resident scan."""
+    import torch
+    V, nS, P, B = geom["V"], geom["nS"], geom["P"], geom["batch_size"]
+    unit = _cube_unit(V, device)
+    Src = torch.empty(B, nS, V, V, V, device=device); Tgt = torch.empty(B, P, V, V, V, device=device)
+    ctr_g = _h2d(geom["ctr_s"], device); sz_g = _h2d(geom["sz_s"], device)
+    alli_s, allk_s, allbuf_s = geom["alli_s"], geom["allk_s"], geom["allbuf_s"]
+    scan_list = geom["scan_list"]
+    N = ctr_g.shape[0]
+    Patches = torch.empty(N, V, V, V, device=device)
+    for u, s, c in zip(geom["uniq"].tolist(), geom["starts"].tolist(), geom["counts"].tolist()):  # 1 grid_sample/scan
         Patches[s:s + c] = _gather_cubes(scan_list[u], ctr_g[s:s + c], sz_g[s:s + c], unit, device)  # contiguous, no sync
     for bb, buf in ((0, Src), (1, Tgt)):                                      # exactly two integer-index scatters (no sync)
         mb = np.nonzero(allbuf_s == bb)[0]
         if mb.size:
             buf[_h2d(alli_s[mb], device), _h2d(allk_s[mb], device)] = Patches[_h2d(mb.astype(np.int64), device)]
     return dict(patches_src=Src, held=Tgt,                             # [B,*,V,V,V] (grid is V^3; stem adds channel)
-                coords_src=csrc, coords_tgt=ctgt, sizes_src=zsrc, sizes_tgt=ztgt,
-                series_src=ser_src, mod_tgt=mod_tgt,
-                tumor_anchor_frac=tumor_hits / batch_size)
+                coords_src=_h2d(geom["csrc_np"], device), coords_tgt=_h2d(geom["ctgt_np"], device),
+                sizes_src=_h2d(geom["zsrc_np"], device), sizes_tgt=_h2d(geom["ztgt_np"], device),
+                series_src=_h2d(geom["ser_np"], device), mod_tgt=_h2d(geom["mod_np"], device),
+                tumor_anchor_frac=geom["tumor_hits"] / B)
+
+
+def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
+                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0):
+    """Per item: pick a target modality D; the source bag = `n_src` patches of the OTHER 3 modalities
+    (random position+modality) + `n_anchor` D anchors; the targets = `n_tgt` held D patches to ORDER.
+    Cube patches (voxels^3), prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common
+    foreground. Because every target is modality D, the ordering match is honest (no modality shortcut).
+    Returns patches_src/held [B,*,V,V,V], coords_src/tgt [B,*,3], series_src [B,nS], mod_tgt [B,P],
+    sizes_src/tgt [B,*,3]. (CPU geometry + GPU gather; see _v5_geometry/_v5_gather for the prefetch split.)"""
+    geom = _v5_geometry(bundles, batch_size=batch_size, n_src=n_src, n_anchor=n_anchor, n_tgt=n_tgt,
+                        prism_choices=prism_choices, prism_patch=prism_patch, voxels=voxels, rng=rng,
+                        tumor_frac=tumor_frac)
+    return _v5_gather(geom, device)
 
 
 def apply_window_jitter(patches, *, center_std, width_log_std):

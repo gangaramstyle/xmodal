@@ -94,6 +94,7 @@ class TrainConfig:
     v5_voxels: int = 8                # cube sample grid (voxels^3)
     v5_prisms: tuple = (32.0, 64.0)   # cube prism sizes (mm); 32->4mm patch, 64->8mm patch
     tumor_frac: float = 0.0           # v5: fraction of bags anchored on segmented tissue (pathology-focus)
+    v5_sampler_workers: int = 0       # v5: parallel CPU-geometry prefetch workers (0 = synchronous sampling)
     git_commit: str = ""
     git_branch: str = ""
 
@@ -525,6 +526,38 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
                                  n_tgt=cfg.v5_n_tgt, prism_choices=cfg.v5_prisms, voxels=cfg.v5_voxels,
                                  rng=rng, device=device, tumor_frac=cfg.tumor_frac)
 
+    # parallel prefetch: worker threads run the pure-CPU _v5_geometry stage; the main thread does the GPU
+    # gather + step. Hides the ~1s CPU geometry behind the GPU work -> keeps the A40 fed.
+    import threading, queue as _queue
+    _pf = cfg.v5_sampler_workers if _is_cache else 0
+    _geom_q = _pf_stop = _pf_threads = None
+    if _pf > 0:
+        _geom_q = _queue.Queue(maxsize=_pf + 1); _pf_stop = threading.Event()
+
+        def _producer(wid):
+            wrng = np.random.default_rng(cfg.seed + 1009 + wid)            # own rng per worker (numpy Gen not thread-safe)
+            while not _pf_stop.is_set():
+                try:
+                    g = S._v5_geometry(train_bundles.resident(), batch_size=cfg.batch_size, n_src=cfg.v5_n_src,
+                                       n_anchor=cfg.v5_n_anchor, n_tgt=cfg.v5_n_tgt, prism_choices=cfg.v5_prisms,
+                                       voxels=cfg.v5_voxels, rng=wrng, tumor_frac=cfg.tumor_frac)
+                except Exception as e:
+                    log(f"[prefetch w{wid}] {type(e).__name__}: {e}"); continue
+                while not _pf_stop.is_set():
+                    try:
+                        _geom_q.put(g, timeout=0.5); break
+                    except _queue.Full:
+                        pass
+        _pf_threads = [threading.Thread(target=_producer, args=(w,), daemon=True) for w in range(_pf)]
+        for t in _pf_threads:
+            t.start()
+        log(f"[prefetch] {_pf} CPU-geometry workers")
+
+    def draw_train():
+        if _pf > 0:
+            return S._v5_gather(_geom_q.get(), device)                     # GPU gather on main thread (ordered on stream)
+        return draw(train_bundles.resident() if _is_cache else train_bundles)
+
     def fwd(b):
         return model.forward_v5(b, content_blur=cfg.content_blur, mae_weight=cfg.mae_weight, match_weight=cfg.match_weight)
 
@@ -554,7 +587,7 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         for g in opt.param_groups:
             g["lr"] = lr
         _sync(); _ta = time.time()
-        b = draw(train_bundles.resident() if _is_cache else train_bundles)
+        b = draw_train()
         _sync(); _tb = time.time()                                       # t_sample = draw incl. its async GPU gather
         with torch.autocast(**amp):
             out = fwd(b); total = out["loss"]
@@ -588,6 +621,13 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
                     art.add_file(ckpt_path); wb.log_artifact(art)
                 except Exception as e:
                     log(f"[wandb] artifact log skipped: {e}")
+    if _pf_stop is not None:
+        _pf_stop.set()
+        try:
+            while True:
+                _geom_q.get_nowait()                                       # unblock producers stuck on put()
+        except _queue.Empty:
+            pass
     if wb:
         wb.finish()
     log(f"v5 run done: {cfg.steps} steps in {time.time()-t0:.0f}s")
