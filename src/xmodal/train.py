@@ -543,7 +543,9 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         model.train()
         return float(np.mean(mae)), float(np.mean(acc)), float(ctrl)
 
-    torch.cuda.synchronize() if device == "cuda" else None
+    _sync = (torch.cuda.synchronize if device == "cuda" else (lambda: None))
+    _t_samp = _t_step = 0.0; _t_n = 0                                    # perf accumulators (sampler vs GPU step)
+    _sync()
     t0 = time.time(); vm, va, vc = validate()
     log(f"{'step':>6} {'total':>8} {'mae':>7} {'macc':>7} {'val_macc':>8} {'shufctl':>7} {'chance':>7} {'lr':>8}")
     log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {va:>8.3f} {vc:>7.3f} {chance:>7.3f} {'-':>8}")
@@ -551,16 +553,25 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
+        _sync(); _ta = time.time()
         b = draw(train_bundles.resident() if _is_cache else train_bundles)
+        _sync(); _tb = time.time()                                       # t_sample = draw incl. its async GPU gather
         with torch.autocast(**amp):
             out = fwd(b); total = out["loss"]
         opt.zero_grad(set_to_none=True); total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip); opt.step()
         if _is_cache:
             train_bundles.step()
+        _sync(); _tc = time.time()                                       # t_step = fwd + bwd + opt.step
+        _t_samp += _tb - _ta; _t_step += _tc - _tb; _t_n += 1
         if wb and step % cfg.log_every == 0:
+            _ms = 1000.0 / max(_t_n, 1)
             wb.log({"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
-                    "train/match_acc": out["match_acc"], "train/tumor_frac": b.get("tumor_anchor_frac", 0.0), "lr": lr}, step=step)
+                    "train/match_acc": out["match_acc"], "train/tumor_frac": b.get("tumor_anchor_frac", 0.0), "lr": lr,
+                    "perf/t_sample_ms": _t_samp * _ms, "perf/t_step_ms": _t_step * _ms,
+                    "perf/steps_per_s": _t_n / max(_t_samp + _t_step, 1e-9),
+                    "perf/sampler_frac": _t_samp / max(_t_samp + _t_step, 1e-9)}, step=step)
+            _t_samp = _t_step = 0.0; _t_n = 0
         if step % cfg.val_every == 0:
             vm, va, vc = validate()
             if wb:
