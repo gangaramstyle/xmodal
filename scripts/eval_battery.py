@@ -32,6 +32,9 @@ def main():
                     help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy 2.5D slabs.")
     ap.add_argument("--sampling", choices=["random", "grid"], default="random",
                     help="random = train-like sparse foreground centers; grid = dense full-coverage lattice.")
+    ap.add_argument("--probe", choices=["linear", "mlp"], default="linear",
+                    help="readout head: linear logreg (~0.75-comparable) or 1-hidden-layer MLP.")
+    ap.add_argument("--probe-hidden", type=int, default=256, help="MLP hidden width (--probe mlp).")
     a = ap.parse_args()
     dev = a.device
     if a.build or not os.path.exists(a.cache):
@@ -42,9 +45,10 @@ def main():
     mixed = a.mixed or bool(cube)                                    # v5 (cube) always uses series conditioning
     CLASSES = [0, 2, 3]                                              # non-tumor, edema, ET (necrosis dropped)
 
-    def torch_probe(X, Y, G, steps=300):
-        """GPU class-balanced multinomial logistic regression, GroupKFold-5. Replaces sklearn (no dep,
-        faster). Returns per-class F1 [non-tumor, edema, ET]. enh=ET, macro=mean."""
+    def torch_probe(X, Y, G, steps=300, probe="linear", hidden=256):
+        """GPU class-balanced GroupKFold-5 readout (no sklearn). probe='linear' = multinomial logreg
+        (baseline, ~0.75-comparable); probe='mlp' = 1-hidden-layer MLP head. Returns per-class F1
+        [non-tumor, edema, ET]. enh=ET, macro=mean."""
         cmap = {c: i for i, c in enumerate(CLASSES)}
         Xt = torch.tensor(X, device=dev, dtype=torch.float32)
         Yt = torch.tensor([cmap[int(y)] for y in Y], device=dev)
@@ -57,7 +61,11 @@ def main():
             mu = Xtr.mean(0, keepdim=True); sd = Xtr.std(0, keepdim=True) + 1e-6
             cnt = torch.bincount(Ytr, minlength=len(CLASSES)).float()
             w = (len(Ytr) / (len(CLASSES) * cnt.clamp(min=1))).to(dev)
-            clf = torch.nn.Linear(Xt.shape[1], len(CLASSES)).to(dev)
+            if probe == "mlp":
+                clf = torch.nn.Sequential(torch.nn.Linear(Xt.shape[1], hidden), torch.nn.ReLU(),
+                                          torch.nn.Linear(hidden, len(CLASSES))).to(dev)
+            else:
+                clf = torch.nn.Linear(Xt.shape[1], len(CLASSES)).to(dev)
             opt = torch.optim.Adam(clf.parameters(), lr=1e-2, weight_decay=1e-4)
             for _ in range(steps):
                 opt.zero_grad()
@@ -93,7 +101,7 @@ def main():
                 cols[m].append(lat[0].float().cpu().numpy())
         Fm = {m: np.concatenate(cols[m]) for m in MODS}
         keep = labels != 1; Y = labels[keep]; G = groups[keep]; X = np.concatenate([Fm[m] for m in MODS], -1)[keep]
-        f1 = torch_probe(X, Y, G)
+        f1 = torch_probe(X, Y, G, probe=a.probe, hidden=a.probe_hidden)
         return step, float(f1[2]), float(sum(f1) / len(f1))
 
     for spec in a.checkpoints:
