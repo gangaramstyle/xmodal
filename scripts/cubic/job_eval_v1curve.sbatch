@@ -27,12 +27,15 @@ print("extracted ->", os.listdir("/tmp/ho"))
 PY
 
 # enumerate every checkpoint as name=exact-path (eval_battery globs an exact path to itself)
-RUN=runs/mixed_noema_s0
+RUN="${RUN:-runs/mixed_noema_s0}"
 CKPTS=""
 for f in $(ls -v $RUN/step_*.pt); do s=$(basename "$f" .pt | sed 's/step_0*/s/'); CKPTS="$CKPTS ${s}=$f"; done
-echo "evaling $(echo $CKPTS | wc -w) checkpoints"
+echo "RUN=$RUN evaling $(echo $CKPTS | wc -w) checkpoints"
 
+# shared held-out cache (patch content is checkpoint-independent) -> build once, reuse across runs
+CACHE=/tmp/patchcache_curve.npz
+BUILD=""; [ -f "$CACHE" ] || BUILD="--build"
 .venv/bin/python -u scripts/eval_battery.py \
-    --cache /tmp/patchcache_v1curve.npz --data-root /tmp/ho --tracks mets_ho --build --device cuda --mixed \
+    --cache "$CACHE" --data-root /tmp/ho --tracks mets_ho $BUILD --device cuda --mixed \
     --checkpoints $CKPTS
-echo "=== v1curve done ==="
+echo "=== curve done ($RUN) ==="
