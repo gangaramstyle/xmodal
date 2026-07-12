@@ -16,11 +16,16 @@ export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd ~/xmodal
-git fetch -q origin v5
-SHA="${LAUNCH_SHA:-$(git rev-parse origin/v5)}"
-git checkout -q --detach "$SHA"
-test "$(git rev-parse HEAD)" = "$SHA" || { echo "FATAL: SHA mismatch"; exit 1; }
-echo "PINNED $SHA"
+# serialize the checkout across concurrently-starting jobs (shared working tree -> .git/index.lock race)
+(
+  flock -w 300 9 || { echo "FATAL: git lock timeout"; exit 1; }
+  git fetch -q origin v5
+  SHA="${LAUNCH_SHA:-$(git rev-parse origin/v5)}"
+  git checkout -q --detach "$SHA"
+  test "$(git rev-parse HEAD)" = "$SHA" || { echo "FATAL: SHA mismatch"; exit 1; }
+  echo "PINNED $SHA"
+) 9>/tmp/xmodal_git_checkout.lock
+SHA="${LAUNCH_SHA:-$(git rev-parse HEAD)}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 NAME="v5_${TAG:-both}_s${SEED:-0}"
