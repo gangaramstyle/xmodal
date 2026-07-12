@@ -87,6 +87,15 @@ class TrainConfig:
     held_excl_frac: float = 1.0       # target<->source exclusion: no held target overlaps a SAME-series
                                       # source footprint (frac*(s_h+s_s)/2). 0 = off (allows local copy)
     hardneg_frac: float = 0.0         # frac of held slots made same-position/different-series HARD-NEG pairs
+    # v5 cross-modal ordering (docs/MIXED_V5_DESIGN.md): cube patches, context ABC + few D -> order held D
+    v5_n_src: int = 90                # source context patches (3 modalities, random)
+    v5_n_anchor: int = 6              # target-modality (D) anchors visible in the source bag
+    v5_n_tgt: int = 32                # held modality-D patches to order
+    v5_voxels: int = 8                # cube sample grid (voxels^3)
+    v5_prisms: tuple = (32.0, 64.0)   # cube prism sizes (mm); 32->4mm patch, 64->8mm patch
+    tumor_frac: float = 0.0           # v5: fraction of bags anchored on segmented tissue (pathology-focus)
+    git_commit: str = ""
+    git_branch: str = ""
 
 
 def _cosine_warmup(step, total, base_lr, warmup):
@@ -483,3 +492,91 @@ def train_mixed(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, d
     if wb:
         wb.finish()
     log(f"mixed run done: {cfg.steps} steps in {time.time()-t0:.0f}s")
+
+
+def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, device="cuda", log=print):
+    """v5 cross-modal ordering trainer (docs/MIXED_V5_DESIGN.md). Loss = ordering (match) + pixel MAE,
+    toggled by cfg.match_weight/mae_weight for the ablation. Val logs match_acc (chance 1/n_tgt) and a
+    coord-shuffle control (order should fall to chance if positions are permuted)."""
+    import os
+    torch.manual_seed(cfg.seed)
+    _is_cache = hasattr(train_bundles, "resident")
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+                            fused=(device == "cuda"))
+    if cfg.compile:
+        try:
+            model.encode = torch.compile(model.encode, dynamic=True)
+        except Exception as e:
+            log(f"[compile] skipped: {e}")
+    rng = np.random.default_rng(cfg.seed)
+    warmup = int(cfg.warmup_frac * cfg.steps)
+    amp = dict(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.amp_bf16 and device == "cuda")
+    chance = 1.0 / cfg.v5_n_tgt
+    wb = None
+    if cfg.wandb:
+        try:
+            import wandb as wb
+            wb.init(project=cfg.wandb, name=cfg.wandb_run, config=cfg.__dict__)
+        except Exception as e:
+            log(f"[wandb] disabled: {e}"); wb = None
+
+    def draw(bundles):
+        return S.sample_v5_batch(bundles, batch_size=cfg.batch_size, n_src=cfg.v5_n_src, n_anchor=cfg.v5_n_anchor,
+                                 n_tgt=cfg.v5_n_tgt, prism_choices=cfg.v5_prisms, voxels=cfg.v5_voxels,
+                                 rng=rng, device=device, tumor_frac=cfg.tumor_frac)
+
+    def fwd(b):
+        return model.forward_v5(b, content_blur=cfg.content_blur, mae_weight=cfg.mae_weight, match_weight=cfg.match_weight)
+
+    @torch.no_grad()
+    def validate():
+        model.eval(); mae = []; acc = []
+        for _ in range(cfg.val_iters):
+            b = draw(val_bundles)
+            with torch.autocast(**amp):
+                o = fwd(b)
+            mae.append(float(o["mae"])); acc.append(o["match_acc"])
+        b = draw(val_bundles)                                              # coord-shuffle control
+        with torch.autocast(**amp):
+            bshuf = {**b, "coords_tgt": b["coords_tgt"][:, torch.randperm(cfg.v5_n_tgt, device=device)]}
+            ctrl = fwd(bshuf)["match_acc"]
+        model.train()
+        return float(np.mean(mae)), float(np.mean(acc)), float(ctrl)
+
+    torch.cuda.synchronize() if device == "cuda" else None
+    t0 = time.time(); vm, va, vc = validate()
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'macc':>7} {'val_macc':>8} {'shufctl':>7} {'chance':>7} {'lr':>8}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {va:>8.3f} {vc:>7.3f} {chance:>7.3f} {'-':>8}")
+    for step in range(1, cfg.steps + 1):
+        lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
+        for g in opt.param_groups:
+            g["lr"] = lr
+        b = draw(train_bundles.resident() if _is_cache else train_bundles)
+        with torch.autocast(**amp):
+            out = fwd(b); total = out["loss"]
+        opt.zero_grad(set_to_none=True); total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip); opt.step()
+        if _is_cache:
+            train_bundles.step()
+        if wb and step % cfg.log_every == 0:
+            wb.log({"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
+                    "train/match_acc": out["match_acc"], "train/tumor_frac": b.get("tumor_anchor_frac", 0.0), "lr": lr}, step=step)
+        if step % cfg.val_every == 0:
+            vm, va, vc = validate()
+            if wb:
+                wb.log({"val/mae": vm, "val/match_acc": va, "val/shuf_ctrl": vc}, step=step)
+            log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {out['match_acc']:>7.3f} "
+                f"{va:>8.3f} {vc:>7.3f} {chance:>7.3f} {lr:>8.2e}")
+        if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
+            os.makedirs(cfg.ckpt_dir, exist_ok=True)
+            ckpt_path = f"{cfg.ckpt_dir}/step_{step:06d}.pt"
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": cfg.__dict__}, ckpt_path)
+            if wb and cfg.artifact_every and step % cfg.artifact_every == 0:
+                try:
+                    art = wb.Artifact(f"ckpt-{cfg.wandb_run or 'run'}", type="model", metadata={"step": step})
+                    art.add_file(ckpt_path); wb.log_artifact(art)
+                except Exception as e:
+                    log(f"[wandb] artifact log skipped: {e}")
+    if wb:
+        wb.finish()
+    log(f"v5 run done: {cfg.steps} steps in {time.time()-t0:.0f}s")

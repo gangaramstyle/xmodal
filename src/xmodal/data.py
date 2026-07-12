@@ -82,7 +82,8 @@ def place_bundle(cpu_bundle, device):
             affine_trans=torch.as_tensor(p["affine_trans"], device=device),
             foreground_mm=torch.as_tensor(p["foreground_mm"], device=device),
             thick_axis=p["thick"], plane_id=p["plane"], modality=m, series_idx=p["series"],
-            patient=p["patient"], spacing=p["spacing"])
+            patient=p["patient"], spacing=p["spacing"],
+            tumor_mm=(torch.as_tensor(p["tumor_mm"], device=device) if p.get("tumor_mm") is not None else None))
     return b
 
 
@@ -170,7 +171,15 @@ def load_local_cpu(pid, patient_dir, *, labels_dir=None, suffixes=None, with_seg
     if with_seg:
         segp = _find_seg(pid, patient_dir, labels_dir)
         if segp:
-            seg = np.nan_to_num(nib.load(segp).get_fdata(), copy=False).astype(np.int16)
+            simg = nib.load(segp); seg = np.nan_to_num(simg.get_fdata(), copy=False).astype(np.int16)
+            tv = np.argwhere(seg > 0).astype(np.float32)                # tumor voxels -> world-mm cloud (v5 tumor-focus)
+            if len(tv):
+                aff = np.asarray(simg.affine, np.float32); R, t = aff[:3, :3], aff[:3, 3]
+                tmm = (tv @ R.T + t).astype(np.float32)
+                if len(tmm) > 50_000:
+                    tmm = tmm[np.random.default_rng(0).choice(len(tmm), 50_000, replace=False)]
+                for pp in bundle.values():
+                    pp["tumor_mm"] = tmm
     return bundle, seg
 
 

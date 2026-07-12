@@ -36,6 +36,7 @@ class EncoderConfig:
     n_registers: int = 4
     decoder_depth: int = 4
     patch_voxels: int = 16            # 2.5D slab sample grid (V,V,1); physical size is per-patch (size embed)
+    patch_grid: tuple | None = None   # v5: explicit sample grid, e.g. (8,8,8) for 3D CUBE patches; None -> (V,V,1) slab
     rope_lambda_min_mm: float = 2.0
     rope_lambda_max_mm: float = 1024.0
 
@@ -139,8 +140,8 @@ class Phase0Encoder(nn.Module):
         # one Conv3d stem + one pixel head + one color head handle all sizes. Physical scale rides
         # along as a per-patch SIZE EMBEDDING (MLP of size in mm), added to the token + decoder query.
         V = cfg.patch_voxels
-        self.grid = (V, V, 1)
-        self.pv = V * V
+        self.grid = tuple(cfg.patch_grid) if cfg.patch_grid else (V, V, 1)   # v5: (8,8,8) cube or (V,V,1) slab
+        self.pv = int(np.prod(self.grid))
         self.stem = nn.Conv3d(1, cfg.width, self.grid, stride=self.grid)
         # per-axis physical extent (mm) [.,.,3] -> W. For a 2.5D slab two axes = the size, the thin
         # (through-plane) axis ~= 0, so this encodes BOTH scale AND orientation (which plane the slab is).
@@ -348,6 +349,31 @@ class Phase0Encoder(nn.Module):
         return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=m_met["match_acc"],
                     rel_spatial=spatial.detach(), rel_window=window.detach(), rel_acc=rel_acc,
                     recon=recon.detach(), held_patches=hp.detach(), slots=slots.detach(), colors=colors)
+
+    # ---- v5 cross-modal ordering (docs/MIXED_V5_DESIGN.md) ----------------------------
+    def forward_v5(self, batch, *, content_blur=0, mae_weight=0.25, match_weight=1.0):
+        """Encode the source bag (3 context modalities + a few D anchors), decode the held modality-D
+        queries (position + requested modality D), ORDER them via matching + optional pixel MAE. All
+        targets are modality D, so the ordering match has no modality shortcut (honest). Toggle
+        match_weight/mae_weight for the ablation (ordering-only / MAE-only / both)."""
+        dev = batch["patches_src"].device
+        nreg = 2 + self.registers.shape[0]
+        ps, cs, zs, sers = batch["patches_src"], batch["coords_src"], batch["sizes_src"], batch["series_src"]
+        B, n = ps.shape[:2]
+        x = self.encode(*self._context([self.embed(ps, zs, sers)], [cs], dev, B))
+        ctx, cc = self._context([x[:, nreg:]], [cs], dev, B)
+        hp, ct, zt, modt = batch["held"], batch["coords_tgt"], batch["sizes_tgt"], batch["mod_tgt"]
+        m = hp.shape[1]
+        query = (self.query_seed[None, None, :] + self._size_emb(zt) + self.series_q_embed(modt)).contiguous()
+        query = self._decode(query, ctx, cc, ct)
+        recon = self.dec_pixel_head(query)
+        mae = F.l1_loss(recon, hp.reshape(B, m, self.pv))
+        slots = F.normalize(self.match_slot_proj(query), dim=-1)
+        colors = F.normalize(self.color_head(blur_contents(hp, content_blur)), dim=-1)
+        m_loss, met = slot_match_loss(slots, colors, self.match_logit_scale)
+        total = mae_weight * mae + match_weight * m_loss
+        return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=met["match_acc"],
+                    chance=met["match_chance"], slots=slots.detach(), colors=colors.detach(), mod_tgt=modt)
 
     # ---- cross-modal ---------------------------------------------------------------
     def _gather(self, x, idx, d):

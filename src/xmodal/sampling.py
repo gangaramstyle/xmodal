@@ -159,6 +159,7 @@ class CachedScan:
     series_idx: int = 0
     patient: str = ""
     spacing: tuple = (1.0, 1.0, 1.0)
+    tumor_mm: object = None   # torch [T,3] world-mm cloud of segmented tumor voxels (v5 tumor-focus); None if no seg
 
 
 def _thick_and_plane(affine_R: np.ndarray, thick_axis):
@@ -512,6 +513,141 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
                 sizes_a=za, sizes_b=zb, held_sizes=zh,
                 source_series_a=ssa, source_series_b=ssb, target_series=tsr,
                 rel_targets=rel)
+
+
+# ---------------------------------------------------------------------------
+# v5 cross-modal ordering (docs/MIXED_V5_DESIGN.md): 3D CUBE patches; context = 3 modalities (+ a few
+# anchors of the target modality D); recreate the ordering of held modality-D patches.
+# ---------------------------------------------------------------------------
+
+def _v5_common_fg(sid2, cap=50000):
+    import torch
+    clouds = [sc.foreground_mm for sc in sid2.values()]
+    fg = torch.cat(clouds, 0) if len(clouds) > 1 else clouds[0]
+    if fg.shape[0] > cap:
+        fg = fg[torch.randint(fg.shape[0], (cap,), device=fg.device)]
+    return fg
+
+
+def _v5_local(fg, anchor, half):
+    return fg[(fg - anchor[None]).abs().amax(-1) <= half]
+
+
+def _v5_pick(points, k, min_sep, rng):
+    """Greedy min-separation pick of k target positions (distinct D targets for a clean ordering task)."""
+    import torch
+    K = points.shape[0]
+    if K <= k:
+        return torch.arange(K, device=points.device)
+    perm = rng.permutation(K); ms2 = float(min_sep) ** 2; sel = [int(perm[0])]
+    for idx in perm[1:]:
+        if len(sel) >= k:
+            break
+        if min_sep <= 0 or bool(((points[torch.as_tensor(sel, device=points.device)] - points[int(idx)]).pow(2).sum(-1) >= ms2).all()):
+            sel.append(int(idx))
+    if len(sel) < k:
+        sel += [int(x) for x in perm if int(x) not in set(sel)][: k - len(sel)]
+    return torch.as_tensor(sel[:k], device=points.device)
+
+
+def _cube_unit(V, device):
+    return patch_offsets_tensor(cube_spec(1.0, V), thick_axis=0, device=device)   # [V,V,V,3] unit cube
+
+
+def _gather_cubes(scan, centers, sizes, unit, device):
+    """centers [K,3] world-mm, sizes [K] (mm) -> cube patches [K,V,V,V] from ONE scan (one grid_sample)."""
+    off = unit[None] * sizes[:, None, None, None, None]                            # [K,V,V,V,3]
+    phys = off + centers[:, None, None, None, :]
+    vox = (phys - scan.affine_trans) @ scan.affine_inv.T
+    return sample_patches(scan.volume, vox)                                        # [K,V,V,V]
+
+
+def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
+                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0):
+    """Per item: pick a target modality D; the source bag = `n_src` patches of the OTHER 3 modalities
+    (random position+modality) + `n_anchor` D anchors; the targets = `n_tgt` held D patches to ORDER.
+    Cube patches (voxels^3), prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common
+    foreground. Because every target is modality D, the ordering match is honest (no modality shortcut).
+    Returns patches_src/held [B,*,V,V,V], coords_src/tgt [B,*,3], series_src [B,nS], mod_tgt [B,P],
+    sizes_src/tgt [B,*,3]."""
+    import torch
+    prism_patch = prism_patch or {32.0: 4.0, 64.0: 8.0}
+    P, V, nS = n_tgt, voxels, n_src + n_anchor
+    req = {0, 1, 2, 3}
+    elig = [b for b in bundles if req.issubset({sc.series_idx for sc in b.values()})]
+    if not elig:
+        raise RuntimeError(f"v5 needs complete T1/T1c/T2/FLAIR bundles; none of {len(bundles)} qualify")
+    scan_list, gid = [], {}
+    for bnd in elig:
+        for sc in bnd.values():
+            if id(sc) not in gid:
+                gid[id(sc)] = len(scan_list); scan_list.append(sc)
+    unit = _cube_unit(V, device)
+    Src = torch.empty(batch_size, nS, V, V, V, device=device); Tgt = torch.empty(batch_size, P, V, V, V, device=device)
+    csrc = torch.empty(batch_size, nS, 3, device=device); ctgt = torch.empty(batch_size, P, 3, device=device)
+    ser_src = torch.zeros(batch_size, nS, dtype=torch.long, device=device)
+    mod_tgt = torch.zeros(batch_size, P, dtype=torch.long, device=device)
+    zsrc = torch.empty(batch_size, nS, 3, device=device); ztgt = torch.empty(batch_size, P, 3, device=device)
+    common_cache = {}; tumor_hits = 0
+    G_ctr, G_key, G_buf, G_i, G_k, G_sz = [], [], [], [], [], []
+    for i in range(batch_size):
+        bnd = elig[int(rng.integers(len(elig)))]
+        sid2 = {sc.series_idx: sc for sc in bnd.values()}
+        rep = sid2[sorted(sid2)[0]]; fg = rep.foreground_mm
+        bid = id(bnd)
+        if bid not in common_cache:
+            common_cache[bid] = _v5_common_fg(sid2)
+        cfg = common_cache[bid]
+        prism = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]); half = prism / 2.0
+        ps = float(prism_patch[prism])
+        tmm = rep.tumor_mm                                              # tumor-focus: place prism so tumor is inside it
+        use_tumor = tumor_frac > 0 and tmm is not None and rng.random() < tumor_frac
+        for _t in range(8):
+            if use_tumor:                                              # anchor = tumor voxel + offset so it lands in the prism
+                tv = tmm[int(rng.integers(tmm.shape[0]))]
+                a_a = tv + torch.as_tensor((rng.random(3) * 2 - 1) * half, device=device, dtype=tv.dtype)
+            else:
+                a_a = fg[int(rng.integers(fg.shape[0]))]
+            local = _v5_local(cfg, a_a, half)
+            if local.shape[0] >= n_tgt:
+                break
+        tumor_hits += int(use_tumor)
+        K = local.shape[0]
+        D = int(rng.integers(4)); ctx = np.array([m for m in range(4) if m != D], dtype=np.int64)
+        src_pos = local[torch.as_tensor(rng.choice(K, size=n_src, replace=(K < n_src)), device=device)]
+        src_mod = ctx[rng.integers(3, size=n_src)]                                  # random A/B/C per source patch
+        anc_pos = local[torch.as_tensor(rng.choice(K, size=n_anchor, replace=(K < n_anchor)), device=device)]
+        tgt_pos = local[_v5_pick(local, n_tgt, ps, rng)]
+        src_all = torch.cat([src_pos, anc_pos], 0)                                  # [nS,3] world
+        mods = np.concatenate([src_mod, np.full(n_anchor, D, np.int64)])
+        csrc[i] = src_all - a_a[None]; ser_src[i] = torch.as_tensor(mods, device=device)
+        ctgt[i] = tgt_pos - a_a[None]; mod_tgt[i] = D
+        zsrc[i] = ps; ztgt[i] = ps                                                  # cube: per-axis extent = ps
+        bmap = np.zeros(8, np.int64)
+        for sid, sc in sid2.items():
+            bmap[sid] = gid[id(sc)]
+        for ctr, mm, buf in ((src_all, mods, 0), (tgt_pos, np.full(n_tgt, D, np.int64), 1)):
+            G_ctr.append(ctr); G_key.append(bmap[mm]); G_buf.append(np.full(len(mm), buf, np.int64))
+            G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
+            G_sz.append(np.full(len(mm), ps, np.float32))
+
+    allctr = torch.cat(G_ctr); allkey = np.concatenate(G_key); allbuf = np.concatenate(G_buf)
+    alli = np.concatenate(G_i); allk = np.concatenate(G_k)
+    allsz = torch.as_tensor(np.concatenate(G_sz), device=device)
+    bufs = {0: Src, 1: Tgt}
+    for u in np.unique(allkey):
+        sel = np.nonzero(allkey == u)[0]; scan = scan_list[int(u)]; sel_t = torch.as_tensor(sel, device=device)
+        patches = _gather_cubes(scan, allctr[sel_t], allsz[sel_t], unit, device)
+        bsel, isel, ksel = allbuf[sel], alli[sel], allk[sel]
+        for bb, buf in bufs.items():
+            mb = np.nonzero(bsel == bb)[0]
+            if mb.size:
+                buf[torch.as_tensor(isel[mb], device=device), torch.as_tensor(ksel[mb], device=device)] = \
+                    patches[torch.as_tensor(mb, device=device)]
+    return dict(patches_src=Src, held=Tgt,                             # [B,*,V,V,V] (grid is V^3; stem adds channel)
+                coords_src=csrc, coords_tgt=ctgt, sizes_src=zsrc, sizes_tgt=ztgt,
+                series_src=ser_src, mod_tgt=mod_tgt,
+                tumor_anchor_frac=tumor_hits / batch_size)
 
 
 def apply_window_jitter(patches, *, center_std, width_log_std):
