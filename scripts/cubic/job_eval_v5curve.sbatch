@@ -43,8 +43,10 @@ echo "evaluating ${#CK[@]} checkpoints across arms: $ARMS"
 [ ${#CK[@]} -eq 0 ] && { echo "FATAL: no checkpoints found under runs/{$ARMS}"; exit 1; }
 
 # --cube 8 builds the cube cache once (first ckpt), then reuses it; --mixed auto-on for cube.
+# SAMPLING=random (train-like sparse) or grid (dense full coverage) -> the train->eval domain-gap test.
+SAMPLING="${SAMPLING:-random}"
 .venv/bin/python -u scripts/eval_battery.py \
-    --data-root /tmp/ho --tracks mets_ho --build --cube 8 --device cuda \
-    --cache /tmp/patchcache_v5cube.npz \
+    --data-root /tmp/ho --tracks mets_ho --build --cube 8 --sampling "$SAMPLING" --device cuda \
+    --cache "/tmp/patchcache_v5cube_${SAMPLING}.npz" \
     --checkpoints "${CK[@]}"
-echo "=== eval_v5curve done ==="
+echo "=== eval_v5curve done (sampling=$SAMPLING) ==="

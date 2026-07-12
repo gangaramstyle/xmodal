@@ -95,8 +95,11 @@ class _TorchLogReg:
         return self.classes_[(Xt @ self.W.T + self.b).argmax(1).cpu().numpy()]
 
 
-def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", cube=0):
-    """cube=0 -> legacy 2.5D slabs (16-vox, {4,8,16}mm). cube=V -> 3D cubes (V^3) at v5 sizes ({4,8}mm),
+def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", cube=0,
+                sampling="random", grid_step=8.0, grid_cap=6000):
+    """sampling='random' -> K patch centers at random foreground locations (matches how training samples,
+    sparse). sampling='grid' -> one center per occupied grid_step-mm cell (dense, full anatomy coverage) to
+    test the train->eval domain gap. cube=0 -> legacy 2.5D slabs (16-vox, {4,8,16}mm). cube=V -> 3D cubes (V^3) at v5 sizes ({4,8}mm),
     matching how the v5 encoders were trained. Labels use the same 4mm footprint (cube or slab)."""
     torch.manual_seed(seed)
     sizes = [4, 8] if cube else SIZES
@@ -116,7 +119,13 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", c
         except Exception:
             continue
         sc0 = b["t1c"]
-        c = sc0.foreground_mm[torch.randint(sc0.foreground_mm.shape[0], (K,), device=device)]; cm = c.mean(0)
+        if sampling == "grid":                                                   # dense grid over anatomy (full coverage)
+            c = torch.unique(torch.round(sc0.foreground_mm / grid_step), dim=0) * grid_step
+            if c.shape[0] > grid_cap:
+                c = c[torch.randperm(c.shape[0], device=device)[:grid_cap]]
+        else:                                                                    # random foreground (train-like, sparse)
+            c = sc0.foreground_mm[torch.randint(sc0.foreground_mm.shape[0], (K,), device=device)]
+        K = c.shape[0]; cm = c.mean(0)                                           # K = actual per-patient patch count
         shp = torch.as_tensor(sc0.volume.shape, device=device)
         segt = torch.as_tensor(np.asarray(nib.load(segp[0]).get_fdata()), dtype=torch.int16, device=device)
         if cube:
@@ -146,8 +155,10 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", c
         used += 1; del b, segt; torch.cuda.empty_cache()
     arrs = {k: np.concatenate(v).astype(np.float16) for k, v in store.items()}
     np.savez(out, coords=np.concatenate(COORD).astype(np.float32), labels=np.concatenate(LAB).astype(np.int8),
-             groups=np.concatenate(GRP).astype(np.int16), cube=np.int16(cube), **arrs)
-    print(f"cache built: {used} patients, {len(np.concatenate(LAB))} patches, cube={cube} -> {out}", flush=True)
+             groups=np.concatenate(GRP).astype(np.int16), cube=np.int16(cube), sampling=np.str_(sampling), **arrs)
+    lab_all = np.concatenate(LAB)
+    print(f"cache built: {used} patients, {len(lab_all)} patches ({len(lab_all)//max(used,1)}/patient), "
+          f"cube={cube} sampling={sampling} -> {out}", flush=True)
 
 
 def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda", mixed=False, cube=0):
@@ -210,9 +221,11 @@ def main():
                          "conditioning) so the readout matches training. Off for legacy phased checkpoints.")
     ap.add_argument("--cube", type=int, default=0,
                     help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy 2.5D slabs.")
+    ap.add_argument("--sampling", choices=["random", "grid"], default="random",
+                    help="random = train-like sparse foreground centers; grid = dense full-coverage lattice.")
     a = ap.parse_args()
     if a.build or not os.path.exists(a.cache):
-        build_cache(a.data_root, a.tracks, a.cache, device=a.device, cube=a.cube)
+        build_cache(a.data_root, a.tracks, a.cache, device=a.device, cube=a.cube, sampling=a.sampling)
     if a.checkpoint:
         print(eval_ckpt(a.cache, a.checkpoint, sizes=tuple(a.sizes), device=a.device, mixed=a.mixed, cube=a.cube))
 

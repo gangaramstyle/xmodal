@@ -30,11 +30,13 @@ def main():
                          "encoder is conditioned the SAME way training was (Site A). Off for legacy phased ckpts.")
     ap.add_argument("--cube", type=int, default=0,
                     help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy 2.5D slabs.")
+    ap.add_argument("--sampling", choices=["random", "grid"], default="random",
+                    help="random = train-like sparse foreground centers; grid = dense full-coverage lattice.")
     a = ap.parse_args()
     dev = a.device
     if a.build or not os.path.exists(a.cache):
-        print("building cache...", flush=True)
-        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube)
+        print("building cache (sampling=%s cube=%d)..." % (a.sampling, a.cube), flush=True)
+        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube, sampling=a.sampling)
     Z = np.load(a.cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
     cube = int(a.cube or (int(Z["cube"]) if "cube" in Z else 0))     # cache remembers its geometry
     mixed = a.mixed or bool(cube)                                    # v5 (cube) always uses series conditioning
