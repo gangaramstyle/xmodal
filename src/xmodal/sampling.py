@@ -604,48 +604,83 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
     csrc_np = np.zeros((batch_size, nS, 3), np.float32); ctgt_np = np.zeros((batch_size, P, 3), np.float32)
     ser_np = np.zeros((batch_size, nS), np.int64); mod_np = np.zeros((batch_size, P), np.int64)
     zsrc_np = np.zeros((batch_size, nS, 3), np.float32); ztgt_np = np.zeros((batch_size, P, 3), np.float32)
-    common_cache = {}; tumor_hits = 0
+    tumor_hits = 0
     G_ctr, G_key, G_buf, G_i, G_k, G_sz = [], [], [], [], [], []
-    for i in range(batch_size):                                        # ALL geometry in numpy -> no per-item GPU sync
-        bnd = elig[int(rng.integers(len(elig)))]
+    item_bnd = rng.integers(len(elig), size=batch_size)                # assign each item a random bundle (i.i.d.)
+    from collections import defaultdict as _dd
+    groups = _dd(list)
+    for i in range(batch_size):
+        groups[int(item_bnd[i])].append(i)
+    for bi, items in groups.items():                                   # process a bundle's items together (vectorized masking)
+        bnd = elig[bi]
         sid2 = {sc.series_idx: sc for sc in bnd.values()}
         rep = sid2[sorted(sid2)[0]]
-        bid = id(bnd)
-        if bid not in common_cache:
-            _tmm = rep.tumor_np if rep.tumor_np is not None else (
-                rep.tumor_mm.detach().cpu().numpy() if rep.tumor_mm is not None else None)
-            common_cache[bid] = (_v5_common_fg_np(sid2), _tmm)
-        cfg, tmm = common_cache[bid]
-        prism = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]); half = prism / 2.0
-        ps = float(prism_patch[prism])
-        use_tumor = tumor_frac > 0 and tmm is not None and rng.random() < tumor_frac
-        for _t in range(8):
-            if use_tumor:                                              # anchor = tumor voxel + offset so it lands in the prism
-                a_a = tmm[int(rng.integers(len(tmm)))] + (rng.random(3) * 2 - 1) * half
-            else:
-                a_a = cfg[int(rng.integers(len(cfg)))]
-            local = _v5_local_np(cfg, a_a.astype(np.float32), half)
-            if len(local) >= n_tgt:
-                break
-        tumor_hits += int(use_tumor)
-        K = len(local)
-        D = int(rng.integers(4)); ctx = np.array([m for m in range(4) if m != D], dtype=np.int64)
-        src_pos = local[rng.choice(K, size=n_src, replace=(K < n_src))]
-        src_mod = ctx[rng.integers(3, size=n_src)]                                  # random A/B/C per source patch
-        anc_pos = local[rng.choice(K, size=n_anchor, replace=(K < n_anchor))]
-        tgt_pos = local[_v5_pick_np(local, n_tgt, ps, rng)]
-        src_all = np.concatenate([src_pos, anc_pos], 0).astype(np.float32)          # [nS,3] world
-        mods = np.concatenate([src_mod, np.full(n_anchor, D, np.int64)])
-        csrc_np[i] = src_all - a_a[None]; ser_np[i] = mods
-        ctgt_np[i] = tgt_pos - a_a[None]; mod_np[i] = D
-        zsrc_np[i] = ps; ztgt_np[i] = ps                                            # cube: per-axis extent = ps
+        cfg = getattr(rep, "_v5_common_fg", None)                      # common fg is deterministic -> persist across batches
+        if cfg is None:
+            cfg = _v5_common_fg_np(sid2)
+            try:
+                rep._v5_common_fg = cfg
+            except Exception:
+                pass
+        tmm = rep.tumor_np if rep.tumor_np is not None else (          # tmm read fresh (cheap ref; may change post-load)
+            rep.tumor_mm.detach().cpu().numpy() if rep.tumor_mm is not None else None)
+        Kc = len(cfg)
         bmap = np.zeros(8, np.int64)
         for sid, sc in sid2.items():
             bmap[sid] = gid[id(sc)]
-        for ctr, mm, buf in ((src_all, mods, 0), (tgt_pos.astype(np.float32), np.full(n_tgt, D, np.int64), 1)):
-            G_ctr.append(ctr); G_key.append(bmap[mm]); G_buf.append(np.full(len(mm), buf, np.int64))
-            G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
-            G_sz.append(np.full(len(mm), ps, np.float32))
+        G = len(items)
+        pr_idx = rng.integers(len(prism_choices), size=G)
+        prisms = np.asarray(prism_choices, np.float32)[pr_idx]; halfs = prisms / 2.0
+        pss = np.array([prism_patch[float(p)] for p in prisms], np.float32)
+        can_tumor = tumor_frac > 0 and tmm is not None
+        use_t = (rng.random(G) < tumor_frac) if can_tumor else np.zeros(G, bool)
+        # initial anchors [G,3]: tumor items = tumor voxel + in-prism offset; else a foreground point
+        anchors = np.empty((G, 3), np.float32)
+        if can_tumor and use_t.any():
+            nt = int(use_t.sum())
+            anchors[use_t] = tmm[rng.integers(len(tmm), size=nt)] + (rng.random((nt, 3)) * 2 - 1) * halfs[use_t, None]
+        nf = int((~use_t).sum())
+        if nf:
+            anchors[~use_t] = cfg[rng.integers(Kc, size=nf)]
+        # vectorized local masking across the group, with per-item retry only for the few that come up short
+        need = np.arange(G)
+        masks = [None] * G
+        for _attempt in range(8):
+            d = np.abs(cfg[None, :, :] - anchors[need][:, None, :]).max(-1)         # [len(need),Kc]
+            m = d <= halfs[need][:, None]
+            cnt = m.sum(1)
+            for j, g in enumerate(need):
+                masks[g] = m[j]
+            short = cnt < n_tgt
+            if not short.any():
+                break
+            rs = need[short]                                                         # redraw anchors for the short ones
+            st = use_t[rs]
+            if can_tumor and st.any():
+                anchors[rs[st]] = tmm[rng.integers(len(tmm), size=int(st.sum()))] + \
+                    (rng.random((int(st.sum()), 3)) * 2 - 1) * halfs[rs[st], None]
+            if (~st).any():
+                anchors[rs[~st]] = cfg[rng.integers(Kc, size=int((~st).sum()))]
+            need = rs
+        tumor_hits += int(use_t.sum())
+        for j, i in enumerate(items):                                              # j = position in group, i = global item idx
+            a_a = anchors[j]; ps = float(pss[j])
+            local = cfg[masks[j]]
+            K = len(local)
+            D = int(rng.integers(4)); ctx = np.array([m2 for m2 in range(4) if m2 != D], dtype=np.int64)
+            src_pos = local[rng.choice(K, size=n_src, replace=(K < n_src))]
+            src_mod = ctx[rng.integers(3, size=n_src)]                              # random A/B/C per source patch
+            anc_pos = local[rng.choice(K, size=n_anchor, replace=(K < n_anchor))]
+            tgt_pos = local[_v5_pick_np(local, n_tgt, ps, rng)]
+            src_all = np.concatenate([src_pos, anc_pos], 0).astype(np.float32)      # [nS,3] world
+            mods = np.concatenate([src_mod, np.full(n_anchor, D, np.int64)])
+            csrc_np[i] = src_all - a_a[None]; ser_np[i] = mods
+            ctgt_np[i] = tgt_pos - a_a[None]; mod_np[i] = D
+            zsrc_np[i] = ps; ztgt_np[i] = ps                                        # cube: per-axis extent = ps
+            for ctr, mm, buf in ((src_all, mods, 0), (tgt_pos.astype(np.float32), np.full(n_tgt, D, np.int64), 1)):
+                G_ctr.append(ctr); G_key.append(bmap[mm]); G_buf.append(np.full(len(mm), buf, np.int64))
+                G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
+                G_sz.append(np.full(len(mm), ps, np.float32))
 
     csrc = _h2d(csrc_np, device); ctgt = _h2d(ctgt_np, device)              # pinned + non_blocking single transfers
     ser_src = _h2d(ser_np, device); mod_tgt = _h2d(mod_np, device)
