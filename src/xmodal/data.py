@@ -81,9 +81,11 @@ def place_bundle(cpu_bundle, device):
             affine_inv=torch.as_tensor(p["affine_inv"], device=device),
             affine_trans=torch.as_tensor(p["affine_trans"], device=device),
             foreground_mm=torch.as_tensor(p["foreground_mm"], device=device),
+            foreground_np=np.ascontiguousarray(p["foreground_mm"], dtype=np.float32),   # CPU mirror (v5 geometry, no sync)
             thick_axis=p["thick"], plane_id=p["plane"], modality=m, series_idx=p["series"],
             patient=p["patient"], spacing=p["spacing"],
-            tumor_mm=(torch.as_tensor(p["tumor_mm"], device=device) if p.get("tumor_mm") is not None else None))
+            tumor_mm=(torch.as_tensor(p["tumor_mm"], device=device) if p.get("tumor_mm") is not None else None),
+            tumor_np=(np.ascontiguousarray(p["tumor_mm"], dtype=np.float32) if p.get("tumor_mm") is not None else None))
     return b
 
 

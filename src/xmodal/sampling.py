@@ -160,6 +160,8 @@ class CachedScan:
     patient: str = ""
     spacing: tuple = (1.0, 1.0, 1.0)
     tumor_mm: object = None   # torch [T,3] world-mm cloud of segmented tumor voxels (v5 tumor-focus); None if no seg
+    foreground_np: object = None   # CPU numpy [M,3] mirror of foreground_mm -> sampler geometry never syncs the GPU
+    tumor_np: object = None        # CPU numpy [T,3] mirror of tumor_mm (v5 tumor-focus); None if no seg
 
 
 def _thick_and_plane(affine_R: np.ndarray, thick_axis):
@@ -196,6 +198,7 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
         affine_inv=torch.as_tensor(np.linalg.inv(R).copy(), device=device),
         affine_trans=torch.as_tensor(t.copy(), device=device),
         foreground_mm=torch.as_tensor(fg, device=device),
+        foreground_np=np.ascontiguousarray(fg, dtype=np.float32),   # CPU mirror -> no per-batch GPU->CPU sync
         thick_axis=thick, plane_id=plane, modality=modality, series_idx=series_idx,
         patient=patient, spacing=spacing,
     )
@@ -520,10 +523,15 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
 # anchors of the target modality D); recreate the ordering of held modality-D patches.
 # ---------------------------------------------------------------------------
 
+def _fg_np(sc):
+    """CPU numpy foreground for a scan, preferring the pre-computed mirror (no GPU->CPU sync)."""
+    return sc.foreground_np if sc.foreground_np is not None else sc.foreground_mm.detach().cpu().numpy()
+
+
 def _v5_common_fg_np(sid2, cap=50000):
     """Common foreground (union of the 4 modalities) as a CPU numpy cloud [K,3] (subsampled). All the
     per-item geometry runs on this in numpy -> no per-item GPU sync (throughput)."""
-    clouds = [sc.foreground_mm.detach().cpu().numpy() for sc in sid2.values()]
+    clouds = [_fg_np(sc) for sc in sid2.values()]
     fg = (np.concatenate(clouds, 0) if len(clouds) > 1 else clouds[0]).astype(np.float32)
     if len(fg) > cap:
         fg = fg[np.random.default_rng(0).choice(len(fg), cap, replace=False)]
@@ -548,6 +556,15 @@ def _v5_pick_np(points, k, min_sep, rng):
     if len(sel) < k:
         sel += [int(x) for x in perm if int(x) not in set(sel)][: k - len(sel)]
     return np.asarray(sel[:k], dtype=np.int64)
+
+
+def _h2d(x, device):
+    """Host->device transfer, pinned + non_blocking on CUDA so the copy overlaps GPU compute."""
+    import torch
+    t = torch.from_numpy(np.ascontiguousarray(x))
+    if str(device).startswith("cuda"):
+        return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device)
 
 
 def _cube_unit(V, device):
@@ -595,8 +612,9 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
         rep = sid2[sorted(sid2)[0]]
         bid = id(bnd)
         if bid not in common_cache:
-            common_cache[bid] = (_v5_common_fg_np(sid2),
-                                 rep.tumor_mm.detach().cpu().numpy() if rep.tumor_mm is not None else None)
+            _tmm = rep.tumor_np if rep.tumor_np is not None else (
+                rep.tumor_mm.detach().cpu().numpy() if rep.tumor_mm is not None else None)
+            common_cache[bid] = (_v5_common_fg_np(sid2), _tmm)
         cfg, tmm = common_cache[bid]
         prism = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]); half = prism / 2.0
         ps = float(prism_patch[prism])
@@ -629,23 +647,23 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
             G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
             G_sz.append(np.full(len(mm), ps, np.float32))
 
-    csrc = torch.as_tensor(csrc_np, device=device); ctgt = torch.as_tensor(ctgt_np, device=device)   # single transfers
-    ser_src = torch.as_tensor(ser_np, device=device); mod_tgt = torch.as_tensor(mod_np, device=device)
-    zsrc = torch.as_tensor(zsrc_np, device=device); ztgt = torch.as_tensor(ztgt_np, device=device)
-    allctr = torch.as_tensor(np.concatenate(G_ctr), device=device)
-    allkey = np.concatenate(G_key); allbuf = np.concatenate(G_buf)
-    alli = np.concatenate(G_i); allk = np.concatenate(G_k)
-    allsz = torch.as_tensor(np.concatenate(G_sz), device=device)
-    bufs = {0: Src, 1: Tgt}
-    for u in np.unique(allkey):
-        sel = np.nonzero(allkey == u)[0]; scan = scan_list[int(u)]; sel_t = torch.as_tensor(sel, device=device)
-        patches = _gather_cubes(scan, allctr[sel_t], allsz[sel_t], unit, device)
-        bsel, isel, ksel = allbuf[sel], alli[sel], allk[sel]
-        for bb, buf in bufs.items():
-            mb = np.nonzero(bsel == bb)[0]
-            if mb.size:
-                buf[torch.as_tensor(isel[mb], device=device), torch.as_tensor(ksel[mb], device=device)] = \
-                    patches[torch.as_tensor(mb, device=device)]
+    csrc = _h2d(csrc_np, device); ctgt = _h2d(ctgt_np, device)              # pinned + non_blocking single transfers
+    ser_src = _h2d(ser_np, device); mod_tgt = _h2d(mod_np, device)
+    zsrc = _h2d(zsrc_np, device); ztgt = _h2d(ztgt_np, device)
+    # sort the gather requests by scan so each scan's cubes are one contiguous segment (one grid_sample, no per-scan H2D)
+    allkey = np.concatenate(G_key); order = np.argsort(allkey, kind="stable")
+    allkey_s = allkey[order]
+    ctr_g = _h2d(np.concatenate(G_ctr)[order], device); sz_g = _h2d(np.concatenate(G_sz)[order], device)
+    alli_s = np.concatenate(G_i)[order]; allk_s = np.concatenate(G_k)[order]; allbuf_s = np.concatenate(G_buf)[order]
+    N = allkey_s.shape[0]
+    Patches = torch.empty(N, V, V, V, device=device)
+    uniq, starts, counts = np.unique(allkey_s, return_index=True, return_counts=True)
+    for u, s, c in zip(uniq.tolist(), starts.tolist(), counts.tolist()):      # ONE grid_sample per resident scan
+        Patches[s:s + c] = _gather_cubes(scan_list[u], ctr_g[s:s + c], sz_g[s:s + c], unit, device)  # contiguous, no sync
+    for bb, buf in ((0, Src), (1, Tgt)):                                      # exactly two integer-index scatters (no sync)
+        mb = np.nonzero(allbuf_s == bb)[0]
+        if mb.size:
+            buf[_h2d(alli_s[mb], device), _h2d(allk_s[mb], device)] = Patches[_h2d(mb.astype(np.int64), device)]
     return dict(patches_src=Src, held=Tgt,                             # [B,*,V,V,V] (grid is V^3; stem adds channel)
                 coords_src=csrc, coords_tgt=ctgt, sizes_src=zsrc, sizes_tgt=ztgt,
                 series_src=ser_src, mod_tgt=mod_tgt,
