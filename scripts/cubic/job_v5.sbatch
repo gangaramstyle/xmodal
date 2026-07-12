@@ -16,16 +16,18 @@ export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd ~/xmodal
-# serialize the checkout across concurrently-starting jobs (shared working tree -> .git/index.lock race)
-(
-  flock -w 300 9 || { echo "FATAL: git lock timeout"; exit 1; }
-  git fetch -q origin v5
-  SHA="${LAUNCH_SHA:-$(git rev-parse origin/v5)}"
-  git checkout -q --detach "$SHA"
-  test "$(git rev-parse HEAD)" = "$SHA" || { echo "FATAL: SHA mismatch"; exit 1; }
-  echo "PINNED $SHA"
-) 9>/tmp/xmodal_git_checkout.lock
-SHA="${LAUNCH_SHA:-$(git rev-parse HEAD)}"
+# concurrently-starting jobs share the NFS ~/xmodal tree -> .git/index.lock race. Retry with random
+# backoff (robust across nodes; /tmp flock wouldn't coordinate cross-node). All arms pin the SAME SHA.
+git fetch -q origin v5 2>/dev/null || true
+SHA="${LAUNCH_SHA:-$(git rev-parse origin/v5)}"
+ok=0
+for attempt in $(seq 1 8); do
+  if git checkout -q --detach "$SHA" 2>/dev/null && [ "$(git rev-parse HEAD)" = "$SHA" ]; then ok=1; break; fi
+  echo "checkout attempt $attempt hit a lock, backing off..."; sleep $((RANDOM % 8 + 3))
+  git fetch -q origin v5 2>/dev/null || true
+done
+[ "$ok" = 1 ] || { echo "FATAL: checkout of $SHA failed after retries"; exit 1; }
+echo "PINNED $SHA"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 NAME="v5_${TAG:-both}_s${SEED:-0}"
