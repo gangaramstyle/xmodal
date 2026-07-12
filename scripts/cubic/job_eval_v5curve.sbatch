@@ -19,7 +19,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd ~/xmodal
 git fetch -q origin v5
 SHA="${SHA:-$(git rev-parse origin/v5)}"
-git checkout -q --detach "$SHA" && echo "PINNED $SHA"
+git checkout -qf --detach "$SHA" && echo "PINNED $SHA"   # -f: discard any stray local changes in the shared tree
 nvidia-smi --query-gpu=name --format=csv,noheader
 
 # pull the 51-METS held-out set from wandb, extract
