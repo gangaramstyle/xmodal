@@ -520,34 +520,34 @@ def sample_mixed_paired_batch(bundles, *, batch_size, token_count, held_count, n
 # anchors of the target modality D); recreate the ordering of held modality-D patches.
 # ---------------------------------------------------------------------------
 
-def _v5_common_fg(sid2, cap=50000):
-    import torch
-    clouds = [sc.foreground_mm for sc in sid2.values()]
-    fg = torch.cat(clouds, 0) if len(clouds) > 1 else clouds[0]
-    if fg.shape[0] > cap:
-        fg = fg[torch.randint(fg.shape[0], (cap,), device=fg.device)]
+def _v5_common_fg_np(sid2, cap=50000):
+    """Common foreground (union of the 4 modalities) as a CPU numpy cloud [K,3] (subsampled). All the
+    per-item geometry runs on this in numpy -> no per-item GPU sync (throughput)."""
+    clouds = [sc.foreground_mm.detach().cpu().numpy() for sc in sid2.values()]
+    fg = (np.concatenate(clouds, 0) if len(clouds) > 1 else clouds[0]).astype(np.float32)
+    if len(fg) > cap:
+        fg = fg[np.random.default_rng(0).choice(len(fg), cap, replace=False)]
     return fg
 
 
-def _v5_local(fg, anchor, half):
-    return fg[(fg - anchor[None]).abs().amax(-1) <= half]
+def _v5_local_np(fg, anchor, half):
+    return fg[np.abs(fg - anchor[None]).max(-1) <= half]
 
 
-def _v5_pick(points, k, min_sep, rng):
-    """Greedy min-separation pick of k target positions (distinct D targets for a clean ordering task)."""
-    import torch
-    K = points.shape[0]
+def _v5_pick_np(points, k, min_sep, rng):
+    """Greedy min-separation pick of k target positions (numpy; no GPU). Distinct D targets -> clean order."""
+    K = len(points)
     if K <= k:
-        return torch.arange(K, device=points.device)
+        return np.arange(K)
     perm = rng.permutation(K); ms2 = float(min_sep) ** 2; sel = [int(perm[0])]
     for idx in perm[1:]:
         if len(sel) >= k:
             break
-        if min_sep <= 0 or bool(((points[torch.as_tensor(sel, device=points.device)] - points[int(idx)]).pow(2).sum(-1) >= ms2).all()):
+        if min_sep <= 0 or float(((points[sel] - points[idx]) ** 2).sum(-1).min()) >= ms2:
             sel.append(int(idx))
     if len(sel) < k:
         sel += [int(x) for x in perm if int(x) not in set(sel)][: k - len(sel)]
-    return torch.as_tensor(sel[:k], device=points.device)
+    return np.asarray(sel[:k], dtype=np.int64)
 
 
 def _cube_unit(V, device):
@@ -584,54 +584,56 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
                 gid[id(sc)] = len(scan_list); scan_list.append(sc)
     unit = _cube_unit(V, device)
     Src = torch.empty(batch_size, nS, V, V, V, device=device); Tgt = torch.empty(batch_size, P, V, V, V, device=device)
-    csrc = torch.empty(batch_size, nS, 3, device=device); ctgt = torch.empty(batch_size, P, 3, device=device)
-    ser_src = torch.zeros(batch_size, nS, dtype=torch.long, device=device)
-    mod_tgt = torch.zeros(batch_size, P, dtype=torch.long, device=device)
-    zsrc = torch.empty(batch_size, nS, 3, device=device); ztgt = torch.empty(batch_size, P, 3, device=device)
+    csrc_np = np.zeros((batch_size, nS, 3), np.float32); ctgt_np = np.zeros((batch_size, P, 3), np.float32)
+    ser_np = np.zeros((batch_size, nS), np.int64); mod_np = np.zeros((batch_size, P), np.int64)
+    zsrc_np = np.zeros((batch_size, nS, 3), np.float32); ztgt_np = np.zeros((batch_size, P, 3), np.float32)
     common_cache = {}; tumor_hits = 0
     G_ctr, G_key, G_buf, G_i, G_k, G_sz = [], [], [], [], [], []
-    for i in range(batch_size):
+    for i in range(batch_size):                                        # ALL geometry in numpy -> no per-item GPU sync
         bnd = elig[int(rng.integers(len(elig)))]
         sid2 = {sc.series_idx: sc for sc in bnd.values()}
-        rep = sid2[sorted(sid2)[0]]; fg = rep.foreground_mm
+        rep = sid2[sorted(sid2)[0]]
         bid = id(bnd)
         if bid not in common_cache:
-            common_cache[bid] = _v5_common_fg(sid2)
-        cfg = common_cache[bid]
+            common_cache[bid] = (_v5_common_fg_np(sid2),
+                                 rep.tumor_mm.detach().cpu().numpy() if rep.tumor_mm is not None else None)
+        cfg, tmm = common_cache[bid]
         prism = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]); half = prism / 2.0
         ps = float(prism_patch[prism])
-        tmm = rep.tumor_mm                                              # tumor-focus: place prism so tumor is inside it
         use_tumor = tumor_frac > 0 and tmm is not None and rng.random() < tumor_frac
         for _t in range(8):
             if use_tumor:                                              # anchor = tumor voxel + offset so it lands in the prism
-                tv = tmm[int(rng.integers(tmm.shape[0]))]
-                a_a = tv + torch.as_tensor((rng.random(3) * 2 - 1) * half, device=device, dtype=tv.dtype)
+                a_a = tmm[int(rng.integers(len(tmm)))] + (rng.random(3) * 2 - 1) * half
             else:
-                a_a = fg[int(rng.integers(fg.shape[0]))]
-            local = _v5_local(cfg, a_a, half)
-            if local.shape[0] >= n_tgt:
+                a_a = cfg[int(rng.integers(len(cfg)))]
+            local = _v5_local_np(cfg, a_a.astype(np.float32), half)
+            if len(local) >= n_tgt:
                 break
         tumor_hits += int(use_tumor)
-        K = local.shape[0]
+        K = len(local)
         D = int(rng.integers(4)); ctx = np.array([m for m in range(4) if m != D], dtype=np.int64)
-        src_pos = local[torch.as_tensor(rng.choice(K, size=n_src, replace=(K < n_src)), device=device)]
+        src_pos = local[rng.choice(K, size=n_src, replace=(K < n_src))]
         src_mod = ctx[rng.integers(3, size=n_src)]                                  # random A/B/C per source patch
-        anc_pos = local[torch.as_tensor(rng.choice(K, size=n_anchor, replace=(K < n_anchor)), device=device)]
-        tgt_pos = local[_v5_pick(local, n_tgt, ps, rng)]
-        src_all = torch.cat([src_pos, anc_pos], 0)                                  # [nS,3] world
+        anc_pos = local[rng.choice(K, size=n_anchor, replace=(K < n_anchor))]
+        tgt_pos = local[_v5_pick_np(local, n_tgt, ps, rng)]
+        src_all = np.concatenate([src_pos, anc_pos], 0).astype(np.float32)          # [nS,3] world
         mods = np.concatenate([src_mod, np.full(n_anchor, D, np.int64)])
-        csrc[i] = src_all - a_a[None]; ser_src[i] = torch.as_tensor(mods, device=device)
-        ctgt[i] = tgt_pos - a_a[None]; mod_tgt[i] = D
-        zsrc[i] = ps; ztgt[i] = ps                                                  # cube: per-axis extent = ps
+        csrc_np[i] = src_all - a_a[None]; ser_np[i] = mods
+        ctgt_np[i] = tgt_pos - a_a[None]; mod_np[i] = D
+        zsrc_np[i] = ps; ztgt_np[i] = ps                                            # cube: per-axis extent = ps
         bmap = np.zeros(8, np.int64)
         for sid, sc in sid2.items():
             bmap[sid] = gid[id(sc)]
-        for ctr, mm, buf in ((src_all, mods, 0), (tgt_pos, np.full(n_tgt, D, np.int64), 1)):
+        for ctr, mm, buf in ((src_all, mods, 0), (tgt_pos.astype(np.float32), np.full(n_tgt, D, np.int64), 1)):
             G_ctr.append(ctr); G_key.append(bmap[mm]); G_buf.append(np.full(len(mm), buf, np.int64))
             G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
             G_sz.append(np.full(len(mm), ps, np.float32))
 
-    allctr = torch.cat(G_ctr); allkey = np.concatenate(G_key); allbuf = np.concatenate(G_buf)
+    csrc = torch.as_tensor(csrc_np, device=device); ctgt = torch.as_tensor(ctgt_np, device=device)   # single transfers
+    ser_src = torch.as_tensor(ser_np, device=device); mod_tgt = torch.as_tensor(mod_np, device=device)
+    zsrc = torch.as_tensor(zsrc_np, device=device); ztgt = torch.as_tensor(ztgt_np, device=device)
+    allctr = torch.as_tensor(np.concatenate(G_ctr), device=device)
+    allkey = np.concatenate(G_key); allbuf = np.concatenate(G_buf)
     alli = np.concatenate(G_i); allk = np.concatenate(G_k)
     allsz = torch.as_tensor(np.concatenate(G_sz), device=device)
     bufs = {0: Src, 1: Tgt}
