@@ -28,12 +28,16 @@ def main():
     ap.add_argument("--mixed", action="store_true",
                     help="mixed-modality checkpoints: pass per-patch series_ids to teacher_readout so the "
                          "encoder is conditioned the SAME way training was (Site A). Off for legacy phased ckpts.")
+    ap.add_argument("--cube", type=int, default=0,
+                    help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy 2.5D slabs.")
     a = ap.parse_args()
     dev = a.device
     if a.build or not os.path.exists(a.cache):
         print("building cache...", flush=True)
-        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev)
+        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube)
     Z = np.load(a.cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
+    cube = int(a.cube or (int(Z["cube"]) if "cube" in Z else 0))     # cache remembers its geometry
+    mixed = a.mixed or bool(cube)                                    # v5 (cube) always uses series conditioning
     CLASSES = [0, 2, 3]                                              # non-tumor, edema, ET (necrosis dropped)
 
     def torch_probe(X, Y, G, steps=300):
@@ -67,15 +71,21 @@ def main():
 
     def ev(ckpt):
         ck = torch.load(ckpt, map_location=dev); step = int(ck.get("step", -1))
-        E = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8)).to(dev)
+        ecfg = M.EncoderConfig(width=384, depth=12, heads=6, n_series=8,
+                               patch_grid=(cube, cube, cube) if cube else None)
+        E = M.Phase0Encoder(ecfg).to(dev)
         E.load_state_dict(ck["model"], strict=False); E.eval()
-        s = 8; cols = {m: [] for m in MODS}
+        s = 8; cols = {m: [] for m in MODS}                          # 8mm patch (v5 trained 4&8mm cubes)
         for g in sorted(set(groups.tolist())):
             idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
-            sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=dev), 2)
+            if cube:
+                sz3 = torch.full((1, len(idx), 3), float(s), device=dev)                 # isotropic cube extent
+            else:
+                sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=dev), 2)
             for mi, m in enumerate(MODS):
-                pt = torch.as_tensor(Z["%d_%s" % (s, m)][idx], device=dev).float()[None, ..., None]
-                sid = torch.full((1, len(idx)), mi, device=dev, dtype=torch.long) if a.mixed else None
+                arr = torch.as_tensor(Z["%d_%s" % (s, m)][idx], device=dev).float()
+                pt = arr[None] if cube else arr[None, ..., None]                          # cube [1,n,V,V,V]; slab [1,n,V,V,1]
+                sid = torch.full((1, len(idx)), mi, device=dev, dtype=torch.long) if mixed else None
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     _, lat = E.teacher_readout(pt, co, sz3, sid)
                 cols[m].append(lat[0].float().cpu().numpy())
