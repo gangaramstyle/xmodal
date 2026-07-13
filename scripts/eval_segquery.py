@@ -134,15 +134,19 @@ def main():
                 order = rng.permutation(len(tr))
                 for c0 in range(0, len(tr), a.chunk):
                     cb = [tr[i] for i in order[c0:c0 + a.chunk]]
-                    y = torch.as_tensor(np.concatenate([[cmap[int(v)] for v in g["lab"]] for g in cb]), device=dev)
+                    raw = np.concatenate([g["lab"] for g in cb]); keep = torch.as_tensor(raw != 1, device=dev)  # drop NCR
+                    y = torch.as_tensor([cmap[int(v)] for v in raw[raw != 1]], device=dev)
+                    if len(y) == 0:
+                        continue
                     cnt = torch.bincount(y, minlength=len(CLASSES)).float(); w = len(y) / (len(CLASSES) * cnt.clamp(min=1))
-                    logits = head(slots_for(E, seg_tok, cb)).reshape(-1, len(CLASSES))
+                    logits = head(slots_for(E, seg_tok, cb)).reshape(-1, len(CLASSES))[keep]
                     opt.zero_grad(); torch.nn.functional.cross_entropy(logits, y, weight=w).backward(); opt.step()
             with torch.no_grad():
                 for c0 in range(0, len(te), a.chunk):
                     cb = te[c0:c0 + a.chunk]
-                    pr = head(slots_for(E, seg_tok, cb)).reshape(-1, len(CLASSES)).argmax(1).cpu().numpy()
-                    allP += [CLASSES[i] for i in pr]; allY += [int(v) for g in cb for v in g["lab"]]
+                    raw = np.concatenate([g["lab"] for g in cb]); keep = torch.as_tensor(raw != 1, device=dev)
+                    pr = head(slots_for(E, seg_tok, cb)).reshape(-1, len(CLASSES))[keep].argmax(1).cpu().numpy()
+                    allP += [CLASSES[i] for i in pr]; allY += [int(v) for v in raw[raw != 1]]
         allY = np.array(allY); allP = np.array(allP); f1 = []
         for c in CLASSES:
             tp = ((allP == c) & (allY == c)).sum(); fp = ((allP == c) & (allY != c)).sum(); fn = ((allP != c) & (allY == c)).sum()
