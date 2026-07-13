@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--sampler-workers", type=int, default=0, help="parallel CPU-geometry prefetch workers (0=sync)")
     ap.add_argument("--seg-task", choices=["none", "ce", "supcon"], default="none", help="aux seg-prediction task")
     ap.add_argument("--seg-frac", type=float, default=0.1, help="fraction of steps doing the seg task")
+    ap.add_argument("--patient-frac", type=float, default=1.0, help="fraction of train patients to keep (data-bottleneck ablation)")
     ap.add_argument("--width", type=int, default=384, help="encoder width (384=ViT-small, 768=ViT-base)")
     ap.add_argument("--depth", type=int, default=12, help="encoder depth (transformer blocks)")
     ap.add_argument("--heads", type=int, default=6, help="attention heads (768-wide -> 12)")
@@ -87,6 +88,11 @@ def main():
     all_pids = sorted(pid2dir)
     train_pids, val_pids = H.split_patients(all_pids, seed=args.holdout_seed, val_frac=args.holdout_frac)
     assert not H.contamination_check(train_pids, val_pids)
+    if args.patient_frac < 1.0:                                          # data-bottleneck ablation: subsample train patients
+        import numpy as _np
+        keep = int(round(len(train_pids) * args.patient_frac))
+        train_pids = [train_pids[i] for i in sorted(_np.random.default_rng(args.holdout_seed).permutation(len(train_pids))[:keep])]
+        print(f"patient_frac={args.patient_frac}: train patients {len(train_pids)}", flush=True)
     print(f"total {len(all_pids)} | train {len(train_pids)} | val {len(val_pids)}", flush=True)
 
     _seg = args.tumor_frac > 0                                          # only pay seg-loading cost for tumor-focus
