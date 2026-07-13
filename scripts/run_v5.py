@@ -35,6 +35,9 @@ def main():
     ap.add_argument("--mae-weight", type=float, default=0.25, help="pixel MAE weight (0 = ordering-only)")
     ap.add_argument("--tumor-frac", type=float, default=0.0, help="fraction of bags anchored on segmented tissue")
     ap.add_argument("--sampler-workers", type=int, default=0, help="parallel CPU-geometry prefetch workers (0=sync)")
+    ap.add_argument("--width", type=int, default=384, help="encoder width (384=ViT-small, 768=ViT-base)")
+    ap.add_argument("--depth", type=int, default=12, help="encoder depth (transformer blocks)")
+    ap.add_argument("--heads", type=int, default=6, help="attention heads (768-wide -> 12)")
     ap.add_argument("--ckpt-dir", default="runs/v5")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-compile", action="store_true")
@@ -79,7 +82,7 @@ def main():
     val_bundles = [D.load_local_bundle(p, pid2dir[p], device=dev)[0] for p in val_pids[:args.val_patients]]
 
     torch.manual_seed(args.seed)
-    enc = M.Phase0Encoder(M.EncoderConfig(width=384, depth=12, heads=6, n_series=8,
+    enc = M.Phase0Encoder(M.EncoderConfig(width=args.width, depth=args.depth, heads=args.heads, n_series=8,
                                           patch_grid=(args.voxels,) * 3)).to(dev)      # 3D cube patches
     cfg = T.TrainConfig(steps=args.steps, batch_size=args.batch_size, lr=args.lr, seed=args.seed,
                         compile=not args.no_compile, content_blur=args.content_blur,
