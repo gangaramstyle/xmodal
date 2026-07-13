@@ -47,6 +47,16 @@ class SmoothHead(torch.nn.Module):
         return self.net(vol)
 
 
+def find_patient_dirs(root, tracks):
+    """Patient dirs = any dir containing a *-seg.nii.gz, at ANY depth under root/track (layouts nest
+    differently: /tmp/ho/mets_ho/BraTS-* is flat, mets_train/MICCAI-.../BraTS-MET-* is one deeper)."""
+    dirs = []
+    for tr in tracks:
+        segs = glob.glob(os.path.join(os.path.expanduser(root), tr, "**", "*-seg.nii.gz"), recursive=True)
+        dirs += sorted({os.path.dirname(s) for s in segs})
+    return dirs
+
+
 def seg_at(scan, pts_mm, dev):
     """nearest seg class at world-mm points [K,3]."""
     vox = ((pts_mm - scan.affine_trans) @ scan.affine_inv.T).round().long()
@@ -141,18 +151,14 @@ def main():
         return out
 
     # ---- test pool (held-out) + optional large pretrain train pool ----
-    test_dirs = []
-    for tr in a.tracks:
-        test_dirs += sorted(glob.glob(os.path.join(os.path.expanduser(a.data_root), tr, "BraTS-*")))
+    test_dirs = find_patient_dirs(a.data_root, a.tracks)
     test_ids = {os.path.basename(d) for d in test_dirs}
     test_prisms = build_prisms(test_dirs, a.n_patients, a.n_prisms, None, "TEST")
     assert test_prisms
     train_prisms = None
     if a.n_train_patients > 0 and a.train_tracks:
-        tr_dirs = []
-        for tr in a.train_tracks:
-            tr_dirs += sorted(glob.glob(os.path.join(os.path.expanduser(a.train_root), tr, "BraTS-*")))
-        tr_dirs = list(tr_dirs); rng.shuffle(tr_dirs)                           # representative sample across the pool
+        tr_dirs = find_patient_dirs(a.train_root, a.train_tracks)
+        rng.shuffle(tr_dirs)                                                    # representative sample across the pool
         n_excl = sum(1 for d in tr_dirs if os.path.basename(d) in test_ids)
         print(f"train pool {a.train_tracks}: {len(tr_dirs)} dirs, excluding {n_excl} held-out test IDs", flush=True)
         train_prisms = build_prisms(tr_dirs, a.n_train_patients, a.n_train_prisms, test_ids, "TRAIN")
