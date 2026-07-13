@@ -102,6 +102,7 @@ def main():
     ap.add_argument("--tgt-train", type=int, default=384, help="voxels/prism for stage-1 (linear) fine-tune"); ap.add_argument("--chunk", type=int, default=8)
     ap.add_argument("--head", choices=["conv", "linear"], default="conv", help="conv=3D smoothing head (spatial prior); linear=stage-1 only")
     ap.add_argument("--block", type=int, default=11, help="contiguous grid sub-block side for conv-head training (voxels)")
+    ap.add_argument("--warmstart-seg", action="store_true", help="init seg-token+head from the ckpt's baked-in seg_query/seg_cls_head (in-distribution eval of seg-task arms; no-op for non-seg arms whose seg_query is untrained)")
     ap.add_argument("--unfreeze", type=int, default=12); ap.add_argument("--enc-width", type=int, default=384); ap.add_argument("--enc-heads", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
@@ -201,8 +202,14 @@ def main():
     def fit_eval(E, tr, te):
         """Stage-1 (decoder+seg_tok+linear on scattered voxels) -> freeze+cache embeddings -> stage-2 conv.
         Returns (linear_preds, conv_preds) on te as lists of (pred_class, gt_class, coords)."""
-        seg_tok = torch.zeros(E.cfg.width, device=dev, requires_grad=True)
+        if a.warmstart_seg and hasattr(E, "seg_query"):                        # give seg-task arms their baked-in head
+            seg_tok = E.seg_query.detach().clone().to(dev).requires_grad_(True)
+        else:
+            seg_tok = torch.zeros(E.cfg.width, device=dev, requires_grad=True)
         lin = torch.nn.Linear(E.cfg.width, 4).to(dev)
+        if a.warmstart_seg and hasattr(E, "seg_cls_head"):                     # seg_cls_head is Linear(width,4) -> direct copy
+            with torch.no_grad():
+                lin.weight.copy_(E.seg_cls_head.weight); lin.bias.copy_(E.seg_cls_head.bias)
         dec_blocks = list(E.decoder)[-a.unfreeze:]
         params = list(lin.parameters()) + [seg_tok, E.query_seed]
         for blk in dec_blocks:
@@ -268,7 +275,8 @@ def main():
             p.requires_grad_(False)
         rl, rc = run(E)
         pool = f"train{len(train_prisms)}p" if train_prisms is not None else "kfold5"
-        tag = f"{nm} step{step} denseseg[{pool}] qsize{a.qsize}mm/stride{a.res}mm"
+        ws = "+warmstart" if a.warmstart_seg else ""
+        tag = f"{nm} step{step} denseseg[{pool}{ws}] qsize{a.qsize}mm/stride{a.res}mm"
         print(f"{tag} [stage1 linear]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rl.items()), flush=True)
         if rc is not None:
             print(f"{tag} [stage2 conv-smooth]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rc.items()), flush=True)
