@@ -102,3 +102,22 @@ SOTA Dice.
   `mets_train/MICCAI-.../BraTS-MET-*` → discover patient dirs by recursive `*-seg.nii.gz`.
 - A session **date artifact** (+10 days) once faked a "jobs thrashing for days" scare — verify
   elapsed time via git/log timestamps, not the reported date.
+
+## Reference: OLD MLP-probe curves (51-patient held-out, mlp / 4mm / prism_random)
+
+From evalv5_16314790.log (ViT-small) + evalv5_16315976.log (ViT-base). **On the OLD 51-patient
+artifact** — NOT directly comparable to the reconstructed 116-patient held-out (rerun the same models
+on the new set for apples-to-apples). macro-F1, ET(enh) in parens.
+
+| step | both_tumor | both (non-tumor) | mae_tumor | both_tumor_vitbase |
+|---|---|---|---|---|
+| 1k  | 0.723 (.549) | 0.697 (.530) | 0.574 (.337) | 0.719 (.552) |
+| 11k | 0.849 (.762) | 0.841 (.740) | 0.820 (.705) | 0.827 (.743) |
+| 21k | 0.850 | 0.852 | 0.849 | 0.851 |
+| 31k | 0.858 (.786) | 0.843 (.747) | 0.857 (.784) | 0.841 (.735) |
+| 41k | 0.856 | 0.849 | 0.863 | 0.859 |
+| 51k | 0.845 | 0.858 | 0.858 | 0.861 |
+| 61k | 0.865 (.793) | 0.862 (.790) | 0.871 (.810) | 0.866 (.792) |
+
+Reads: plateau ~0.86-0.87 by ~30k; mae_tumor is the late-bloomer with best final ET (.810);
+tumor-vs-nontumor and small-vs-base both ~negligible on this frozen-MLP probe.
