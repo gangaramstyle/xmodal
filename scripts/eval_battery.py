@@ -30,7 +30,7 @@ def main():
                          "encoder is conditioned the SAME way training was (Site A). Off for legacy phased ckpts.")
     ap.add_argument("--cube", type=int, default=0,
                     help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy 2.5D slabs.")
-    ap.add_argument("--sampling", choices=["random", "grid"], default="random",
+    ap.add_argument("--sampling", choices=["random", "grid", "prism_random", "prism_grid"], default="random",
                     help="random = train-like sparse foreground centers; grid = dense full-coverage lattice.")
     ap.add_argument("--probe", choices=["linear", "mlp"], default="linear",
                     help="readout head: linear logreg (~0.75-comparable) or 1-hidden-layer MLP.")
@@ -41,6 +41,7 @@ def main():
         print("building cache (sampling=%s cube=%d)..." % (a.sampling, a.cube), flush=True)
         EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube, sampling=a.sampling)
     Z = np.load(a.cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
+    bags = Z["prisms"].astype(int) if "prisms" in Z else groups      # encode per-prism bag (whole-brain: bag==patient)
     cube = int(a.cube or (int(Z["cube"]) if "cube" in Z else 0))     # cache remembers its geometry
     mixed = a.mixed or bool(cube)                                    # v5 (cube) always uses series conditioning
     CLASSES = [0, 2, 3]                                              # non-tumor, edema, ET (necrosis dropped)
@@ -86,8 +87,8 @@ def main():
         E = M.Phase0Encoder(ecfg).to(dev)
         E.load_state_dict(ck["model"], strict=False); E.eval()
         s = 8; cols = {m: [] for m in MODS}                          # 8mm patch (v5 trained 4&8mm cubes)
-        for g in sorted(set(groups.tolist())):
-            idx = np.where(groups == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
+        for g in sorted(set(bags.tolist())):                         # encode per-prism bag (bags contiguous in cache)
+            idx = np.where(bags == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
             if cube:
                 sz3 = torch.full((1, len(idx), 3), float(s), device=dev)                 # isotropic cube extent
             else:
