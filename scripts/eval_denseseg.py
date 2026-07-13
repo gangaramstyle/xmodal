@@ -58,7 +58,8 @@ def main():
     ap.add_argument("--n-patients", type=int, default=40); ap.add_argument("--n-prisms", type=int, default=8)
     ap.add_argument("--n-src", type=int, default=96); ap.add_argument("--voxels", type=int, default=8)
     ap.add_argument("--size", type=float, default=4.0, help="source patch mm"); ap.add_argument("--prism-mm", type=float, default=32.0)
-    ap.add_argument("--res", type=float, default=2.0, help="dense query grid spacing mm")
+    ap.add_argument("--res", type=float, default=2.0, help="dense query grid STRIDE mm (metric resolution)")
+    ap.add_argument("--qsize", type=float, default=4.0, help="query SIZE embedding mm (keep in-distribution w/ pretrain patch size, independent of stride)")
     ap.add_argument("--tol", type=float, default=2.0, help="NSD tolerance mm")
     ap.add_argument("--epochs", type=int, default=30); ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--tgt-train", type=int, default=384, help="voxels/prism for fine-tune"); ap.add_argument("--chunk", type=int, default=8)
@@ -114,7 +115,7 @@ def main():
 
     def slots(E, seg_tok, sp, sc, sm, qpts):                                    # frozen-enc source -> decode dense queries
         nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
-        zs = torch.full((nb, sp.shape[1], 3), a.size, device=dev); zt = torch.full((nb, qpts.shape[1], 3), a.res, device=dev)
+        zs = torch.full((nb, sp.shape[1], 3), a.size, device=dev); zt = torch.full((nb, qpts.shape[1], 3), a.qsize, device=dev)
         with torch.no_grad():
             x = E.encode(*E._context([E.embed(sp, zs, sm)], [sc], dev, nb)); ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
         q = (E.query_seed[None, None, :] + E._size_emb(zt) + seg_tok[None, None, :]).contiguous()
@@ -173,7 +174,7 @@ def main():
             p.requires_grad_(False)
         r = run(E)
         msg = " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in r.items())
-        print(f"{nm} step{step} denseseg @res{a.res}mm: {msg}", flush=True)
+        print(f"{nm} step{step} denseseg qsize{a.qsize}mm/stride{a.res}mm: {msg}", flush=True)
 
 
 if __name__ == "__main__":

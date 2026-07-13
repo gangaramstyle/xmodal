@@ -37,6 +37,7 @@ for arm in $ARMS; do
 done
 echo "dense-seg (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) over: $ARMS"
 .venv/bin/python -u scripts/eval_denseseg.py --data-root /tmp/ho --tracks mets_ho --device cuda \
-    --unfreeze "${UNFREEZE:-12}" --res "${RES:-2}" --enc-width "${EWIDTH:-384}" --enc-heads "${EHEADS:-6}" \
+    --unfreeze "${UNFREEZE:-12}" --res "${RES:-2}" --qsize "${QSIZE:-4}" \
+    --enc-width "${EWIDTH:-384}" --enc-heads "${EHEADS:-6}" \
     --checkpoints "${CK[@]}"
 echo "=== eval_denseseg done (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) ==="
