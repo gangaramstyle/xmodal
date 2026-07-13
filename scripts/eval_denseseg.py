@@ -62,7 +62,8 @@ def seg_at(scan, pts_mm, dev):
     vox = ((pts_mm - scan.affine_trans) @ scan.affine_inv.T).round().long()
     shp = torch.as_tensor(scan.seg_vol.shape, device=dev)
     vox = vox.clamp(min=torch.zeros(3, device=dev, dtype=torch.long), max=shp - 1)
-    return scan.seg_vol[vox[..., 0], vox[..., 1], vox[..., 2]].long()          # [K]
+    cls = scan.seg_vol[vox[..., 0], vox[..., 1], vox[..., 2]].long()            # [K]
+    return torch.where(cls == 4, torch.full_like(cls, 3), cls)                  # old BraTS label 4 (ET) -> 3 (mets_train uses 4)
 
 
 def dsc(pred, gt):

@@ -23,13 +23,17 @@ git checkout -qf --detach "$SHA" && echo "PINNED $SHA"   # -f: discard any stray
 nvidia-smi --query-gpu=name --format=csv,noheader
 
 # pull the 51-METS held-out set from wandb, extract
-.venv/bin/python - <<'PY'
+for attempt in 1 2 3 4 5; do
+.venv/bin/python - <<'PY' && break
 import wandb, os, tarfile, glob
 p = wandb.Api().artifact("vineeth-gangaram-penn/xmodal-phased/heldout-mets-51:v0").download("/tmp/ho_art")
 os.makedirs("/tmp/ho", exist_ok=True)
 tarfile.open(glob.glob("/tmp/ho_art/*.tar")[0]).extractall("/tmp/ho")
 print("held-out extracted ->", os.listdir("/tmp/ho"))
 PY
+echo "wandb download attempt $attempt failed (transient), retrying..."; sleep 15
+done
+[ -d /tmp/ho/mets_ho ] || { echo "FATAL: held-out download failed after retries"; exit 1; }
 
 # enumerate EVERY checkpoint of each arm as its own name=path (full curve)
 ARMS="${ARMS:-v5_both_tumor_s0 v5_both_s0 v5_mae_tumor_s0}"

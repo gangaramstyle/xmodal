@@ -22,13 +22,17 @@ SHA="${SHA:-$(git rev-parse origin/v5)}"
 git checkout -qf --detach "$SHA" && echo "PINNED $SHA"
 nvidia-smi --query-gpu=name --format=csv,noheader
 
-.venv/bin/python - <<'PY'
+for attempt in 1 2 3 4 5; do
+.venv/bin/python - <<'PY' && break
 import wandb, os, tarfile, glob
 p = wandb.Api().artifact("vineeth-gangaram-penn/xmodal-phased/heldout-mets-51:v0").download("/tmp/ho_art")
 os.makedirs("/tmp/ho", exist_ok=True)
 tarfile.open(glob.glob("/tmp/ho_art/*.tar")[0]).extractall("/tmp/ho")
 print("held-out extracted ->", os.listdir("/tmp/ho"))
 PY
+echo "wandb download attempt $attempt failed (transient), retrying..."; sleep 15
+done
+[ -d /tmp/ho/mets_ho ] || { echo "FATAL: held-out download failed after retries"; exit 1; }
 
 ARMS="${ARMS:-v5_both_tumor_s0}"
 CK=()
