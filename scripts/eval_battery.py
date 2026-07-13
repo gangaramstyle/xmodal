@@ -86,21 +86,28 @@ def main():
                                patch_grid=(cube, cube, cube) if cube else None)
         E = M.Phase0Encoder(ecfg).to(dev)
         E.load_state_dict(ck["model"], strict=False); E.eval()
-        s = 8; cols = {m: [] for m in MODS}                          # 8mm patch (v5 trained 4&8mm cubes)
-        for g in sorted(set(bags.tolist())):                         # encode per-prism bag (bags contiguous in cache)
-            idx = np.where(bags == g)[0]; co = torch.as_tensor(coords[idx], device=dev)[None].float()
+        s = 8; W = ecfg.width                                        # 8mm patch (v5 trained 4&8mm cubes)
+        bag_ids = sorted(set(bags.tolist())); bidx = {g: np.where(bags == g)[0] for g in bag_ids}
+        by_size = {}                                                 # batch equal-size bags together (prism: 1224x96 -> few big encodes)
+        for g in bag_ids:
+            by_size.setdefault(len(bidx[g]), []).append(g)
+        Fm = {m: np.zeros((len(labels), W), np.float32) for m in MODS}
+        for bsz, gs in by_size.items():
+            ch = max(1, 8192 // bsz)                                  # adaptive: ~8k patches/encode regardless of bag size
             if cube:
-                sz3 = torch.full((1, len(idx), 3), float(s), device=dev)                 # isotropic cube extent
+                sz3 = torch.full((min(ch, len(gs)), bsz, 3), float(s), device=dev)
             else:
-                sz3 = S.size_to_extent(torch.full((1, len(idx)), float(s), device=dev), 2)
-            for mi, m in enumerate(MODS):
-                arr = torch.as_tensor(Z["%d_%s" % (s, m)][idx], device=dev).float()
-                pt = arr[None] if cube else arr[None, ..., None]                          # cube [1,n,V,V,V]; slab [1,n,V,V,1]
-                sid = torch.full((1, len(idx)), mi, device=dev, dtype=torch.long) if mixed else None
-                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    _, lat = E.teacher_readout(pt, co, sz3, sid)
-                cols[m].append(lat[0].float().cpu().numpy())
-        Fm = {m: np.concatenate(cols[m]) for m in MODS}
+                sz3 = S.size_to_extent(torch.full((min(ch, len(gs)), bsz), float(s), device=dev), 2)
+            for c0 in range(0, len(gs), ch):
+                gg = gs[c0:c0 + ch]; nb = len(gg); ii = np.concatenate([bidx[g] for g in gg])   # cache-aligned
+                co = torch.as_tensor(coords[ii].reshape(nb, bsz, 3), device=dev).float()
+                for mi, m in enumerate(MODS):
+                    arr = torch.as_tensor(Z["%d_%s" % (s, m)][ii], device=dev).float()
+                    arr = arr.reshape(nb, bsz, *arr.shape[1:]); pt = arr if cube else arr[..., None]
+                    sid = torch.full((nb, bsz), mi, device=dev, dtype=torch.long) if mixed else None
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                        _, lat = E.teacher_readout(pt, co, sz3[:nb], sid)     # [nb, bsz, W]
+                    Fm[m][ii] = lat.reshape(nb * bsz, -1).float().cpu().numpy()
         keep = labels != 1; Y = labels[keep]; G = groups[keep]; X = np.concatenate([Fm[m] for m in MODS], -1)[keep]
         f1 = torch_probe(X, Y, G, probe=a.probe, hidden=a.probe_hidden)
         return step, float(f1[2]), float(sum(f1) / len(f1))
