@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--probe-hidden", type=int, default=256, help="MLP hidden width (--probe mlp).")
     ap.add_argument("--readout-size", type=int, default=8, help="patch size (mm) to read out (cache stores 4 & 8).")
     ap.add_argument("--prism-mm", type=float, default=64.0, help="prism size for prism modes (4mm patch trained in 32mm prisms).")
+    ap.add_argument("--enc-width", type=int, default=384, help="encoder width (768 for ViT-base checkpoints).")
+    ap.add_argument("--enc-depth", type=int, default=12); ap.add_argument("--enc-heads", type=int, default=6, help="12 for ViT-base.")
     a = ap.parse_args()
     dev = a.device
     if a.build or not os.path.exists(a.cache):
@@ -84,7 +86,7 @@ def main():
 
     def ev(ckpt):
         ck = torch.load(ckpt, map_location=dev); step = int(ck.get("step", -1))
-        ecfg = M.EncoderConfig(width=384, depth=12, heads=6, n_series=8,
+        ecfg = M.EncoderConfig(width=a.enc_width, depth=a.enc_depth, heads=a.enc_heads, n_series=8,
                                patch_grid=(cube, cube, cube) if cube else None)
         E = M.Phase0Encoder(ecfg).to(dev)
         E.load_state_dict(ck["model"], strict=False); E.eval()
