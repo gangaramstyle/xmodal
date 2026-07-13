@@ -162,6 +162,7 @@ class CachedScan:
     tumor_mm: object = None   # torch [T,3] world-mm cloud of segmented tumor voxels (v5 tumor-focus); None if no seg
     foreground_np: object = None   # CPU numpy [M,3] mirror of foreground_mm -> sampler geometry never syncs the GPU
     tumor_np: object = None        # CPU numpy [T,3] mirror of tumor_mm (v5 tumor-focus); None if no seg
+    seg_vol: object = None         # torch [D,H,W] int seg volume (co-registered); for the seg-prediction training task
 
 
 def _thick_and_plane(affine_R: np.ndarray, thick_axis):
@@ -742,6 +743,78 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
                         prism_choices=prism_choices, prism_patch=prism_patch, voxels=voxels, rng=rng,
                         tumor_frac=tumor_frac, src_spacing=src_spacing)
     return _v5_gather(geom, device)
+
+
+def _seg_class(scan, centers, size, unit, device):
+    """seg class (0 nontumor / 1 NCR / 2 edema / 3 ET, priority ET>NCR>ED) for centers [K,3] world-mm."""
+    import torch
+    off = unit[None] * size + centers[:, None, None, None, :]
+    vox = ((off - scan.affine_trans) @ scan.affine_inv.T).round().long()
+    shp = torch.as_tensor(scan.seg_vol.shape, device=device)
+    vox = vox.clamp(min=torch.zeros(3, device=device, dtype=torch.long), max=shp - 1)
+    sl = scan.seg_vol[vox[..., 0], vox[..., 1], vox[..., 2]].reshape(len(centers), -1)
+    tf = (sl > 0).float().mean(1); tv = (sl > 0).float().sum(1).clamp(min=1)
+    c1 = (sl == 1).float().sum(1) / tv; c3 = (sl == 3).float().sum(1) / tv
+    lab = torch.zeros(len(centers), dtype=torch.long, device=device)
+    tum = tf > 0.25; et = tum & (c3 >= 0.15); nc = tum & ~et & (c1 >= 0.15); ed = tum & ~et & ~nc
+    lab[ed] = 2; lab[nc] = 1; lab[et] = 3
+    return lab                                                                    # [K]
+
+
+def sample_v5_seg_batch(bundles, *, batch_size, n_src, n_tgt, prism_choices=(32., 64.), prism_patch=None,
+                        voxels=8, rng, device, tumor_frac=0.7, ls=4.0):
+    """Seg-prediction task: source = `n_src` patches across ALL 4 modalities in a prism; targets = `n_tgt`
+    query positions with their seg CLASS (from seg_vol). No held patches -- the decoder queries a position
+    and (route A) classifies / (route B) contrasts by class. Tumor-enriched so classes are present.
+    Returns patches_src [B,nS,V,V,V], coords_src/tgt [B,*,3], sizes_src/tgt [B,*,3], series_src [B,nS],
+    seg_labels [B,P] (0/1/2/3)."""
+    import torch
+    prism_patch = prism_patch or {32.0: [4.0], 64.0: [8.0]}
+    prism_patch = {float(k): (list(v) if hasattr(v, "__len__") else [float(v)]) for k, v in prism_patch.items()}
+    V, nS, P = voxels, n_src, n_tgt
+    elig = [b for b in bundles if all(getattr(sc, "seg_vol", None) is not None for sc in b.values())
+            and req_ok(b)]
+    if not elig:
+        raise RuntimeError("seg task needs bundles with seg_vol (+ 4 modalities)")
+    unit = _cube_unit(V, device)
+    Src = torch.empty(batch_size, nS, V, V, V, device=device)
+    csrc = torch.zeros(batch_size, nS, 3, device=device); ctgt = torch.zeros(batch_size, P, 3, device=device)
+    ser = torch.zeros(batch_size, nS, dtype=torch.long, device=device)
+    zsrc = torch.zeros(batch_size, nS, 3, device=device); ztgt = torch.zeros(batch_size, P, 3, device=device)
+    lab = torch.zeros(batch_size, P, dtype=torch.long, device=device)
+    for i in range(batch_size):
+        bnd = elig[int(rng.integers(len(elig)))]; sid2 = {sc.series_idx: sc for sc in bnd.values()}
+        rep = sid2[sorted(sid2)[0]]
+        cfg = getattr(rep, "_v5_common_fg", None)
+        if cfg is None:
+            cfg = _v5_common_fg_np(sid2)
+        tmm = rep.tumor_np
+        prism = float(np.asarray(prism_choices)[rng.integers(len(prism_choices))]); half = prism / 2.0
+        ps = float(rng.choice(prism_patch[prism]))
+        for _t in range(8):
+            a = (tmm[rng.integers(len(tmm))] + (rng.random(3) * 2 - 1) * half) if (tmm is not None and rng.random() < tumor_frac) \
+                else cfg[rng.integers(len(cfg))]
+            local = _v5_local_np(cfg, a.astype(np.float32), half)
+            if len(local) >= n_tgt:
+                break
+        src_pos = local[rng.integers(len(local), size=n_src)].astype(np.float32)
+        src_mod = rng.integers(4, size=n_src)                                     # ALL 4 modalities in the source
+        tgt_pos = local[rng.integers(len(local), size=n_tgt)].astype(np.float32)
+        sp = torch.as_tensor(src_pos, device=device); tp = torch.as_tensor(tgt_pos, device=device)
+        for sid, sc in sid2.items():
+            sel = np.nonzero(src_mod == sid)[0]
+            if sel.size:
+                Src[i, torch.as_tensor(sel, device=device)] = _gather_cubes(
+                    sc, sp[torch.as_tensor(sel, device=device)], torch.full((sel.size,), ps, device=device), unit, device)
+        lab[i] = _seg_class(rep, tp, ls, unit, device)                            # class at target footprints
+        csrc[i] = torch.as_tensor(src_pos - a[None], device=device); ctgt[i] = torch.as_tensor(tgt_pos - a[None], device=device)
+        ser[i] = torch.as_tensor(src_mod, device=device); zsrc[i] = ps; ztgt[i] = ps
+    return dict(patches_src=Src, coords_src=csrc, coords_tgt=ctgt, sizes_src=zsrc, sizes_tgt=ztgt,
+                series_src=ser, seg_labels=lab)
+
+
+def req_ok(b):
+    return {0, 1, 2, 3}.issubset({sc.series_idx for sc in b.values()})
 
 
 def apply_window_jitter(patches, *, center_std, width_log_std):

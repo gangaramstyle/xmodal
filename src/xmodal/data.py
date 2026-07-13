@@ -85,7 +85,8 @@ def place_bundle(cpu_bundle, device):
             thick_axis=p["thick"], plane_id=p["plane"], modality=m, series_idx=p["series"],
             patient=p["patient"], spacing=p["spacing"],
             tumor_mm=(torch.as_tensor(p["tumor_mm"], device=device) if p.get("tumor_mm") is not None else None),
-            tumor_np=(np.ascontiguousarray(p["tumor_mm"], dtype=np.float32) if p.get("tumor_mm") is not None else None))
+            tumor_np=(np.ascontiguousarray(p["tumor_mm"], dtype=np.float32) if p.get("tumor_mm") is not None else None),
+            seg_vol=(torch.as_tensor(p["seg_vol"], device=device) if p.get("seg_vol") is not None else None))
     return b
 
 
@@ -182,6 +183,8 @@ def load_local_cpu(pid, patient_dir, *, labels_dir=None, suffixes=None, with_seg
                     tmm = tmm[np.random.default_rng(0).choice(len(tmm), 50_000, replace=False)]
                 for pp in bundle.values():
                     pp["tumor_mm"] = tmm
+            for pp in bundle.values():
+                pp["seg_vol"] = seg.astype(np.int8)                     # co-registered seg volume (seg-prediction task)
     return bundle, seg
 
 

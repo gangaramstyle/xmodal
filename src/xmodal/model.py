@@ -167,6 +167,8 @@ class Phase0Encoder(nn.Module):
         # cross-modal decoder + heads
         self.decoder = nn.ModuleList(CrossAttentionBlock(cfg) for _ in range(cfg.decoder_depth))
         self.query_seed = nn.Parameter(torch.zeros(cfg.width))
+        self.seg_query = nn.Parameter(torch.zeros(cfg.width))            # seg as a 5th "modality" query (seg-prediction task)
+        self.seg_cls_head = nn.Linear(cfg.width, 4)                      # 0 nontumor / 1 NCR / 2 edema / 3 ET
         self.dec_pixel_head = nn.Linear(cfg.width, self.pv)
         self.match_slot_proj = nn.Linear(cfg.width, cfg.width)
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
@@ -374,6 +376,39 @@ class Phase0Encoder(nn.Module):
         total = mae_weight * mae + match_weight * m_loss
         return dict(loss=total, mae=mae.detach(), match=m_loss.detach(), match_acc=met["match_acc"],
                     chance=met["match_chance"], slots=slots.detach(), colors=colors.detach(), mod_tgt=modt)
+
+    def forward_v5_seg(self, batch, *, mode="ce", tau=0.1):
+        """Seg-prediction auxiliary task (seg as a 5th modality). Encode a multi-modal source bag, decode
+        query positions with the SEG token. mode='ce': class head + balanced cross-entropy. mode='supcon':
+        supervised-contrastive on the slots (same-class = positive; the class-equivalence target instead of
+        the identity ordering matrix) + a small detached CE head for a usable classifier + logged acc."""
+        dev = batch["patches_src"].device
+        nreg = 2 + self.registers.shape[0]
+        ps, cs, zs, sers = batch["patches_src"], batch["coords_src"], batch["sizes_src"], batch["series_src"]
+        B = ps.shape[0]
+        x = self.encode(*self._context([self.embed(ps, zs, sers)], [cs], dev, B))
+        ctx, cc = self._context([x[:, nreg:]], [cs], dev, B)
+        ct, zt, y = batch["coords_tgt"], batch["sizes_tgt"], batch["seg_labels"]   # y [B,P]
+        m = ct.shape[1]
+        query = (self.query_seed[None, None, :] + self._size_emb(zt) + self.seg_query[None, None, :]).contiguous()
+        slots = self._decode(query, ctx, cc, ct)                                  # [B,P,W]
+        if mode == "supcon":
+            z = F.normalize(slots, dim=-1)
+            sim = torch.matmul(z, z.transpose(1, 2)) / tau                        # [B,P,P]
+            eye = torch.eye(m, device=dev)[None]
+            pos = (y[:, :, None] == y[:, None, :]).float() * (1 - eye)            # same-class, non-self
+            logp = torch.log_softmax(sim - eye * 1e9, dim=-1)                     # mask self in denominator
+            per = -(pos * logp).sum(-1) / pos.sum(-1).clamp(min=1); valid = (pos.sum(-1) > 0).float()
+            sc_loss = (per * valid).sum() / valid.sum().clamp(min=1)
+            logits = self.seg_cls_head(slots.detach())                           # readout head (doesn't shape slots)
+            ce = F.cross_entropy(logits.reshape(-1, 4), y.reshape(-1))
+            acc = (logits.reshape(-1, 4).argmax(-1) == y.reshape(-1)).float().mean()
+            return dict(loss=sc_loss + 0.1 * ce, seg_loss=sc_loss.detach(), seg_acc=acc.detach())
+        logits = self.seg_cls_head(slots)                                        # route A: class head + balanced CE
+        cnt = torch.bincount(y.reshape(-1), minlength=4).float(); w = (y.numel() / (4 * cnt.clamp(min=1)))
+        loss = F.cross_entropy(logits.reshape(-1, 4), y.reshape(-1), weight=w)
+        acc = (logits.reshape(-1, 4).argmax(-1) == y.reshape(-1)).float().mean()
+        return dict(loss=loss, seg_loss=loss.detach(), seg_acc=acc.detach())
 
     # ---- cross-modal ---------------------------------------------------------------
     def _gather(self, x, idx, d):

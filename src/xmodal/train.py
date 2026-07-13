@@ -96,6 +96,8 @@ class TrainConfig:
     v5_prism_patch: dict = None       # {prism_mm: [patch_mm,...]}; None -> {32:[4], 64:[8]}. multi-size: {32:[2,3,4],64:[8]}
     tumor_frac: float = 0.0           # v5: fraction of bags anchored on segmented tissue (pathology-focus)
     v5_sampler_workers: int = 0       # v5: parallel CPU-geometry prefetch workers (0 = synchronous sampling)
+    v5_seg_task: str = "none"         # v5 aux seg-prediction task: 'none' | 'ce' (route A) | 'supcon' (route B)
+    v5_seg_frac: float = 0.1          # fraction of steps that do the seg task instead of ordering
     git_commit: str = ""
     git_branch: str = ""
 
@@ -598,11 +600,19 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
+        do_seg = cfg.v5_seg_task != "none" and _is_cache and rng.random() < cfg.v5_seg_frac
         _sync(); _ta = time.time()
-        b = draw_train()
+        if do_seg:                                                       # aux seg-prediction task (route A/B)
+            b = S.sample_v5_seg_batch(train_bundles.resident(), batch_size=cfg.batch_size,
+                                      n_src=cfg.v5_n_src + cfg.v5_n_anchor, n_tgt=cfg.v5_n_tgt,
+                                      prism_choices=cfg.v5_prisms, prism_patch=cfg.v5_prism_patch,
+                                      voxels=cfg.v5_voxels, rng=rng, device=device, tumor_frac=max(0.7, cfg.tumor_frac))
+        else:
+            b = draw_train()
         _sync(); _tb = time.time()                                       # t_sample = draw incl. its async GPU gather
         with torch.autocast(**amp):
-            out = fwd(b); total = out["loss"]
+            out = model.forward_v5_seg(b, mode=cfg.v5_seg_task) if do_seg else fwd(b)
+            total = out["loss"]
         opt.zero_grad(set_to_none=True); total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip); opt.step()
         if _is_cache:
@@ -611,18 +621,24 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         _t_samp += _tb - _ta; _t_step += _tc - _tb; _t_n += 1
         if wb and step % cfg.log_every == 0:
             _ms = 1000.0 / max(_t_n, 1)
-            wb.log({"train/total": float(total), "train/mae": float(out["mae"]), "train/match": float(out["match"]),
-                    "train/match_acc": out["match_acc"], "train/tumor_frac": b.get("tumor_anchor_frac", 0.0), "lr": lr,
+            logd = {"train/total": float(total), "lr": lr,
                     "perf/t_sample_ms": _t_samp * _ms, "perf/t_step_ms": _t_step * _ms,
                     "perf/steps_per_s": _t_n / max(_t_samp + _t_step, 1e-9),
-                    "perf/sampler_frac": _t_samp / max(_t_samp + _t_step, 1e-9)}, step=step)
+                    "perf/sampler_frac": _t_samp / max(_t_samp + _t_step, 1e-9)}
+            if "seg_loss" in out:                                        # seg-task step
+                logd.update({"seg/loss": float(out["seg_loss"]), "seg/acc": float(out["seg_acc"])})
+            else:
+                logd.update({"train/mae": float(out["mae"]), "train/match": float(out["match"]),
+                             "train/match_acc": out["match_acc"], "train/tumor_frac": b.get("tumor_anchor_frac", 0.0)})
+            wb.log(logd, step=step)
             _t_samp = _t_step = 0.0; _t_n = 0
         if step % cfg.val_every == 0:
             vm, va, vc, vp = validate()
             if wb:
                 wb.log({"val/mae": vm, "val/match_acc": va, "val/shuf_ctrl": vc,
                         **{f"val/macc_{int(s)}mm": vp[s] for s in vp}}, step=step)
-            log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {out['match_acc']:>7.3f} "
+            log(f"{step:>6} {float(total):>8.4f} {float(out.get('mae', out.get('seg_loss', 0))):>7.4f} "
+                f"{out.get('match_acc', out.get('seg_acc', 0)):>7.3f} "
                 f"{va:>8.3f} {vc:>7.3f} {chance:>7.3f} {lr:>8.2e}   {'/'.join(f'{vp[s]:.3f}' for s in sorted(vp))}")
         if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
             os.makedirs(cfg.ckpt_dir, exist_ok=True)

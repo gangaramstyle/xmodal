@@ -33,7 +33,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 NAME="v5_${TAG:-both}_s${SEED:-0}"
 .venv/bin/python -u scripts/run_v5.py \
     --batch-size ${BATCH:-224} --n-src 90 --n-anchor 6 --n-tgt 32 --voxels 8 --prisms 32 64 \
-    --prism-patch "${PRISM_PATCH:-}" \
+    --prism-patch "${PRISM_PATCH:-}" --seg-task "${SEG_TASK:-none}" --seg-frac "${SEG_FRAC:-0.1}" \
     --sampler-workers ${WORKERS:-4} --width ${WIDTH:-384} --depth ${DEPTH:-12} --heads ${HEADS:-6} \
     --match-weight ${MATCH_W:-1.0} --mae-weight ${MAE_W:-0.25} --tumor-frac ${TUMOR_FRAC:-0.0} \
     --content-blur ${CBLUR:-1} --seed ${SEED:-0} --steps ${STEPS:-70000} \

@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--mae-weight", type=float, default=0.25, help="pixel MAE weight (0 = ordering-only)")
     ap.add_argument("--tumor-frac", type=float, default=0.0, help="fraction of bags anchored on segmented tissue")
     ap.add_argument("--sampler-workers", type=int, default=0, help="parallel CPU-geometry prefetch workers (0=sync)")
+    ap.add_argument("--seg-task", choices=["none", "ce", "supcon"], default="none", help="aux seg-prediction task")
+    ap.add_argument("--seg-frac", type=float, default=0.1, help="fraction of steps doing the seg task")
     ap.add_argument("--width", type=int, default=384, help="encoder width (384=ViT-small, 768=ViT-base)")
     ap.add_argument("--depth", type=int, default=12, help="encoder depth (transformer blocks)")
     ap.add_argument("--heads", type=int, default=6, help="attention heads (768-wide -> 12)")
@@ -103,6 +105,7 @@ def main():
                         v5_n_src=args.n_src, v5_n_anchor=args.n_anchor, v5_n_tgt=args.n_tgt, v5_voxels=args.voxels,
                         v5_prisms=tuple(args.prisms), v5_prism_patch=_parse_prism_patch(args.prism_patch),
                         tumor_frac=args.tumor_frac, v5_sampler_workers=args.sampler_workers,
+                        v5_seg_task=args.seg_task, v5_seg_frac=args.seg_frac,
                         git_commit=git, git_branch=branch,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | grid {enc.grid} pv {enc.pv} | bs {args.batch_size}", flush=True)
