@@ -39,6 +39,7 @@ def blur_contents(patches, kernel):
     ks = tuple(min(kernel, d) for d in x.shape[2:])   # cap per-dim so 2.5D thin axis (size 1) -> kernel 1
     pad = tuple(k // 2 for k in ks)
     x = F.avg_pool3d(x, kernel_size=ks, stride=1, padding=pad)
+    x = x[(slice(None), slice(None)) + tuple(slice(0, d) for d in patches.shape[2:])]  # even kernels over-produce by 1 -> crop
     return x.reshape(b, q, *patches.shape[2:])
 
 
