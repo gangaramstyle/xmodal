@@ -2,7 +2,15 @@
 """Dense-segmentation eval, tumor-prism-scoped (ORACLE detection). Given a tumor-containing prism, densely
 query the fine-tuned seg decoder at every grid voxel -> per-voxel class -> DSC + NSD for ET/TC/WT vs GT.
 Because we hand it the tumor prism, this isolates segmentation QUALITY from detection -> comparable to the
-BraTS-METS lesion-wise DSC (~0.75 ET at SOTA). Encoder frozen; decoder fine-tuned on dense voxels; GroupKFold-5.
+BraTS-METS lesion-wise DSC (~0.75 ET at SOTA). Encoder frozen; decoder fine-tuned on dense voxels.
+
+Two-stage readout: (1) fine-tune decoder(last N) + seg-token + LINEAR head on scattered voxels; (2) freeze
+that, cache each prism's dense slot embeddings, and train a 3D-CONV SmoothHead on top (spatial prior the
+per-point cross-attn decoder lacks). Reports both heads.
+
+READOUT TRAINING POOL: by default GroupKFold-5 within the held-out test set. With --n-train-patients>0 and
+--train-tracks (e.g. mets_train), the readout instead trains on a large pool of PRETRAIN patients (their
+lesions), with the held-out test IDs excluded by basename, and evaluates on the full held-out set.
 Regions: ET={3}, TC={1,3}(NCR+ET), WT={1,2,3}. Query at --res mm (default 2mm) inside a --prism-mm box.
 """
 from __future__ import annotations
@@ -12,7 +20,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-import nibabel as nib  # noqa: E402
+import nibabel as nib  # noqa: E402,F401
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from xmodal import data as D, model as M, sampling as S  # noqa: E402
@@ -56,12 +64,6 @@ def nsd(pred, gt, coords, tol):
     """Normalized surface distance @ tol mm (brute force over boundary points; prism-sized so cheap)."""
     if pred.sum() == 0 or gt.sum() == 0:
         return None
-    # boundary = points of the mask with a neighbor (within ~res) of the opposite label
-    def surf(mask):
-        c = coords[mask]
-        if len(c) == 0:
-            return c
-        return c                                                                # prism is small -> use all mask pts as surface proxy
     pc, gc = coords[pred], coords[gt]
     if len(pc) == 0 or len(gc) == 0:
         return None
@@ -73,63 +75,88 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoints", nargs="+", required=True)
     ap.add_argument("--data-root", default="/tmp/ho"); ap.add_argument("--tracks", nargs="+", default=["mets_ho"])
-    ap.add_argument("--n-patients", type=int, default=40); ap.add_argument("--n-prisms", type=int, default=8)
+    ap.add_argument("--n-patients", type=int, default=51, help="held-out TEST patients"); ap.add_argument("--n-prisms", type=int, default=8)
+    # --- readout TRAIN pool: large pretrain-patient set (test IDs excluded). Empty -> GroupKFold within test. ---
+    ap.add_argument("--train-root", default="~/xmodal/data/brats26")
+    ap.add_argument("--train-tracks", nargs="+", default=[], help="tracks for readout TRAIN pool, e.g. mets_train")
+    ap.add_argument("--n-train-patients", type=int, default=0, help=">0 -> train readout on this many pretrain patients (test IDs excluded); 0 -> 5-fold within test")
+    ap.add_argument("--n-train-prisms", type=int, default=4)
     ap.add_argument("--n-src", type=int, default=96); ap.add_argument("--voxels", type=int, default=8)
     ap.add_argument("--size", type=float, default=4.0, help="source patch mm"); ap.add_argument("--prism-mm", type=float, default=32.0)
     ap.add_argument("--res", type=float, default=2.0, help="dense query grid STRIDE mm (metric resolution)")
-    ap.add_argument("--qsize", type=float, default=4.0, help="query SIZE embedding mm (keep in-distribution w/ pretrain patch size, independent of stride)")
+    ap.add_argument("--qsize", type=float, default=4.0, help="query SIZE embedding mm (in-distribution w/ pretrain patch size, independent of stride)")
     ap.add_argument("--tol", type=float, default=2.0, help="NSD tolerance mm")
     ap.add_argument("--epochs", type=int, default=30, help="stage-1 decoder fine-tune epochs"); ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--epochs2", type=int, default=60, help="stage-2 conv-smoothing epochs (on cached embeddings, cheap)")
-    ap.add_argument("--tgt-train", type=int, default=384, help="voxels/prism for fine-tune (linear head)"); ap.add_argument("--chunk", type=int, default=8)
-    ap.add_argument("--head", choices=["conv", "linear"], default="conv", help="conv=3D smoothing head over grid (spatial prior); linear=independent per-voxel")
+    ap.add_argument("--tgt-train", type=int, default=384, help="voxels/prism for stage-1 (linear) fine-tune"); ap.add_argument("--chunk", type=int, default=8)
+    ap.add_argument("--head", choices=["conv", "linear"], default="conv", help="conv=3D smoothing head (spatial prior); linear=stage-1 only")
     ap.add_argument("--block", type=int, default=11, help="contiguous grid sub-block side for conv-head training (voxels)")
     ap.add_argument("--unfreeze", type=int, default=12); ap.add_argument("--enc-width", type=int, default=384); ap.add_argument("--enc-heads", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     dev = a.device; V = a.voxels; unit = S._cube_unit(V, dev); rng = np.random.default_rng(a.seed)
 
-    dirs = []
-    for tr in a.tracks:
-        dirs += sorted(glob.glob(os.path.join(os.path.expanduser(a.data_root), tr, "BraTS-*")))
-    prisms = []; pid_ctr = 0
-    for d in dirs:
-        if pid_ctr >= a.n_patients:
-            break
-        pid = os.path.basename(d); segp = glob.glob(f"{d}/{pid}-seg.nii.gz")
-        if not segp:
-            continue
-        try:
-            b = D.load_local_bundle(pid, d, device=dev, with_seg=True)[0]
-        except Exception:
-            continue
-        sc0 = b["t1c"]; tmm = sc0.tumor_np
-        if tmm is None or len(tmm) == 0:
-            continue
-        fgn = sc0.foreground_np if sc0.foreground_np is not None else sc0.foreground_mm.cpu().numpy()
-        half = a.prism_mm / 2.0
-        lin = np.arange(-half, half + 1e-3, a.res, dtype=np.float32)             # dense grid offsets (mm)
-        gdim = len(lin)                                                          # grid side (reshape [G^3,.]->[G,G,G,.])
-        gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij"); grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
-        for _ in range(a.n_prisms):
-            anch = tmm[rng.integers(len(tmm))].astype(np.float32)                # anchor ON a tumor voxel
-            gpts = (grid + anch).astype(np.float32)                             # dense query voxels (world-mm)
-            cm = fgn[np.abs(fgn - anch).max(-1) <= half]                        # foreground INSIDE the prism
-            if len(cm) < a.n_src // 2:
+    def build_prisms(dirs, npat, nprism, exclude, label):
+        """Build tumor-anchored dense prisms from up to npat patients in dirs (skip exclude ids / no-seg / no-tumor)."""
+        out = []; ctr = 0
+        for d in dirs:
+            if ctr >= npat:
+                break
+            pid = os.path.basename(d)
+            if exclude and pid in exclude:
                 continue
-            cs = cm[rng.integers(len(cm), size=a.n_src)].astype(np.float32)      # source context sampled inside the prism
-            sm = rng.integers(4, size=a.n_src)
-            sp = np.zeros((a.n_src, V, V, V), np.float16)
-            for mi, m in enumerate(MODS):
-                sel = np.nonzero(sm == mi)[0]
-                if sel.size:
-                    sp[sel] = S._gather_cubes(b[m], torch.as_tensor(cs[sel], device=dev),
-                                              torch.full((sel.size,), a.size, device=dev), unit, dev).half().cpu().numpy()
-            gt = seg_at(sc0, torch.as_tensor(gpts, device=dev), dev).cpu().numpy()   # class per query voxel
-            prisms.append(dict(sp=sp, sc=cs - anch, sm=sm, gpts=gpts - anch, gt=gt, gdim=gdim, pid=pid_ctr))
-        pid_ctr += 1; del b; torch.cuda.empty_cache()
-    print(f"built {len(prisms)} tumor prisms over {pid_ctr} patients (res={a.res}mm grid ~{len(grid)} vox/prism, head={a.head})", flush=True)
-    assert prisms
+            segp = glob.glob(f"{d}/{pid}-seg.nii.gz")
+            if not segp:
+                continue
+            try:
+                b = D.load_local_bundle(pid, d, device=dev, with_seg=True)[0]
+            except Exception:
+                continue
+            sc0 = b["t1c"]; tmm = sc0.tumor_np
+            if tmm is None or len(tmm) == 0:
+                continue
+            fgn = sc0.foreground_np if sc0.foreground_np is not None else sc0.foreground_mm.cpu().numpy()
+            half = a.prism_mm / 2.0
+            lin = np.arange(-half, half + 1e-3, a.res, dtype=np.float32)         # dense grid offsets (mm)
+            gdim = len(lin)                                                      # grid side (reshape [G^3,.]->[G,G,G,.])
+            gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij"); grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
+            for _ in range(nprism):
+                anch = tmm[rng.integers(len(tmm))].astype(np.float32)            # anchor ON a tumor voxel
+                gpts = (grid + anch).astype(np.float32)                         # dense query voxels (world-mm)
+                cm = fgn[np.abs(fgn - anch).max(-1) <= half]                    # foreground INSIDE the prism
+                if len(cm) < a.n_src // 2:
+                    continue
+                cs = cm[rng.integers(len(cm), size=a.n_src)].astype(np.float32)  # source context sampled inside the prism
+                sm = rng.integers(4, size=a.n_src)
+                sp = np.zeros((a.n_src, V, V, V), np.float16)
+                for mi, m in enumerate(MODS):
+                    sel = np.nonzero(sm == mi)[0]
+                    if sel.size:
+                        sp[sel] = S._gather_cubes(b[m], torch.as_tensor(cs[sel], device=dev),
+                                                  torch.full((sel.size,), a.size, device=dev), unit, dev).half().cpu().numpy()
+                gt = seg_at(sc0, torch.as_tensor(gpts, device=dev), dev).cpu().numpy()   # class per query voxel
+                out.append(dict(sp=sp, sc=cs - anch, sm=sm, gpts=gpts - anch, gt=gt, gdim=gdim, pid=ctr))
+            ctr += 1; del b; torch.cuda.empty_cache()
+        print(f"built {len(out)} {label} prisms over {ctr} patients (res={a.res}mm grid, head={a.head})", flush=True)
+        return out
+
+    # ---- test pool (held-out) + optional large pretrain train pool ----
+    test_dirs = []
+    for tr in a.tracks:
+        test_dirs += sorted(glob.glob(os.path.join(os.path.expanduser(a.data_root), tr, "BraTS-*")))
+    test_ids = {os.path.basename(d) for d in test_dirs}
+    test_prisms = build_prisms(test_dirs, a.n_patients, a.n_prisms, None, "TEST")
+    assert test_prisms
+    train_prisms = None
+    if a.n_train_patients > 0 and a.train_tracks:
+        tr_dirs = []
+        for tr in a.train_tracks:
+            tr_dirs += sorted(glob.glob(os.path.join(os.path.expanduser(a.train_root), tr, "BraTS-*")))
+        tr_dirs = list(tr_dirs); rng.shuffle(tr_dirs)                           # representative sample across the pool
+        n_excl = sum(1 for d in tr_dirs if os.path.basename(d) in test_ids)
+        print(f"train pool {a.train_tracks}: {len(tr_dirs)} dirs, excluding {n_excl} held-out test IDs", flush=True)
+        train_prisms = build_prisms(tr_dirs, a.n_train_patients, a.n_train_prisms, test_ids, "TRAIN")
+        assert train_prisms
 
     def slots(E, seg_tok, sp, sc, sm, qpts):                                    # frozen-enc source -> decode dense queries
         nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
@@ -139,13 +166,12 @@ def main():
         q = (E.query_seed[None, None, :] + E._size_emb(zt) + seg_tok[None, None, :]).contiguous()
         return E._decode(q, ctx, cc, qpts)
 
-    def dense_slots(E, seg_tok, pr, grad=False):                               # decode EVERY grid voxel -> [G^3, W]
+    def dense_slots(E, seg_tok, pr):                                            # decode EVERY grid voxel -> [G^3, W]
         sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
         sm = torch.as_tensor(pr["sm"][None], device=dev).long(); coords = torch.as_tensor(pr["gpts"], device=dev).float()
-        ctx = torch.enable_grad() if grad else torch.no_grad()
-        with ctx:
+        with torch.no_grad():
             sl = [slots(E, seg_tok, sp, sc, sm, coords[c0:c0 + 4096][None])[0] for c0 in range(0, coords.shape[0], 4096)]
-        return torch.cat(sl), coords                                           # [G^3, W], [G^3, 3]
+        return torch.cat(sl)                                                    # [G^3, W]
 
     def grid_logits(head, sl, G):                                              # [G^3,W] -> conv over volume -> [G^3,4]
         vol = sl.reshape(G, G, G, -1).permute(3, 0, 1, 2)[None]                # [1,W,G,G,G]
@@ -165,60 +191,63 @@ def main():
                         aggn[r].append(nv)
         return {r: (float(np.mean(agg[r])) if agg[r] else 0, float(np.mean(aggn[r])) if aggn[r] else 0, len(agg[r])) for r in REGIONS}
 
-    def run(E):
-        pids = sorted(set(p["pid"] for p in prisms)); fold = {p: i % 5 for i, p in enumerate(pids)}
-        lin_preds = []; conv_preds = []
-        for f in range(5):
-            tr = [p for p in prisms if fold[p["pid"]] != f]; te = [p for p in prisms if fold[p["pid"]] == f]
-            # ---- Stage 1: fine-tune decoder(last N) + seg_tok + linear head on scattered voxels (as before) ----
-            seg_tok = torch.zeros(E.cfg.width, device=dev, requires_grad=True)
-            lin = torch.nn.Linear(E.cfg.width, 4).to(dev)
-            dec_blocks = list(E.decoder)[-a.unfreeze:]
-            params = list(lin.parameters()) + [seg_tok, E.query_seed]
-            for blk in dec_blocks:
-                for p in blk.parameters():
-                    p.requires_grad_(True); params.append(p)
-            opt = torch.optim.Adam(params, lr=a.lr)
-            for _ in range(a.epochs):
-                for pr in [tr[i] for i in rng.permutation(len(tr))]:
-                    sub = rng.integers(len(pr["gt"]), size=a.tgt_train)
-                    sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
-                    sm = torch.as_tensor(pr["sm"][None], device=dev).long(); qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
-                    y = torch.as_tensor(pr["gt"][sub], device=dev).long()
+    def fit_eval(E, tr, te):
+        """Stage-1 (decoder+seg_tok+linear on scattered voxels) -> freeze+cache embeddings -> stage-2 conv.
+        Returns (linear_preds, conv_preds) on te as lists of (pred_class, gt_class, coords)."""
+        seg_tok = torch.zeros(E.cfg.width, device=dev, requires_grad=True)
+        lin = torch.nn.Linear(E.cfg.width, 4).to(dev)
+        dec_blocks = list(E.decoder)[-a.unfreeze:]
+        params = list(lin.parameters()) + [seg_tok, E.query_seed]
+        for blk in dec_blocks:
+            for p in blk.parameters():
+                p.requires_grad_(True); params.append(p)
+        opt = torch.optim.Adam(params, lr=a.lr)
+        for _ in range(a.epochs):                                              # ---- Stage 1 ----
+            for pr in [tr[i] for i in rng.permutation(len(tr))]:
+                sub = rng.integers(len(pr["gt"]), size=a.tgt_train)
+                sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
+                sm = torch.as_tensor(pr["sm"][None], device=dev).long(); qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
+                y = torch.as_tensor(pr["gt"][sub], device=dev).long()
+                cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
+                logit = lin(slots(E, seg_tok, sp, sc, sm, qp)).reshape(-1, 4)
+                opt.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt.step()
+        seg_tok.requires_grad_(False); E.query_seed.requires_grad_(False)      # freeze all of stage 1
+        for m in [lin, *dec_blocks]:
+            for p in m.parameters():
+                p.requires_grad_(False)
+        emb_tr = [dense_slots(E, seg_tok, pr).half().cpu() for pr in tr]        # train cache on CPU (pool can be large)
+        emb_te = [dense_slots(E, seg_tok, pr).half() for pr in te]             # test cache on GPU
+        conv = None
+        if a.head == "conv":                                                   # ---- Stage 2 ----
+            conv = SmoothHead(E.cfg.width).to(dev); opt2 = torch.optim.Adam(conv.parameters(), lr=a.lr)
+            for _ in range(a.epochs2):
+                for i in rng.permutation(len(tr)):
+                    pr = tr[i]; G = pr["gdim"]; b = min(a.block, G); o = rng.integers(0, G - b + 1, size=3)
+                    ev = emb_tr[i].reshape(G, G, G, -1)[o[0]:o[0] + b, o[1]:o[1] + b, o[2]:o[2] + b].to(dev).float()  # [b,b,b,W]
+                    y = torch.as_tensor(pr["gt"].reshape(G, G, G)[o[0]:o[0] + b, o[1]:o[1] + b, o[2]:o[2] + b].reshape(-1), device=dev).long()
+                    logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
                     cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
-                    logit = lin(slots(E, seg_tok, sp, sc, sm, qp)).reshape(-1, 4)
-                    opt.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt.step()
-            # ---- freeze all of stage 1; cache the (now fixed) dense slot embeddings per prism ----
-            seg_tok.requires_grad_(False); E.query_seed.requires_grad_(False)
-            for m in [lin, *dec_blocks]:
-                for p in m.parameters():
-                    p.requires_grad_(False)
-            cache = te if a.head == "linear" else tr + te
-            emb = {}
-            for pr in cache:
-                emb[id(pr)] = dense_slots(E, seg_tok, pr)[0].half()             # [G^3, W] fp16
-            # ---- Stage 2: train conv SmoothHead ON TOP of frozen embeddings (grid sub-blocks) ----
-            conv = None
-            if a.head == "conv":
-                conv = SmoothHead(E.cfg.width).to(dev)
-                opt2 = torch.optim.Adam(conv.parameters(), lr=a.lr)
-                for _ in range(a.epochs2):
-                    for pr in [tr[i] for i in rng.permutation(len(tr))]:
-                        G = pr["gdim"]; b = min(a.block, G); o = rng.integers(0, G - b + 1, size=3)
-                        ev = emb[id(pr)].float().reshape(G, G, G, -1)[o[0]:o[0] + b, o[1]:o[1] + b, o[2]:o[2] + b]  # [b,b,b,W]
-                        y = torch.as_tensor(pr["gt"].reshape(G, G, G)[o[0]:o[0] + b, o[1]:o[1] + b, o[2]:o[2] + b].reshape(-1), device=dev).long()
-                        logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
-                        cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
-                        opt2.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt2.step()
-            # ---- eval both heads on the held-out fold ----
-            with torch.no_grad():
-                for pr in te:
-                    e = emb[id(pr)].float(); gtc = torch.as_tensor(pr["gt"], device=dev).long()
-                    coords = torch.as_tensor(pr["gpts"], device=dev).float()
-                    lin_preds.append((lin(e).argmax(1), gtc, coords))
-                    if conv is not None:
-                        conv_preds.append((grid_logits(conv, e, pr["gdim"]).argmax(1), gtc, coords))
-        return score(lin_preds), (score(conv_preds) if conv_preds else None)
+                    opt2.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt2.step()
+        lp = []; cp = []                                                       # ---- eval both heads ----
+        with torch.no_grad():
+            for j, pr in enumerate(te):
+                e = emb_te[j].float(); G = pr["gdim"]
+                gtc = torch.as_tensor(pr["gt"], device=dev).long(); coords = torch.as_tensor(pr["gpts"], device=dev).float()
+                lp.append((lin(e).argmax(1), gtc, coords))
+                if conv is not None:
+                    cp.append((grid_logits(conv, e, G).argmax(1), gtc, coords))
+        return lp, cp
+
+    def run(E):
+        if train_prisms is not None:                                           # pretrain-pool mode: train->pool, test->held-out
+            lp, cp = fit_eval(E, train_prisms, test_prisms)
+        else:                                                                  # GroupKFold-5 within the held-out test set
+            pids = sorted(set(p["pid"] for p in test_prisms)); fold = {p: i % 5 for i, p in enumerate(pids)}
+            lp = []; cp = []
+            for f in range(5):
+                tr = [p for p in test_prisms if fold[p["pid"]] != f]; te = [p for p in test_prisms if fold[p["pid"]] == f]
+                a2, b2 = fit_eval(E, tr, te); lp += a2; cp += b2
+        return score(lp), (score(cp) if cp else None)
 
     for spec in a.checkpoints:
         nm, path = spec.split("=", 1); g = sorted(glob.glob(path))
@@ -231,7 +260,8 @@ def main():
         for p in E.parameters():
             p.requires_grad_(False)
         rl, rc = run(E)
-        tag = f"{nm} step{step} denseseg qsize{a.qsize}mm/stride{a.res}mm"
+        pool = f"train{len(train_prisms)}p" if train_prisms is not None else "kfold5"
+        tag = f"{nm} step{step} denseseg[{pool}] qsize{a.qsize}mm/stride{a.res}mm"
         print(f"{tag} [stage1 linear]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rl.items()), flush=True)
         if rc is not None:
             print(f"{tag} [stage2 conv-smooth]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rc.items()), flush=True)

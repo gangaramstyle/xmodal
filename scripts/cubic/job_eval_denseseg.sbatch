@@ -36,9 +36,13 @@ for arm in $ARMS; do
   ls runs/$arm/step_*.pt >/dev/null 2>&1 && CK+=("${arm}=runs/${arm}/step_*.pt")
 done
 echo "dense-seg (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) over: $ARMS"
+POOL=()
+[ -n "${TRAIN_TRACKS:-}" ] && POOL+=(--train-tracks ${TRAIN_TRACKS} --n-train-patients "${NTRAIN:-600}" --n-train-prisms "${NTRAINP:-4}")
 .venv/bin/python -u scripts/eval_denseseg.py --data-root /tmp/ho --tracks mets_ho --device cuda \
     --unfreeze "${UNFREEZE:-12}" --res "${RES:-2}" --qsize "${QSIZE:-4}" \
     --head "${HEAD:-conv}" --block "${BLOCK:-11}" \
+    --train-root "${TRAIN_ROOT:-~/xmodal/data/brats26}" ${POOL[@]+"${POOL[@]}"} \
+    --epochs "${EPOCHS:-30}" --epochs2 "${EPOCHS2:-60}" \
     --enc-width "${EWIDTH:-384}" --enc-heads "${EHEADS:-6}" \
     --checkpoints "${CK[@]}"
 echo "=== eval_denseseg done (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) ==="
