@@ -567,6 +567,20 @@ def _h2d(x, device):
     return t.to(device)
 
 
+def _fps_pick(points, k, rng):
+    """Farthest-point sampling: k evenly-spread indices (grid-like coverage). vs random choice, which
+    clumps. Used by the bag-size/spacing ablation (source patches 'spaced evenly')."""
+    K = len(points)
+    if K <= k:
+        pad = rng.integers(K, size=k - K) if k > K else np.empty(0, np.int64)
+        return np.concatenate([np.arange(K), pad]).astype(np.int64)
+    sel = [int(rng.integers(K))]; d = np.full(K, np.inf, np.float64)
+    for _ in range(k - 1):
+        d = np.minimum(d, ((points - points[sel[-1]]) ** 2).sum(-1))
+        sel.append(int(d.argmax()))
+    return np.asarray(sel, np.int64)
+
+
 def _cube_unit(V, device):
     return patch_offsets_tensor(cube_spec(1.0, V), thick_axis=0, device=device)   # [V,V,V,3] unit cube
 
@@ -580,7 +594,7 @@ def _gather_cubes(scan, centers, sizes, unit, device):
 
 
 def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
-                 prism_patch=None, voxels=8, rng, tumor_frac=0.0):
+                 prism_patch=None, voxels=8, rng, tumor_frac=0.0, src_spacing="random"):
     """PURE-CPU geometry stage of v5 sampling (no GPU ops -> thread-safe & parallelizable for prefetch).
     Builds per-item coords/sizes/series + a scan-sorted gather PLAN (numpy). Returns a dict consumed by
     _v5_gather on the main thread. See sample_v5_batch for the task semantics."""
@@ -662,7 +676,10 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
             local = cfg[masks[j]]
             K = len(local)
             D = int(rng.integers(4)); ctx = np.array([m2 for m2 in range(4) if m2 != D], dtype=np.int64)
-            src_pos = local[rng.choice(K, size=n_src, replace=(K < n_src))]
+            if src_spacing == "grid":
+                src_pos = local[_fps_pick(local, n_src, rng)]                       # evenly-spread source (ablation)
+            else:
+                src_pos = local[rng.choice(K, size=n_src, replace=(K < n_src))]
             src_mod = ctx[rng.integers(3, size=n_src)]                              # random A/B/C per source patch
             anc_pos = local[rng.choice(K, size=n_anchor, replace=(K < n_anchor))]
             tgt_pos = local[_v5_pick_np(local, n_tgt, ps, rng)]
@@ -713,7 +730,7 @@ def _v5_gather(geom, device):
 
 
 def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
-                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0):
+                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0, src_spacing="random"):
     """Per item: pick a target modality D; the source bag = `n_src` patches of the OTHER 3 modalities
     (random position+modality) + `n_anchor` D anchors; the targets = `n_tgt` held D patches to ORDER.
     Cube patches (voxels^3), prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common
@@ -722,7 +739,7 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
     sizes_src/tgt [B,*,3]. (CPU geometry + GPU gather; see _v5_geometry/_v5_gather for the prefetch split.)"""
     geom = _v5_geometry(bundles, batch_size=batch_size, n_src=n_src, n_anchor=n_anchor, n_tgt=n_tgt,
                         prism_choices=prism_choices, prism_patch=prism_patch, voxels=voxels, rng=rng,
-                        tumor_frac=tumor_frac)
+                        tumor_frac=tumor_frac, src_spacing=src_spacing)
     return _v5_gather(geom, device)
 
 
