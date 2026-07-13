@@ -92,14 +92,10 @@ def main():
         for _ in range(a.n_prisms):
             anch = tmm[rng.integers(len(tmm))].astype(np.float32)                # anchor ON a tumor voxel
             gpts = (grid + anch).astype(np.float32)                             # dense query voxels (world-mm)
-            cs = fgn[rng.integers(len(fgn), size=a.n_src)].astype(np.float32)   # source context near the prism
-            keep = np.abs(cs - anch).max(-1) <= half
-            if keep.sum() < a.n_src // 2:
+            cm = fgn[np.abs(fgn - anch).max(-1) <= half]                        # foreground INSIDE the prism
+            if len(cm) < a.n_src // 2:
                 continue
-            cm = fgn[np.abs(fgn - anch).max(-1) <= half]
-            if len(cm) < 8:
-                continue
-            cs = cm[rng.integers(len(cm), size=a.n_src)].astype(np.float32)
+            cs = cm[rng.integers(len(cm), size=a.n_src)].astype(np.float32)      # source context sampled inside the prism
             sm = rng.integers(4, size=a.n_src)
             sp = np.zeros((a.n_src, V, V, V), np.float16)
             for mi, m in enumerate(MODS):
