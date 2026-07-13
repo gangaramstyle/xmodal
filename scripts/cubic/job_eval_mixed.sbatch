@@ -21,13 +21,10 @@ git checkout -q main && git pull -q || true
 nvidia-smi --query-gpu=name --format=csv,noheader
 
 # pull the 51-METS held-out set from wandb, extract
-.venv/bin/python - <<'PY'
-import wandb, os, tarfile, glob
-p = wandb.Api().artifact("vineeth-gangaram-penn/xmodal-phased/heldout-mets-51:v0").download("/tmp/ho_art")
-os.makedirs("/tmp/ho", exist_ok=True)
-tarfile.open(glob.glob("/tmp/ho_art/*.tar")[0]).extractall("/tmp/ho")
-print("extracted ->", os.listdir("/tmp/ho"))
-PY
+# Reconstruct the held-out METS set from disk via the deterministic hash split (no wandb; the old
+# xmodal-phased/heldout-mets-51 artifact was deleted). Provably disjoint from pretraining (see make_heldout_local.py).
+.venv/bin/python scripts/make_heldout_local.py /tmp/ho/mets_ho data/brats26/mets_train
+[ -d /tmp/ho/mets_ho ] && [ -n "$(ls -A /tmp/ho/mets_ho 2>/dev/null)" ] || { echo "FATAL: held-out reconstruction failed"; exit 1; }
 
 # --mixed: correct readout for the series-conditioned encoders (builds the cache once)
 .venv/bin/python -u scripts/eval_battery.py \

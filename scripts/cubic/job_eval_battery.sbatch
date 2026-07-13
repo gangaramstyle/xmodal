@@ -21,15 +21,10 @@ nvidia-smi --query-gpu=name --format=csv,noheader
 # (readout is now GPU torch logistic regression -- no sklearn dependency)
 
 # pull the 51-METS held-out set (same set the molab baselines used) from wandb, extract
-.venv/bin/python - <<'PY'
-import wandb, os
-p = wandb.Api().artifact("vineeth-gangaram-penn/xmodal-phased/heldout-mets-51:v0").download("/tmp/ho_art")
-import tarfile, glob
-tar = glob.glob("/tmp/ho_art/*.tar")[0]
-os.makedirs("/tmp/ho", exist_ok=True)
-tarfile.open(tar).extractall("/tmp/ho")
-print("extracted heldout ->", os.listdir("/tmp/ho"))
-PY
+# Reconstruct the held-out METS set from disk via the deterministic hash split (no wandb; the old
+# xmodal-phased/heldout-mets-51 artifact was deleted). Provably disjoint from pretraining (see make_heldout_local.py).
+.venv/bin/python scripts/make_heldout_local.py /tmp/ho/mets_ho data/brats26/mets_train
+[ -d /tmp/ho/mets_ho ] && [ -n "$(ls -A /tmp/ho/mets_ho 2>/dev/null)" ] || { echo "FATAL: held-out reconstruction failed"; exit 1; }
 
 .venv/bin/python -u scripts/eval_battery.py \
     --data-root /tmp/ho --tracks mets_ho --build --device cuda \
