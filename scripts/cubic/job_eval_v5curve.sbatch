@@ -33,10 +33,14 @@ PY
 
 # enumerate EVERY checkpoint of each arm as its own name=path (full curve)
 ARMS="${ARMS:-v5_both_tumor_s0 v5_both_s0 v5_mae_tumor_s0}"
+STRIDE="${STRIDE:-1}"                       # take every Nth checkpoint (sparse curve for a quick trend)
 CK=()
 for arm in $ARMS; do
+  i=0
   for f in runs/$arm/step_*.pt; do
-    [ -e "$f" ] && CK+=("${arm}@$(basename "$f" .pt)=$f")
+    [ -e "$f" ] || continue
+    [ $((i % STRIDE)) -eq 0 ] && CK+=("${arm}@$(basename "$f" .pt)=$f")
+    i=$((i+1))
   done
 done
 echo "evaluating ${#CK[@]} checkpoints across arms: $ARMS"
