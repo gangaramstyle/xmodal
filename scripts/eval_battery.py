@@ -43,7 +43,8 @@ def main():
     dev = a.device
     if a.build or not os.path.exists(a.cache):
         print("building cache (sampling=%s cube=%d prism_mm=%g)..." % (a.sampling, a.cube, a.prism_mm), flush=True)
-        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube, sampling=a.sampling, prism_mm=a.prism_mm)
+        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube, sampling=a.sampling, prism_mm=a.prism_mm,
+                        sizes=sorted({a.readout_size, 4, 8}) if a.cube else None)   # include the requested readout size (e.g. 2,3mm)
     Z = np.load(a.cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
     bags = Z["prisms"].astype(int) if "prisms" in Z else groups      # encode per-prism bag (whole-brain: bag==patient)
     cube = int(a.cube or (int(Z["cube"]) if "cube" in Z else 0))     # cache remembers its geometry

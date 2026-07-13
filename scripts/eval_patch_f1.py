@@ -97,7 +97,7 @@ class _TorchLogReg:
 
 def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", cube=0,
                 sampling="random", grid_step=8.0, grid_cap=6000,
-                n_prisms=24, per_prism=96, prism_tumor=0.7, prism_mm=64.0):
+                n_prisms=24, per_prism=96, prism_tumor=0.7, prism_mm=64.0, sizes=None):
     """Whole-brain modes (readout = one big per-PATIENT bag): sampling='random' (K sparse foreground
     centers, patient-centered coords) or 'grid' (dense lattice, full coverage). Prism modes (readout =
     per-PRISM bags ~per_prism patches, matching training's ~96-patch context; tumor-enriched for label
@@ -105,7 +105,7 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", c
     'prism_grid' (FPS-even-in-prism). cube=V -> 3D cubes (V^3) at v5 sizes; labels = 4mm seg footprint."""
     torch.manual_seed(seed); rng = np.random.default_rng(seed)
     prism_mode = sampling.startswith("prism")
-    sizes = [4, 8] if cube else SIZES
+    sizes = sizes if sizes is not None else ([4, 8] if cube else SIZES)
     dirs = []
     for tr in tracks:
         dirs += sorted(glob.glob(os.path.join(os.path.expanduser(data_root), tr, "BraTS-*")))
