@@ -44,9 +44,10 @@ echo "evaluating ${#CK[@]} checkpoints across arms: $ARMS"
 
 # --cube 8 builds the cube cache once (first ckpt), then reuses it; --mixed auto-on for cube.
 # SAMPLING=random (train-like sparse) or grid (dense full coverage) -> the train->eval domain-gap test.
-SAMPLING="${SAMPLING:-random}"; PROBE="${PROBE:-linear}"
+SAMPLING="${SAMPLING:-random}"; PROBE="${PROBE:-linear}"; RSIZE="${RSIZE:-8}"; PRISM_MM="${PRISM_MM:-64}"
 .venv/bin/python -u scripts/eval_battery.py \
-    --data-root /tmp/ho --tracks mets_ho --build --cube 8 --sampling "$SAMPLING" --probe "$PROBE" --device cuda \
-    --cache "/tmp/patchcache_v5cube_${SAMPLING}.npz" \
+    --data-root /tmp/ho --tracks mets_ho --build --cube 8 --sampling "$SAMPLING" --probe "$PROBE" \
+    --readout-size "$RSIZE" --prism-mm "$PRISM_MM" --device cuda \
+    --cache "/tmp/patchcache_v5cube_${SAMPLING}_p${PRISM_MM}.npz" \
     --checkpoints "${CK[@]}"
-echo "=== eval_v5curve done (sampling=$SAMPLING probe=$PROBE) ==="
+echo "=== eval_v5curve done (sampling=$SAMPLING probe=$PROBE readout=${RSIZE}mm prism=${PRISM_MM}mm) ==="

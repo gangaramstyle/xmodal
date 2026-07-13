@@ -35,11 +35,13 @@ def main():
     ap.add_argument("--probe", choices=["linear", "mlp"], default="linear",
                     help="readout head: linear logreg (~0.75-comparable) or 1-hidden-layer MLP.")
     ap.add_argument("--probe-hidden", type=int, default=256, help="MLP hidden width (--probe mlp).")
+    ap.add_argument("--readout-size", type=int, default=8, help="patch size (mm) to read out (cache stores 4 & 8).")
+    ap.add_argument("--prism-mm", type=float, default=64.0, help="prism size for prism modes (4mm patch trained in 32mm prisms).")
     a = ap.parse_args()
     dev = a.device
     if a.build or not os.path.exists(a.cache):
-        print("building cache (sampling=%s cube=%d)..." % (a.sampling, a.cube), flush=True)
-        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube, sampling=a.sampling)
+        print("building cache (sampling=%s cube=%d prism_mm=%g)..." % (a.sampling, a.cube, a.prism_mm), flush=True)
+        EPF.build_cache(a.data_root, a.tracks, a.cache, device=dev, cube=a.cube, sampling=a.sampling, prism_mm=a.prism_mm)
     Z = np.load(a.cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
     bags = Z["prisms"].astype(int) if "prisms" in Z else groups      # encode per-prism bag (whole-brain: bag==patient)
     cube = int(a.cube or (int(Z["cube"]) if "cube" in Z else 0))     # cache remembers its geometry
@@ -86,7 +88,7 @@ def main():
                                patch_grid=(cube, cube, cube) if cube else None)
         E = M.Phase0Encoder(ecfg).to(dev)
         E.load_state_dict(ck["model"], strict=False); E.eval()
-        s = 8; W = ecfg.width                                        # 8mm patch (v5 trained 4&8mm cubes)
+        s = a.readout_size; W = ecfg.width                           # 4 or 8mm patch (v5 trained both)
         bag_ids = sorted(set(bags.tolist())); bidx = {g: np.where(bags == g)[0] for g in bag_ids}
         by_size = {}                                                 # batch equal-size bags together (prism: 1224x96 -> few big encodes)
         for g in bag_ids:
