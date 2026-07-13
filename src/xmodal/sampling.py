@@ -599,6 +599,7 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
     Builds per-item coords/sizes/series + a scan-sorted gather PLAN (numpy). Returns a dict consumed by
     _v5_gather on the main thread. See sample_v5_batch for the task semantics."""
     prism_patch = prism_patch or {32.0: 4.0, 64.0: 8.0}
+    prism_patch = {float(k): (list(v) if hasattr(v, "__len__") else [float(v)]) for k, v in prism_patch.items()}
     P, V, nS = n_tgt, voxels, n_src + n_anchor
     req = {0, 1, 2, 3}
     elig = [b for b in bundles if req.issubset({sc.series_idx for sc in b.values()})]
@@ -639,7 +640,7 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
         G = len(items)
         pr_idx = rng.integers(len(prism_choices), size=G)
         prisms = np.asarray(prism_choices, np.float32)[pr_idx]; halfs = prisms / 2.0
-        pss = np.array([prism_patch[float(p)] for p in prisms], np.float32)
+        pss = np.array([rng.choice(prism_patch[float(p)]) for p in prisms], np.float32)  # size per item (32mm->{2,3,4})
         can_tumor = tumor_frac > 0 and tmm is not None
         use_t = (rng.random(G) < tumor_frac) if can_tumor else np.zeros(G, bool)
         # initial anchors [G,3]: tumor items = tumor voxel + in-prism offset; else a foreground point

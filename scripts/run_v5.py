@@ -15,6 +15,17 @@ import torch  # noqa: E402
 from xmodal import data as D, holdout as H, model as M, train as T  # noqa: E402
 
 
+def _parse_prism_patch(spec):
+    """'32:2,3,4;64:8' -> {32.0:[2.,3.,4.], 64.0:[8.]}; None -> None (sampler default {32:[4],64:[8]})."""
+    if not spec:
+        return None
+    out = {}
+    for part in spec.split(";"):
+        pr, sizes = part.split(":")
+        out[float(pr)] = [float(s) for s in sizes.split(",")]
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", default="~/xmodal/data/brats26")
@@ -31,6 +42,8 @@ def main():
     ap.add_argument("--n-tgt", type=int, default=32)
     ap.add_argument("--voxels", type=int, default=8, help="cube sample grid (voxels^3)")
     ap.add_argument("--prisms", type=float, nargs="+", default=[32., 64.])
+    ap.add_argument("--prism-patch", default=None,
+                    help="patch sizes per prism, e.g. '32:2,3,4;64:8' (default 32->4, 64->8). Enables multi-scale.")
     ap.add_argument("--match-weight", type=float, default=1.0, help="ordering loss weight (0 = MAE-only)")
     ap.add_argument("--mae-weight", type=float, default=0.25, help="pixel MAE weight (0 = ordering-only)")
     ap.add_argument("--tumor-frac", type=float, default=0.0, help="fraction of bags anchored on segmented tissue")
@@ -88,7 +101,8 @@ def main():
                         compile=not args.no_compile, content_blur=args.content_blur,
                         mae_weight=args.mae_weight, match_weight=args.match_weight,
                         v5_n_src=args.n_src, v5_n_anchor=args.n_anchor, v5_n_tgt=args.n_tgt, v5_voxels=args.voxels,
-                        v5_prisms=tuple(args.prisms), tumor_frac=args.tumor_frac, v5_sampler_workers=args.sampler_workers,
+                        v5_prisms=tuple(args.prisms), v5_prism_patch=_parse_prism_patch(args.prism_patch),
+                        tumor_frac=args.tumor_frac, v5_sampler_workers=args.sampler_workers,
                         git_commit=git, git_branch=branch,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | grid {enc.grid} pv {enc.pv} | bs {args.batch_size}", flush=True)

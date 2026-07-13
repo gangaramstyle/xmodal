@@ -93,6 +93,7 @@ class TrainConfig:
     v5_n_tgt: int = 32                # held modality-D patches to order
     v5_voxels: int = 8                # cube sample grid (voxels^3)
     v5_prisms: tuple = (32.0, 64.0)   # cube prism sizes (mm); 32->4mm patch, 64->8mm patch
+    v5_prism_patch: dict = None       # {prism_mm: [patch_mm,...]}; None -> {32:[4], 64:[8]}. multi-size: {32:[2,3,4],64:[8]}
     tumor_frac: float = 0.0           # v5: fraction of bags anchored on segmented tissue (pathology-focus)
     v5_sampler_workers: int = 0       # v5: parallel CPU-geometry prefetch workers (0 = synchronous sampling)
     git_commit: str = ""
@@ -521,9 +522,10 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         except Exception as e:
             log(f"[wandb] disabled: {e}"); wb = None
 
-    def draw(bundles):
+    def draw(bundles, prism_choices=None, prism_patch=None):
         return S.sample_v5_batch(bundles, batch_size=cfg.batch_size, n_src=cfg.v5_n_src, n_anchor=cfg.v5_n_anchor,
-                                 n_tgt=cfg.v5_n_tgt, prism_choices=cfg.v5_prisms, voxels=cfg.v5_voxels,
+                                 n_tgt=cfg.v5_n_tgt, prism_choices=prism_choices or cfg.v5_prisms,
+                                 prism_patch=prism_patch or cfg.v5_prism_patch, voxels=cfg.v5_voxels,
                                  rng=rng, device=device, tumor_frac=cfg.tumor_frac)
 
     # parallel prefetch: worker threads run the pure-CPU _v5_geometry stage; the main thread does the GPU
@@ -540,7 +542,7 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
                 try:
                     g = S._v5_geometry(train_bundles.resident(), batch_size=cfg.batch_size, n_src=cfg.v5_n_src,
                                        n_anchor=cfg.v5_n_anchor, n_tgt=cfg.v5_n_tgt, prism_choices=cfg.v5_prisms,
-                                       voxels=cfg.v5_voxels, rng=wrng, tumor_frac=cfg.tumor_frac)
+                                       prism_patch=cfg.v5_prism_patch, voxels=cfg.v5_voxels, rng=wrng, tumor_frac=cfg.tumor_frac)
                 except Exception as e:
                     log(f"[prefetch w{wid}] {type(e).__name__}: {e}"); continue
                 while not _pf_stop.is_set():
@@ -561,6 +563,9 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
     def fwd(b):
         return model.forward_v5(b, content_blur=cfg.content_blur, mae_weight=cfg.mae_weight, match_weight=cfg.match_weight)
 
+    _pp = cfg.v5_prism_patch or {32.0: [4.0], 64.0: [8.0]}                 # per-size val panels: size -> its prism
+    _size2prism = {float(s): float(pr) for pr, ss in _pp.items() for s in (ss if hasattr(ss, "__len__") else [ss])}
+
     @torch.no_grad()
     def validate():
         model.eval(); mae = []; acc = []
@@ -573,15 +578,22 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
         with torch.autocast(**amp):
             bshuf = {**b, "coords_tgt": b["coords_tgt"][:, torch.randperm(cfg.v5_n_tgt, device=device)]}
             ctrl = fwd(bshuf)["match_acc"]
+        panels = {}                                                        # match_acc per patch size (2/3/4/8mm)
+        for s, pr in sorted(_size2prism.items()):
+            bs = draw(val_bundles, prism_choices=(pr,), prism_patch={pr: [s]})
+            with torch.autocast(**amp):
+                panels[s] = fwd(bs)["match_acc"]
         model.train()
-        return float(np.mean(mae)), float(np.mean(acc)), float(ctrl)
+        return float(np.mean(mae)), float(np.mean(acc)), float(ctrl), panels
 
     _sync = (torch.cuda.synchronize if device == "cuda" else (lambda: None))
     _t_samp = _t_step = 0.0; _t_n = 0                                    # perf accumulators (sampler vs GPU step)
     _sync()
-    t0 = time.time(); vm, va, vc = validate()
-    log(f"{'step':>6} {'total':>8} {'mae':>7} {'macc':>7} {'val_macc':>8} {'shufctl':>7} {'chance':>7} {'lr':>8}")
-    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {va:>8.3f} {vc:>7.3f} {chance:>7.3f} {'-':>8}")
+    t0 = time.time(); vm, va, vc, vp = validate()
+    log(f"{'step':>6} {'total':>8} {'mae':>7} {'macc':>7} {'val_macc':>8} {'shufctl':>7} {'chance':>7} {'lr':>8}"
+        f"   sizes:{'/'.join(f'{int(s)}mm' for s in sorted(vp))}")
+    log(f"{0:>6} {'-':>8} {'-':>7} {'-':>7} {va:>8.3f} {vc:>7.3f} {chance:>7.3f} {'-':>8}"
+        f"   {'/'.join(f'{vp[s]:.3f}' for s in sorted(vp))}")
     for step in range(1, cfg.steps + 1):
         lr = _cosine_warmup(step, cfg.steps, cfg.lr, warmup)
         for g in opt.param_groups:
@@ -606,11 +618,12 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
                     "perf/sampler_frac": _t_samp / max(_t_samp + _t_step, 1e-9)}, step=step)
             _t_samp = _t_step = 0.0; _t_n = 0
         if step % cfg.val_every == 0:
-            vm, va, vc = validate()
+            vm, va, vc, vp = validate()
             if wb:
-                wb.log({"val/mae": vm, "val/match_acc": va, "val/shuf_ctrl": vc}, step=step)
+                wb.log({"val/mae": vm, "val/match_acc": va, "val/shuf_ctrl": vc,
+                        **{f"val/macc_{int(s)}mm": vp[s] for s in vp}}, step=step)
             log(f"{step:>6} {float(total):>8.4f} {float(out['mae']):>7.4f} {out['match_acc']:>7.3f} "
-                f"{va:>8.3f} {vc:>7.3f} {chance:>7.3f} {lr:>8.2e}")
+                f"{va:>8.3f} {vc:>7.3f} {chance:>7.3f} {lr:>8.2e}   {'/'.join(f'{vp[s]:.3f}' for s in sorted(vp))}")
         if cfg.ckpt_dir and step % cfg.ckpt_every == 0:
             os.makedirs(cfg.ckpt_dir, exist_ok=True)
             ckpt_path = f"{cfg.ckpt_dir}/step_{step:06d}.pt"
