@@ -6,7 +6,7 @@
 #SBATCH --partition=short
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
-#SBATCH --time=03:00:00
+#SBATCH --time=01:30:00
 #SBATCH --propagate=NONE
 #SBATCH --output=/cbica/home/gangarav/xmodal/push_train_%j.log
 set -uo pipefail
