@@ -433,6 +433,47 @@ def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12
     return eval_readout(E, ro, eval_prisms, dev, progress)
 
 
+def _apply_readout(E, readout, dev="cuda"):
+    """Load a readout dict onto E's frozen encoder; return (seg_tok, lin, conv, size, qsize)."""
+    seg_tok = readout["seg_tok"].to(dev)
+    with torch.no_grad():
+        E.query_seed.copy_(readout["query_seed"].to(dev))
+    for blk, sd in zip(list(E.decoder)[-readout["unfreeze"]:], readout["dec"]):
+        blk.load_state_dict({k: v.to(dev) for k, v in sd.items()})
+    lin = torch.nn.Linear(E.cfg.width, 4).to(dev); lin.load_state_dict({k: v.to(dev) for k, v in readout["lin"].items()})
+    conv = SmoothHead(E.cfg.width).to(dev); conv.load_state_dict({k: v.to(dev) for k, v in readout["conv"].items()})
+    return seg_tok, lin, conv, readout["size"], readout["qsize"]
+
+
+def consensus_predict(E, readout, result, shift=1.0, agg="intersection", dev="cuda"):
+    """Test-time augmentation for one prism: probe the query grid from small +/- shifts (mm) along each axis,
+    realign, and aggregate. agg='intersection' keeps voxels ET under EVERY shift (kills position-sensitive
+    diffuse FP), 'majority' keeps >half, 'union' keeps any. Returns (consensus_pred_3d, single_shot_pred_3d)."""
+    seg_tok, lin, conv, size, qsize = _apply_readout(E, readout, dev)
+    sp = torch.as_tensor(result["sp"][None], device=dev).float()
+    sc = torch.as_tensor(result["sc"][None], device=dev).float()
+    sm = torch.as_tensor(result["sm"][None], device=dev).long()
+    ctx, cc = _encode_src(E, sp, sc, sm, size, dev)                       # encode source ONCE
+    G = result["gdim"]; base = result["gpts"].astype(np.float32)
+    offs = [(0, 0, 0), (shift, 0, 0), (-shift, 0, 0), (0, shift, 0), (0, -shift, 0), (0, 0, shift), (0, 0, -shift)]
+    masks = []
+    with torch.no_grad():
+        for d in offs:
+            coords = torch.as_tensor(base + np.asarray(d, np.float32), device=dev)
+            sl = torch.cat([_decode_q(E, seg_tok, ctx, cc, coords[c0:c0 + 4096][None], qsize, dev)[0]
+                            for c0 in range(0, coords.shape[0], 4096)])
+            pred = lin(sl) if False else _gl(conv, sl, G)   # conv head over the grid
+            masks.append((pred.argmax(1).cpu().numpy().astype(np.int8).reshape(G, G, G) == 3))
+    stk = np.stack(masks)                                                 # (n_shifts, G, G, G) ET masks
+    if agg == "intersection":
+        cons = stk.all(0)
+    elif agg == "union":
+        cons = stk.any(0)
+    else:
+        cons = stk.sum(0) >= (len(masks) // 2 + 1)                        # majority
+    return cons, masks[0]                                                 # consensus ET mask, single-shot (0-offset) ET mask
+
+
 # ---- R2 (Cloudflare) readout cache: config (ckpt + settings) -> trained readout in molab-scratch ----
 R2_PREFIX = "readouts"
 
