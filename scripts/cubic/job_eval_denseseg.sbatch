@@ -36,7 +36,7 @@ echo "dense-seg (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) over: $ARMS"
 POOL=()
 [ -n "${TRAIN_TRACKS:-}" ] && POOL+=(--train-tracks ${TRAIN_TRACKS} --n-train-patients "${NTRAIN:-600}" --n-train-prisms "${NTRAINP:-4}")
 .venv/bin/python -u scripts/eval_denseseg.py --data-root /tmp/ho --tracks mets_ho --device cuda \
-    --n-patients "${NPAT:-51}" --val-frac "${VALFRAC:-0}" \
+    --n-patients "${NPAT:-51}" --val-frac "${VALFRAC:-0}" --n-src "${NSRC:-96}" \
     --unfreeze "${UNFREEZE:-12}" --res "${RES:-2}" --qsize "${QSIZE:-4}" --size "${SIZE:-4}" \
     ${SRC_SIZES:+--src-sizes ${SRC_SIZES}} --src-mult "${SRC_MULT:-1}" \
     --head "${HEAD:-conv}" --block "${BLOCK:-11}" ${WARMSTART:+--warmstart-seg} \
