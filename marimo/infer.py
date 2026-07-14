@@ -213,7 +213,7 @@ def _box_map(result, psl, vols, at, ai):
     ii = np.clip(np.round(((xs / ai[0, 0] + at[0]) - anch[0] + half) / res).astype(int), 0, G - 1)
     jj = np.clip(np.round(((ys / ai[1, 1] + at[1]) - anch[1] + half) / res).astype(int), 0, G - 1)
     bg = result["gt"][:, :, psl][np.ix_(ii, jj)]; bp = result["pred"][:, :, psl][np.ix_(ii, jj)]
-    return bz, x0, x1, y0, y1, bg, bp
+    return bz, x0, x1, y0, y1, bg, bp, ii, jj
 
 
 def _dsc_lab(a, b):
@@ -225,7 +225,7 @@ def multiclass_render(result, psl, bases=("T1c", "FLAIR"), patients_root="/marim
     """GT vs Pred with ALL tumor classes colour-coded (NCR blue, edema green, ET red) on the native
     base modalities, dense box fill. Returns ({f'{base} {GT|Pred}': uint8 RGB}, bz, per-class dice)."""
     vols, seg, at, ai = _load_patient_cached(f"{patients_root}/{result['pname']}")
-    bz, x0, x1, y0, y1, bg, bp = _box_map(result, psl, vols, at, ai)
+    bz, x0, x1, y0, y1, bg, bp, _ii, _jj = _box_map(result, psl, vols, at, ai)
     keymap = {"T1": "t1", "T1c": "t1c", "T2": "t2", "FLAIR": "flair"}
     def paint(base_rgb, labels):
         rgb = base_rgb.copy()
@@ -243,6 +243,25 @@ def multiclass_render(result, psl, bases=("T1c", "FLAIR"), patients_root="/marim
     dice["TC"] = _dsc_lab(np.isin(p3, [1, 3]), np.isin(g3, [1, 3]))
     dice["WT"] = _dsc_lab(np.isin(p3, [1, 2, 3]), np.isin(g3, [1, 2, 3]))
     return panels, bz, dice
+
+
+def proj_render(result, label=3, base="T1c", patients_root="/marimo/assets/patients"):
+    """Z-max projection of GT vs Pred for `label` (default ET) over the WHOLE prism, on the base modality —
+    collapses diffuse over-prediction spread across slices into one view. Returns (gt_rgb, pred_rgb, gt_vox, pred_vox)."""
+    vols, seg, at, ai = _load_patient_cached(f"{patients_root}/{result['pname']}")
+    G = result["gdim"]; keymap = {"T1": "t1", "T1c": "t1c", "T2": "t2", "FLAIR": "flair"}
+    bz, x0, x1, y0, y1, _bg, _bp, ii, jj = _box_map(result, G // 2, vols, at, ai)   # mid-plane base image + box map
+    gproj = (result["gt"] == label).any(2); pproj = (result["pred"] == label).any(2)  # (G,G) any-slice
+    sl = vols[keymap[base]][:, :, bz].astype(np.float32); lo, hi = np.percentile(sl, 1), np.percentile(sl, 99.5)
+    base_rgb = np.stack([np.clip((sl - lo) / (hi - lo + 1e-6), 0, 1)] * 3, -1)
+    col = [c for n, l, c in _LBL if l == label][0]
+    def paint(proj):
+        rgb = base_rgb.copy(); m = np.zeros(rgb.shape[:2], bool); m[x0:x1 + 1, y0:y1 + 1] = proj[np.ix_(ii, jj)]
+        rgb[m] = 0.3 * rgb[m] + 0.7 * np.array(col)
+        rgb[x0:x1 + 1, y0] = [1, 0, 0]; rgb[x0:x1 + 1, y1] = [1, 0, 0]
+        rgb[x0, y0:y1 + 1] = [1, 0, 0]; rgb[x1, y0:y1 + 1] = [1, 0, 0]
+        return (np.rot90(rgb) * 255).astype(np.uint8)
+    return paint(gproj), paint(pproj), int(gproj.sum()), int(pproj.sum())
 
 
 def _encode_src(E, sp, sc, sm, size, dev):
