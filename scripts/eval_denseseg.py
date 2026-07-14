@@ -92,6 +92,7 @@ def main():
     ap.add_argument("--train-tracks", nargs="+", default=[], help="tracks for readout TRAIN pool, e.g. mets_train")
     ap.add_argument("--n-train-patients", type=int, default=0, help=">0 -> train readout on this many pretrain patients (test IDs excluded); 0 -> 5-fold within test")
     ap.add_argument("--n-train-prisms", type=int, default=4)
+    ap.add_argument("--val-frac", type=float, default=0.0, help=">0: single patient split (train on 1-val_frac of held-out, test on val_frac) instead of GroupKFold-5. train/test prisms from the SAME build, split by patient.")
     ap.add_argument("--n-src", type=int, default=96); ap.add_argument("--voxels", type=int, default=8)
     ap.add_argument("--size", type=float, default=4.0, help="source patch mm (uniform, unless --src-sizes)"); ap.add_argument("--prism-mm", type=float, default=32.0)
     ap.add_argument("--src-sizes", default=None, help="mixed-scale source: comma sizes e.g. '2,3,4' — each source patch a random one (multi-scale context, matches multi-size training). None=uniform --size.")
@@ -264,6 +265,13 @@ def main():
     def run(E):
         if train_prisms is not None:                                           # pretrain-pool mode: train->pool, test->held-out
             lp, cp = fit_eval(E, train_prisms, test_prisms)
+        elif a.val_frac > 0:                                                   # single 80/20 patient split within the held-out
+            pids = sorted(set(p["pid"] for p in test_prisms))
+            order = np.random.default_rng(a.seed).permutation(len(pids))
+            nte = max(1, int(round(len(pids) * a.val_frac))); te_pids = {pids[i] for i in order[:nte]}
+            tr = [p for p in test_prisms if p["pid"] not in te_pids]; te = [p for p in test_prisms if p["pid"] in te_pids]
+            print(f"single split: train {len(pids)-nte} patients / test {nte} patients (val_frac={a.val_frac})", flush=True)
+            lp, cp = fit_eval(E, tr, te)
         else:                                                                  # GroupKFold-5 within the held-out test set
             pids = sorted(set(p["pid"] for p in test_prisms)); fold = {p: i % 5 for i, p in enumerate(pids)}
             lp = []; cp = []
