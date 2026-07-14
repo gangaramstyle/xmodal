@@ -1,7 +1,7 @@
 #!/bin/bash
 # CPU-only: push raw held-out patients + the best checkpoint to a wandb artifact so molab can run inference itself.
 #SBATCH --job-name=xmodal_push
-#SBATCH --partition=ai
+#SBATCH --partition=short
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
 #SBATCH --time=00:30:00
@@ -31,7 +31,13 @@ for p in val:
     k += 1
 print(f"staged {k} held-out patients")
 PY
-cp "$CKPT" $STAGE/ckpt/${ARM}_step70000.pt
+# slim the checkpoint: keep model+step+cfg, drop the optimizer state (~900MB)
+.venv/bin/python - <<PY
+import torch
+ck = torch.load("$CKPT", map_location="cpu")
+torch.save({k: ck[k] for k in ("model", "step", "cfg") if k in ck}, "/tmp/molab_stage/ckpt/${ARM}_step70000_slim.pt")
+print("slim ckpt saved")
+PY
 echo "artifact size: $(du -sh $STAGE | cut -f1)"
 
 .venv/bin/python - <<PY
