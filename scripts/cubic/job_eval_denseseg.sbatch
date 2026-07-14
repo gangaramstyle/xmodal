@@ -34,6 +34,7 @@ for arm in $ARMS; do
   ls runs/$arm/${STEPGLOB} >/dev/null 2>&1 && CK+=("${arm}=runs/${arm}/${STEPGLOB}")
 done
 echo "dense-seg (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) over: $ARMS"
+echo "CONFIG: COVER=[${COVER:-}] NSRC=[${NSRC:-96}] SIZE=[${SIZE:-4}] QSIZE=[${QSIZE:-4}] $( [ -n "${COVER:-}" ] && echo '-> FULL COVERAGE 2048' || echo "-> random n_src=${NSRC:-96}" )"
 POOL=()
 [ -n "${TRAIN_TRACKS:-}" ] && POOL+=(--train-tracks ${TRAIN_TRACKS} --n-train-patients "${NTRAIN:-600}" --n-train-prisms "${NTRAINP:-4}")
 .venv/bin/python -u scripts/eval_denseseg.py --data-root /tmp/ho --tracks mets_ho --device cuda \
