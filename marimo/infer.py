@@ -1,6 +1,6 @@
 """In-molab inference: build tumor prisms, fine-tune the seg decoder readout, predict per lesion.
 Reuses the xmodal repo's data loader + sampling (identical to the CUBIC eval). Options exposed."""
-import sys, os
+import sys, os, io, json, hashlib
 sys.path.insert(0, "/marimo/xmodal/src")
 import numpy as np, torch
 from PIL import Image
@@ -37,7 +37,7 @@ def load_model(ckpt, width=768, heads=12, dev="cuda"):
 
 
 def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, res=1.0, seed=0,
-                 cover=False, neg_frac=0.0, dev="cuda", progress=None):
+                 cover=False, neg_frac=0.0, cache=True, dev="cuda", progress=None):
     unit = S._cube_unit(8, dev); rng = np.random.default_rng(seed); out = []
     for ci, pd in enumerate(patient_dirs):
         pid = os.path.basename(pd)
@@ -48,7 +48,8 @@ def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, re
                 b = _BCACHE[pd]
             else:
                 b = D.load_local_bundle(pid, pd, device=dev, with_seg=True)[0]
-                _BCACHE[pd] = b            # cache the loaded bundle so re-runs skip the slow nifti read
+                if cache:
+                    _BCACHE[pd] = b        # cache small reused pools (eval); skip for the large train pool to avoid OOM
         except Exception:
             continue
         sc0 = b["t1c"]; tmm = sc0.tumor_np
@@ -287,14 +288,12 @@ def _dsc(pred, gt):
     return -1.0 if s == 0 else 2.0 * inter / s
 
 
-def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
-                size=4.0, qsize=2.0, seed=0, dev="cuda", progress=None):
-    """Fine-tune the seg readout on train_prisms (fit patients), then predict + score on eval_prisms
-    (disjoint eval patients). No k-fold: fit and eval patient pools are separate by construction."""
-    rng = np.random.default_rng(seed); tr, te = train_prisms, eval_prisms
-    results = []
-    if not tr or not te:
-        return results
+def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
+                  size=4.0, qsize=2.0, seed=0, dev="cuda", progress=None):
+    """Fine-tune the seg readout on train_prisms. Trains E's last `unfreeze` decoder blocks + seg-token +
+    query_seed + linear head (stage 1), then a conv SmoothHead (stage 2). Returns a portable readout dict
+    (all CPU tensors) that eval_readout / R2 caching can reload onto a fresh frozen encoder."""
+    rng = np.random.default_rng(seed); tr = train_prisms
     src_tr = [_prism_src(E, pr, size, dev) for pr in tr]   # frozen source encodings, reused every epoch
     seg_tok = (E.seg_query.detach().clone().to(dev) if (warmstart and hasattr(E, "seg_query"))
                else torch.zeros(E.cfg.width, device=dev)).requires_grad_(True)
@@ -334,10 +333,28 @@ def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12
             logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
             cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
             opt2.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt2.step()
+    cpu = lambda sd: {k: v.detach().cpu() for k, v in sd.items()}
+    return {"seg_tok": seg_tok.detach().cpu(), "query_seed": E.query_seed.detach().cpu(),
+            "dec": [cpu(blk.state_dict()) for blk in dec], "lin": cpu(lin.state_dict()),
+            "conv": cpu(conv.state_dict()), "unfreeze": unfreeze, "size": size, "qsize": qsize}
+
+
+def eval_readout(E, readout, eval_prisms, dev="cuda", progress=None):
+    """Apply a (trained or R2-loaded) readout onto E's frozen encoder and score eval_prisms per lesion."""
+    unfreeze, size, qsize = readout["unfreeze"], readout["size"], readout["qsize"]
+    seg_tok = readout["seg_tok"].to(dev)
     with torch.no_grad():
-        for j, pr in enumerate(te):
+        E.query_seed.copy_(readout["query_seed"].to(dev))
+    dec = list(E.decoder)[-unfreeze:]
+    for blk, sd in zip(dec, readout["dec"]):
+        blk.load_state_dict({k: v.to(dev) for k, v in sd.items()})
+    lin = torch.nn.Linear(E.cfg.width, 4).to(dev); lin.load_state_dict({k: v.to(dev) for k, v in readout["lin"].items()})
+    conv = SmoothHead(E.cfg.width).to(dev); conv.load_state_dict({k: v.to(dev) for k, v in readout["conv"].items()})
+    results = []
+    with torch.no_grad():
+        for j, pr in enumerate(eval_prisms):
             if progress:
-                progress(f"evaluating {j+1}/{len(te)} lesions")
+                progress(f"evaluating {j+1}/{len(eval_prisms)} lesions")
             G = pr["gdim"]; sl = _dense(E, seg_tok, pr, size, qsize, dev)
             pred = _gl(conv, sl, G).argmax(1).cpu().numpy().astype(np.int8)
             gt = pr["gt"]
@@ -345,7 +362,65 @@ def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12
             results.append(dict(pname=pr["pname"], gdim=G, imgs=pr["imgs"].reshape(4, G, G, G),
                                 gt=gt.reshape(G, G, G), pred=pred.reshape(G, G, G),
                                 anch=pr["anch"], prism_mm=pr["prism_mm"], res=pr["res"],
-                                sp=pr["sp"], sc=pr["sc"], sm=pr["sm"],   # source context patch content + centers + modality
+                                sp=pr["sp"], sc=pr["sc"], sm=pr["sm"],
                                 et_vox=int((gt == 3).sum()), tc_vox=int(np.isin(gt, [1, 3]).sum()),
                                 dsc_et=d["ET"], dsc_tc=d["TC"], dsc_wt=d["WT"]))
     return results
+
+
+def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
+                size=4.0, qsize=2.0, seed=0, dev="cuda", progress=None):
+    """Train the readout then evaluate (backward-compatible one-shot)."""
+    if not train_prisms or not eval_prisms:
+        return []
+    ro = train_readout(E, train_prisms, epochs, epochs2, unfreeze, warmstart, size, qsize, seed, dev, progress)
+    return eval_readout(E, ro, eval_prisms, dev, progress)
+
+
+# ---- R2 (Cloudflare) readout cache: config (ckpt + settings) -> trained readout in molab-scratch ----
+R2_PREFIX = "readouts"
+
+
+def _r2_store():
+    from obstore.store import S3Store
+    return S3Store(os.environ.get("R2_BUCKET", "molab-scratch"),
+                   access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                   secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+                   endpoint=os.environ["R2_ENDPOINT"], region="auto",
+                   virtual_hosted_style_request=False)
+
+
+def readout_hash(cfg):
+    """Stable id for a (checkpoint + notebook settings) combo."""
+    return hashlib.md5(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def _r2_get_bytes(store, key):
+    import obstore
+    try:
+        return bytes(obstore.get(store, key).bytes())
+    except Exception:
+        return None
+
+
+def r2_index():
+    """The tracking table: {hash: {'cfg':..., 'metrics':..., 'key':...}}."""
+    b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/index.json")
+    return json.loads(b) if b else {}
+
+
+def r2_load_readout(cfg):
+    """Return the cached readout dict for this config, or None if not present."""
+    b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/{readout_hash(cfg)}.pt")
+    return None if b is None else torch.load(io.BytesIO(b), map_location="cuda")
+
+
+def r2_save_readout(readout, cfg, metrics):
+    """Upload the trained readout + register it in the index. Returns the hash."""
+    import obstore
+    h = readout_hash(cfg); store = _r2_store(); key = f"{R2_PREFIX}/{h}.pt"
+    buf = io.BytesIO(); torch.save(readout, buf)
+    obstore.put(store, key, buf.getvalue())
+    idx = r2_index(); idx[h] = {"cfg": cfg, "metrics": metrics, "key": key}
+    obstore.put(store, f"{R2_PREFIX}/index.json", json.dumps(idx).encode())
+    return h
