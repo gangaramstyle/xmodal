@@ -106,10 +106,11 @@ def _load_patient_cached(pdir, dev="cuda"):
     return _PCACHE[pdir]
 
 
-def native_render(result, psl, patients_root="/marimo/assets/patients"):
-    """All 4 native sequences at this prism slice, each with the 1px red prism box + shared TP/FP/FN(ET)
-    overlay. The box interior is filled DENSELY from the prism grid (inverse of the diagonal affine), so
-    the anisotropic grid→voxel scaling doesn't leave gaps. Returns ({modality: uint8 RGB}, brain_z, et_peak_slice)."""
+def native_render(result, psl, label=3, patients_root="/marimo/assets/patients"):
+    """All 4 native sequences at this prism slice, each with the 1px red prism box + shared TP/FP/FN overlay
+    for class `label` (3=ET, 2=edema, 1=NCR). The box interior is filled DENSELY from the prism grid (inverse
+    of the diagonal affine), so the anisotropic grid→voxel scaling doesn't leave gaps.
+    Returns ({modality: uint8 RGB}, {modality: raw RGB}, brain_z, class_peak_slice)."""
     vols, seg, at, ai = _load_patient_cached(f"{patients_root}/{result['pname']}")
     seg = np.where(seg == 4, 3, seg)
     G = result["gdim"]; half = result["prism_mm"] / 2.0; res = result["res"]; anch = result["anch"]
@@ -128,28 +129,28 @@ def native_render(result, psl, patients_root="/marimo/assets/patients"):
     ii = np.clip(np.round(((xs / aix + at[0]) - anch[0] + half) / res).astype(int), 0, G - 1)
     jj = np.clip(np.round(((ys / aiy + at[1]) - anch[1] + half) / res).astype(int), 0, G - 1)
     gt2 = result["gt"][:, :, psl]; pred2 = result["pred"][:, :, psl]
-    box_gt = gt2[np.ix_(ii, jj)] == 3; box_pred = pred2[np.ix_(ii, jj)] == 3   # dense (box-shaped) ET masks
+    box_gt = gt2[np.ix_(ii, jj)] == label; box_pred = pred2[np.ix_(ii, jj)] == label   # dense box masks for this class
     inbox = np.zeros(shp[:2], bool); inbox[x0:x1 + 1, y0:y1 + 1] = True
     tp = np.zeros(shp[:2], bool); fp = np.zeros(shp[:2], bool); fn = np.zeros(shp[:2], bool)
     tp[x0:x1 + 1, y0:y1 + 1] = box_gt & box_pred
     fp[x0:x1 + 1, y0:y1 + 1] = box_pred & ~box_gt
     fn[x0:x1 + 1, y0:y1 + 1] = box_gt & ~box_pred
-    outside_et = (seg[:, :, bz] == 3) & ~inbox                      # GT-ET elsewhere in the slice (context only)
-    et_peak = int((result["gt"] == 3).sum((0, 1)).argmax())
+    outside = (seg[:, :, bz] == label) & ~inbox                     # GT of this class elsewhere in the slice (context)
+    peak = int((result["gt"] == label).sum((0, 1)).argmax())
     panels = {}; clean = {}
     for name, key in [("T1", "t1"), ("T1c", "t1c"), ("T2", "t2"), ("FLAIR", "flair")]:
         sl = vols[key][:, :, bz].astype(np.float32); lo, hi = np.percentile(sl, 1), np.percentile(sl, 99.5)
         base = np.stack([np.clip((sl - lo) / (hi - lo + 1e-6), 0, 1)] * 3, -1)
         clean[name] = (np.rot90(base) * 255).astype(np.uint8)              # raw, no overlay
         rgb = base.copy()
-        rgb[outside_et] = 0.72 * rgb[outside_et] + 0.28 * np.array([1, .85, 0])
+        rgb[outside] = 0.72 * rgb[outside] + 0.28 * np.array([1, .85, 0])
         rgb[tp] = 0.45 * rgb[tp] + 0.55 * np.array([0, .9, .25])
         rgb[fp] = 0.35 * rgb[fp] + 0.65 * np.array([1, .12, .12])
         rgb[fn] = 0.35 * rgb[fn] + 0.65 * np.array([.2, .5, 1])
         rgb[x0:x1 + 1, y0] = [1, 0, 0]; rgb[x0:x1 + 1, y1] = [1, 0, 0]
         rgb[x0, y0:y1 + 1] = [1, 0, 0]; rgb[x1, y0:y1 + 1] = [1, 0, 0]
         panels[name] = (np.rot90(rgb) * 255).astype(np.uint8)
-    return panels, clean, bz, et_peak
+    return panels, clean, bz, peak
 
 
 def context_fill(result, psl, size=4.0, patients_root="/marimo/assets/patients", zt=2.0):
