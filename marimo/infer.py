@@ -288,6 +288,39 @@ def _dsc(pred, gt):
     return -1.0 if s == 0 else 2.0 * inter / s
 
 
+def _nsd(pred, gt, coords, tol=2.0):
+    """Normalized surface distance @ tol mm (same impl as the CUBIC eval, so molab matches it). coords in mm.
+    Returns None when either mask is empty."""
+    if pred.sum() == 0 or gt.sum() == 0:
+        return None
+    pc, gc = coords[pred], coords[gt]
+    d_pg = torch.cdist(pc, gc).min(1).values; d_gp = torch.cdist(gc, pc).min(1).values
+    return float(((d_pg <= tol).float().sum() + (d_gp <= tol).float().sum()) / (len(pc) + len(gc)))
+
+
+def leaderboard_metrics(results, small_vox=50):
+    """Aggregate results into BraTS-leaderboard-style metrics: lesionwise mean DSC & NSD per region, plus
+    small-instance TP/FN/FP/F1 (small = GT region < small_vox voxels; oracle-eval analogue of the challenge
+    detection metric — a lesion 'detected' if pred overlaps GT, FP = pred region present with no GT region)."""
+    m = {"n": len(results)}
+    for rg in ("et", "tc", "wt"):
+        ds = [r[f"dsc_{rg}"] for r in results if r.get(f"dsc_{rg}", -1) >= 0]
+        ns = [r[f"nsd_{rg}"] for r in results if r.get(f"nsd_{rg}") is not None]
+        m[f"dsc_{rg}"] = round(float(np.mean(ds)), 4) if ds else 0.0
+        m[f"nsd_{rg}"] = round(float(np.mean(ns)), 4) if ns else 0.0
+        tp = fn = fp = 0
+        for r in results:
+            gv, pv = r.get(f"gt_vox_{rg}", 0), r.get(f"pred_vox_{rg}", 0)
+            if 0 < gv <= small_vox:                      # small GT lesion present
+                if r.get(f"dsc_{rg}", 0) > 0: tp += 1
+                else: fn += 1
+            elif gv == 0 and 0 < pv <= small_vox:        # spurious small prediction, no GT
+                fp += 1
+        f1 = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
+        m[f"sm_tp_{rg}"], m[f"sm_fn_{rg}"], m[f"sm_fp_{rg}"], m[f"sm_f1_{rg}"] = tp, fn, fp, round(f1, 3)
+    return m
+
+
 def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
                   size=4.0, qsize=2.0, seed=0, dev="cuda", progress=None):
     """Fine-tune the seg readout on train_prisms. Trains E's last `unfreeze` decoder blocks + seg-token +
@@ -357,14 +390,18 @@ def eval_readout(E, readout, eval_prisms, dev="cuda", progress=None):
                 progress(f"evaluating {j+1}/{len(eval_prisms)} lesions")
             G = pr["gdim"]; sl = _dense(E, seg_tok, pr, size, qsize, dev)
             pred = _gl(conv, sl, G).argmax(1).cpu().numpy().astype(np.int8)
-            gt = pr["gt"]
-            d = {r: _dsc(torch.as_tensor(np.isin(pred, list(cls))), torch.as_tensor(np.isin(gt, list(cls)))) for r, cls in REGIONS.items()}
-            results.append(dict(pname=pr["pname"], gdim=G, imgs=pr["imgs"].reshape(4, G, G, G),
-                                gt=gt.reshape(G, G, G), pred=pred.reshape(G, G, G),
-                                anch=pr["anch"], prism_mm=pr["prism_mm"], res=pr["res"],
-                                sp=pr["sp"], sc=pr["sc"], sm=pr["sm"],
-                                et_vox=int((gt == 3).sum()), tc_vox=int(np.isin(gt, [1, 3]).sum()),
-                                dsc_et=d["ET"], dsc_tc=d["TC"], dsc_wt=d["WT"]))
+            gt = pr["gt"]; coords = torch.as_tensor(pr["gpts"], device=dev)   # mm coords for NSD
+            rec = dict(pname=pr["pname"], gdim=G, imgs=pr["imgs"].reshape(4, G, G, G),
+                       gt=gt.reshape(G, G, G), pred=pred.reshape(G, G, G),
+                       anch=pr["anch"], prism_mm=pr["prism_mm"], res=pr["res"],
+                       sp=pr["sp"], sc=pr["sc"], sm=pr["sm"])
+            for name, cls in REGIONS.items():
+                pm = np.isin(pred, list(cls)); gm = np.isin(gt, list(cls)); k = name.lower()
+                rec[f"dsc_{k}"] = _dsc(torch.as_tensor(pm), torch.as_tensor(gm))
+                rec[f"nsd_{k}"] = _nsd(torch.as_tensor(pm, device=dev), torch.as_tensor(gm, device=dev), coords)
+                rec[f"gt_vox_{k}"] = int(gm.sum()); rec[f"pred_vox_{k}"] = int(pm.sum())
+            rec["et_vox"] = rec["gt_vox_et"]; rec["tc_vox"] = rec["gt_vox_tc"]   # back-compat for table/filter
+            results.append(rec)
     return results
 
 
