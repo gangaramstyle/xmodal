@@ -186,21 +186,27 @@ def main():
         train_prisms = build_prisms(tr_dirs, a.n_train_patients, a.n_train_prisms, test_ids, "TRAIN")
         assert train_prisms
 
-    def slots(E, seg_tok, sp, sc, sm, qpts, ssz=None):                          # frozen-enc source -> decode dense queries
+    def enc_src(E, sp, sc, sm, ssz=None):                                      # encode source bag ONCE (encoder frozen)
         nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
         zs = ssz[..., None].expand(-1, -1, 3) if ssz is not None else torch.full((nb, sp.shape[1], 3), a.size, device=dev)
-        zt = torch.full((nb, qpts.shape[1], 3), a.qsize, device=dev)
         with torch.no_grad():
             x = E.encode(*E._context([E.embed(sp, zs, sm)], [sc], dev, nb)); ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
+        return ctx, cc
+
+    def dec_q(E, seg_tok, ctx, cc, qpts):                                      # decode queries against a pre-encoded source
+        nb = qpts.shape[0]; zt = torch.full((nb, qpts.shape[1], 3), a.qsize, device=dev)
         q = (E.query_seed[None, None, :] + E._size_emb(zt) + seg_tok[None, None, :]).contiguous()
         return E._decode(q, ctx, cc, qpts)
 
-    def dense_slots(E, seg_tok, pr):                                            # decode EVERY grid voxel -> [G^3, W]
-        sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
-        sm = torch.as_tensor(pr["sm"][None], device=dev).long(); coords = torch.as_tensor(pr["gpts"], device=dev).float()
-        ssz = torch.as_tensor(pr["ssz"][None], device=dev).float()
+    def prism_src(E, pr):
+        return enc_src(E, torch.as_tensor(pr["sp"][None], device=dev).float(), torch.as_tensor(pr["sc"][None], device=dev).float(),
+                       torch.as_tensor(pr["sm"][None], device=dev).long(), torch.as_tensor(pr["ssz"][None], device=dev).float())
+
+    def dense_slots(E, seg_tok, pr, src=None):                                 # decode EVERY grid voxel -> [G^3, W]
+        ctx, cc = prism_src(E, pr) if src is None else src                     # encode source ONCE, reuse per chunk
+        coords = torch.as_tensor(pr["gpts"], device=dev).float()
         with torch.no_grad():
-            sl = [slots(E, seg_tok, sp, sc, sm, coords[c0:c0 + 4096][None], ssz)[0] for c0 in range(0, coords.shape[0], 4096)]
+            sl = [dec_q(E, seg_tok, ctx, cc, coords[c0:c0 + 4096][None])[0] for c0 in range(0, coords.shape[0], 4096)]
         return torch.cat(sl)                                                    # [G^3, W]
 
     def grid_logits(head, sl, G):                                              # [G^3,W] -> conv over volume -> [G^3,4]
@@ -238,21 +244,21 @@ def main():
             for p in blk.parameters():
                 p.requires_grad_(True); params.append(p)
         opt = torch.optim.Adam(params, lr=a.lr)
+        src_tr = [prism_src(E, pr) for pr in tr]                                # frozen source encodings, reused every epoch
         for _ in range(a.epochs):                                              # ---- Stage 1 ----
-            for pr in [tr[i] for i in rng.permutation(len(tr))]:
+            for i in rng.permutation(len(tr)):
+                pr = tr[i]; ctx, cc = src_tr[i]
                 sub = rng.integers(len(pr["gt"]), size=a.tgt_train)
-                sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
-                sm = torch.as_tensor(pr["sm"][None], device=dev).long(); qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
-                ssz = torch.as_tensor(pr["ssz"][None], device=dev).float()
+                qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
                 y = torch.as_tensor(pr["gt"][sub], device=dev).long()
                 cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
-                logit = lin(slots(E, seg_tok, sp, sc, sm, qp, ssz)).reshape(-1, 4)
+                logit = lin(dec_q(E, seg_tok, ctx, cc, qp)).reshape(-1, 4)
                 opt.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt.step()
         seg_tok.requires_grad_(False); E.query_seed.requires_grad_(False)      # freeze all of stage 1
         for m in [lin, *dec_blocks]:
             for p in m.parameters():
                 p.requires_grad_(False)
-        emb_tr = [dense_slots(E, seg_tok, pr).half().cpu() for pr in tr]        # train cache on CPU (pool can be large)
+        emb_tr = [dense_slots(E, seg_tok, pr, src=src_tr[i]).half().cpu() for i, pr in enumerate(tr)]   # reuse encodings
         emb_te = [dense_slots(E, seg_tok, pr).half() for pr in te]             # test cache on GPU
         conv = None
         if a.head == "conv":                                                   # ---- Stage 2 ----
