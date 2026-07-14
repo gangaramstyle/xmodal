@@ -31,6 +31,9 @@ echo "PINNED $SHA"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 NAME="v5_${TAG:-both}_s${SEED:-0}"
+# MULTISIZE=1 sets the multi-scale prism-patch internally (avoids SLURM --export comma-parsing on '32:2,3,4;64:8')
+[ "${MULTISIZE:-0}" = 1 ] && PRISM_PATCH="32:2,3,4;64:8"
+echo "PRISM_PATCH=[${PRISM_PATCH:-<single-size default>}] N_TGT=${N_TGT:-32}"
 .venv/bin/python -u scripts/run_v5.py \
     --batch-size ${BATCH:-224} --n-src 90 --n-anchor 6 --n-tgt ${N_TGT:-32} --voxels 8 --prisms 32 64 \
     --prism-patch "${PRISM_PATCH:-}" --seg-task "${SEG_TASK:-none}" --seg-frac "${SEG_FRAC:-0.1}" \
