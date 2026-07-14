@@ -454,7 +454,10 @@ def consensus_predict(E, readout, result, shift=1.0, agg="intersection", dev="cu
     sc = torch.as_tensor(result["sc"][None], device=dev).float()
     sm = torch.as_tensor(result["sm"][None], device=dev).long()
     ctx, cc = _encode_src(E, sp, sc, sm, size, dev)                       # encode source ONCE
-    G = result["gdim"]; base = result["gpts"].astype(np.float32)
+    G = result["gdim"]; half = result["prism_mm"] / 2.0; res = result["res"]
+    lin = np.arange(-half, half + 1e-3, res, dtype=np.float32)[:G]         # anchor-relative grid (matches build_prisms)
+    gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
+    base = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float32)
     offs = [(0, 0, 0), (shift, 0, 0), (-shift, 0, 0), (0, shift, 0), (0, -shift, 0), (0, 0, shift), (0, 0, -shift)]
     masks = []
     with torch.no_grad():
