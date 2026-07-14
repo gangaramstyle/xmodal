@@ -26,9 +26,19 @@ nvidia-smi --query-gpu=name --format=csv,noheader
 [ -d /tmp/ho/mets_ho ] && [ -n "$(ls -A /tmp/ho/mets_ho 2>/dev/null)" ] || { echo "FATAL: held-out reconstruction failed"; exit 1; }
 
 ARMS="${ARMS:-v5_both_tumor_s0 v5_both_s0 v5_mae_tumor_s0}"
+STRIDE="${STRIDE:-0}"                       # 0 = final checkpoint only; N>0 = every Nth checkpoint (trajectory)
 CK=()
 for arm in $ARMS; do
-  ls runs/$arm/step_*.pt >/dev/null 2>&1 && CK+=("${arm}=runs/${arm}/step_*.pt")
+  if [ "$STRIDE" -gt 0 ]; then
+    i=0
+    for f in runs/$arm/step_*.pt; do
+      [ -e "$f" ] || continue
+      [ $((i % STRIDE)) -eq 0 ] && CK+=("${arm}@$(basename "$f" .pt)=$f")
+      i=$((i+1))
+    done
+  else
+    ls runs/$arm/step_*.pt >/dev/null 2>&1 && CK+=("${arm}=runs/${arm}/step_*.pt")
+  fi
 done
 echo "seg-query readout (unfreeze=${UNFREEZE:-0}) over: $ARMS"
 .venv/bin/python -u scripts/eval_segquery.py --data-root /tmp/ho --tracks mets_ho --device cuda \
