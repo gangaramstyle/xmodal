@@ -93,7 +93,9 @@ def main():
     ap.add_argument("--n-train-patients", type=int, default=0, help=">0 -> train readout on this many pretrain patients (test IDs excluded); 0 -> 5-fold within test")
     ap.add_argument("--n-train-prisms", type=int, default=4)
     ap.add_argument("--n-src", type=int, default=96); ap.add_argument("--voxels", type=int, default=8)
-    ap.add_argument("--size", type=float, default=4.0, help="source patch mm"); ap.add_argument("--prism-mm", type=float, default=32.0)
+    ap.add_argument("--size", type=float, default=4.0, help="source patch mm (uniform, unless --src-sizes)"); ap.add_argument("--prism-mm", type=float, default=32.0)
+    ap.add_argument("--src-sizes", default=None, help="mixed-scale source: comma sizes e.g. '2,3,4' — each source patch a random one (multi-scale context, matches multi-size training). None=uniform --size.")
+    ap.add_argument("--src-mult", type=int, default=1, help="oversample source context by this factor (heavy multi-scale inference context, e.g. 3x the ~96 seen in training)")
     ap.add_argument("--res", type=float, default=2.0, help="dense query grid STRIDE mm (metric resolution)")
     ap.add_argument("--qsize", type=float, default=4.0, help="query SIZE embedding mm (in-distribution w/ pretrain patch size, independent of stride)")
     ap.add_argument("--tol", type=float, default=2.0, help="NSD tolerance mm")
@@ -107,6 +109,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     dev = a.device; V = a.voxels; unit = S._cube_unit(V, dev); rng = np.random.default_rng(a.seed)
+    src_sizes = np.array([float(x) for x in a.src_sizes.split(",")]) if a.src_sizes else None
 
     def build_prisms(dirs, npat, nprism, exclude, label):
         """Build tumor-anchored dense prisms from up to npat patients in dirs (skip exclude ids / no-seg / no-tumor)."""
@@ -138,16 +141,19 @@ def main():
                 cm = fgn[np.abs(fgn - anch).max(-1) <= half]                    # foreground INSIDE the prism
                 if len(cm) < a.n_src // 2:
                     continue
-                cs = cm[rng.integers(len(cm), size=a.n_src)].astype(np.float32)  # source context sampled inside the prism
-                sm = rng.integers(4, size=a.n_src)
-                sp = np.zeros((a.n_src, V, V, V), np.float16)
+                nsrc = a.n_src * a.src_mult                                     # heavy multi-scale context = more patches
+                cs = cm[rng.integers(len(cm), size=nsrc)].astype(np.float32)     # source context sampled inside the prism
+                sm = rng.integers(4, size=nsrc)
+                ssz = (rng.choice(src_sizes, size=nsrc) if src_sizes is not None  # per-patch scale (mixed) or uniform --size
+                       else np.full(nsrc, a.size)).astype(np.float32)
+                sp = np.zeros((nsrc, V, V, V), np.float16)
                 for mi, m in enumerate(MODS):
                     sel = np.nonzero(sm == mi)[0]
                     if sel.size:
                         sp[sel] = S._gather_cubes(b[m], torch.as_tensor(cs[sel], device=dev),
-                                                  torch.full((sel.size,), a.size, device=dev), unit, dev).half().cpu().numpy()
+                                                  torch.as_tensor(ssz[sel], device=dev), unit, dev).half().cpu().numpy()
                 gt = seg_at(sc0, torch.as_tensor(gpts, device=dev), dev).cpu().numpy()   # class per query voxel
-                out.append(dict(sp=sp, sc=cs - anch, sm=sm, gpts=gpts - anch, gt=gt, gdim=gdim, pid=ctr))
+                out.append(dict(sp=sp, sc=cs - anch, sm=sm, ssz=ssz, gpts=gpts - anch, gt=gt, gdim=gdim, pid=ctr))
             ctr += 1; del b; torch.cuda.empty_cache()
         print(f"built {len(out)} {label} prisms over {ctr} patients (res={a.res}mm grid, head={a.head})", flush=True)
         return out
@@ -166,9 +172,10 @@ def main():
         train_prisms = build_prisms(tr_dirs, a.n_train_patients, a.n_train_prisms, test_ids, "TRAIN")
         assert train_prisms
 
-    def slots(E, seg_tok, sp, sc, sm, qpts):                                    # frozen-enc source -> decode dense queries
+    def slots(E, seg_tok, sp, sc, sm, qpts, ssz=None):                          # frozen-enc source -> decode dense queries
         nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
-        zs = torch.full((nb, sp.shape[1], 3), a.size, device=dev); zt = torch.full((nb, qpts.shape[1], 3), a.qsize, device=dev)
+        zs = ssz[..., None].expand(-1, -1, 3) if ssz is not None else torch.full((nb, sp.shape[1], 3), a.size, device=dev)
+        zt = torch.full((nb, qpts.shape[1], 3), a.qsize, device=dev)
         with torch.no_grad():
             x = E.encode(*E._context([E.embed(sp, zs, sm)], [sc], dev, nb)); ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
         q = (E.query_seed[None, None, :] + E._size_emb(zt) + seg_tok[None, None, :]).contiguous()
@@ -177,8 +184,9 @@ def main():
     def dense_slots(E, seg_tok, pr):                                            # decode EVERY grid voxel -> [G^3, W]
         sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
         sm = torch.as_tensor(pr["sm"][None], device=dev).long(); coords = torch.as_tensor(pr["gpts"], device=dev).float()
+        ssz = torch.as_tensor(pr["ssz"][None], device=dev).float()
         with torch.no_grad():
-            sl = [slots(E, seg_tok, sp, sc, sm, coords[c0:c0 + 4096][None])[0] for c0 in range(0, coords.shape[0], 4096)]
+            sl = [slots(E, seg_tok, sp, sc, sm, coords[c0:c0 + 4096][None], ssz)[0] for c0 in range(0, coords.shape[0], 4096)]
         return torch.cat(sl)                                                    # [G^3, W]
 
     def grid_logits(head, sl, G):                                              # [G^3,W] -> conv over volume -> [G^3,4]
@@ -221,9 +229,10 @@ def main():
                 sub = rng.integers(len(pr["gt"]), size=a.tgt_train)
                 sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
                 sm = torch.as_tensor(pr["sm"][None], device=dev).long(); qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
+                ssz = torch.as_tensor(pr["ssz"][None], device=dev).float()
                 y = torch.as_tensor(pr["gt"][sub], device=dev).long()
                 cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
-                logit = lin(slots(E, seg_tok, sp, sc, sm, qp)).reshape(-1, 4)
+                logit = lin(slots(E, seg_tok, sp, sc, sm, qp, ssz)).reshape(-1, 4)
                 opt.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt.step()
         seg_tok.requires_grad_(False); E.query_seed.requires_grad_(False)      # freeze all of stage 1
         for m in [lin, *dec_blocks]:
@@ -276,7 +285,8 @@ def main():
         rl, rc = run(E)
         pool = f"train{len(train_prisms)}p" if train_prisms is not None else "kfold5"
         ws = "+warmstart" if a.warmstart_seg else ""
-        tag = f"{nm} step{step} denseseg[{pool}{ws}] qsize{a.qsize}mm/stride{a.res}mm"
+        src = f"src{a.src_sizes}x{a.src_mult}" if a.src_sizes else f"src{a.size}mm"
+        tag = f"{nm} step{step} denseseg[{pool}{ws}] {src}/qsize{a.qsize}mm/stride{a.res}mm"
         print(f"{tag} [stage1 linear]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rl.items()), flush=True)
         if rc is not None:
             print(f"{tag} [stage2 conv-smooth]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rc.items()), flush=True)
