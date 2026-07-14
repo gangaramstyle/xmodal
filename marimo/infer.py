@@ -452,12 +452,30 @@ def r2_load_readout(cfg):
     return None if b is None else torch.load(io.BytesIO(b), map_location="cuda")
 
 
-def r2_save_readout(readout, cfg, metrics):
-    """Upload the trained readout + register it in the index. Returns the hash."""
+def r2_save_readout(readout, cfg, metrics=None):
+    """Upload the trained readout + register it in the index (metrics filled in later by eval). Returns hash."""
     import obstore
     h = readout_hash(cfg); store = _r2_store(); key = f"{R2_PREFIX}/{h}.pt"
     buf = io.BytesIO(); torch.save(readout, buf)
     obstore.put(store, key, buf.getvalue())
-    idx = r2_index(); idx[h] = {"cfg": cfg, "metrics": metrics, "key": key}
+    idx = r2_index(); idx[h] = {"cfg": cfg, "metrics": metrics or {}, "key": key}
     obstore.put(store, f"{R2_PREFIX}/index.json", json.dumps(idx).encode())
+    return h
+
+
+def r2_load_by_hash(h):
+    """Load a cached readout by its index hash (for eval driven by table selection)."""
+    b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/{h}.pt")
+    return None if b is None else torch.load(io.BytesIO(b), map_location="cuda")
+
+
+def r2_set_metrics(h, metrics, eval_cfg=None):
+    """Attach eval metrics to an already-cached readout's index entry (no re-upload of the .pt)."""
+    import obstore
+    store = _r2_store(); idx = r2_index()
+    if h in idx:
+        idx[h]["metrics"] = metrics
+        if eval_cfg is not None:
+            idx[h]["eval"] = eval_cfg
+        obstore.put(store, f"{R2_PREFIX}/index.json", json.dumps(idx).encode())
     return h
