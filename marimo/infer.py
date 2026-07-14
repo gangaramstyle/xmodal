@@ -1,6 +1,6 @@
 """In-molab inference: build tumor prisms, fine-tune the seg decoder readout, predict per lesion.
 Reuses the xmodal repo's data loader + sampling (identical to the CUBIC eval). Options exposed."""
-import sys, os, io, json, hashlib
+import sys, os, io, json, hashlib, contextlib
 sys.path.insert(0, "/marimo/xmodal/src")
 import numpy as np, torch
 from PIL import Image
@@ -341,12 +341,15 @@ def leaderboard_metrics(results, small_vox=50):
 
 
 def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
-                  size=4.0, qsize=2.0, seed=0, dev="cuda", progress=None):
-    """Fine-tune the seg readout on train_prisms. Trains E's last `unfreeze` decoder blocks + seg-token +
-    query_seed + linear head (stage 1), then a conv SmoothHead (stage 2). Returns a portable readout dict
-    (all CPU tensors) that eval_readout / R2 caching can reload onto a fresh frozen encoder."""
+                  size=4.0, qsize=2.0, seed=0, conv_cache_gb=50.0, amp=True, dev="cuda", progress=None):
+    """Fine-tune the seg readout on train_prisms. Stage 1 (decoder+seg-token+query_seed+linear) trains on ALL
+    prisms; stage 2 (conv SmoothHead) caches dense embeddings for only as many prisms as fit in conv_cache_gb
+    of RAM (a light head — a subset suffices), so res=1mm at large scale doesn't OOM. amp=bf16 autocast on the
+    repeated decode/conv forwards for ~2x speed. Returns a portable (CPU) readout dict."""
     rng = np.random.default_rng(seed); tr = train_prisms
-    src_tr = [_prism_src(E, pr, size, dev) for pr in tr]   # frozen source encodings, reused every epoch
+    def ac():
+        return torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()
+    src_tr = [_prism_src(E, pr, size, dev) for pr in tr]   # encoded once, fp32 (safe to reuse under autocast)
     seg_tok = (E.seg_query.detach().clone().to(dev) if (warmstart and hasattr(E, "seg_query"))
                else torch.zeros(E.cfg.width, device=dev)).requires_grad_(True)
     dec = list(E.decoder)[-unfreeze:]; lin = torch.nn.Linear(E.cfg.width, 4).to(dev)
@@ -367,24 +370,35 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
             qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
             y = torch.as_tensor(pr["gt"][sub], device=dev).long()
             cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
-            logit = lin(_decode_q(E, seg_tok, ctx, cc, qp, qsize, dev)).reshape(-1, 4)
-            opt.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt.step()
+            with ac():
+                logit = lin(_decode_q(E, seg_tok, ctx, cc, qp, qsize, dev)).reshape(-1, 4)
+            opt.zero_grad(); torch.nn.functional.cross_entropy(logit.float(), y, weight=w).backward(); opt.step()
     seg_tok.requires_grad_(False); E.query_seed.requires_grad_(False)
     for m in [lin, *dec]:
         for p in m.parameters():
             p.requires_grad_(False)
-    emb_tr = [_dense(E, seg_tok, pr, size, qsize, dev, src=src_tr[i]).half().cpu() for i, pr in enumerate(tr)]
+    # stage 2: cache dense embeddings for only as many prisms as fit conv_cache_gb (conv is a light head)
+    G0 = tr[0]["gdim"]; per_mb = (G0 ** 3) * E.cfg.width * 2 / 1e6
+    kmax = max(1, min(len(tr), int(conv_cache_gb * 1000 / max(per_mb, 1e-6))))
+    cidx = list(rng.permutation(len(tr))[:kmax])
+    if progress:
+        progress(f"caching {kmax}/{len(tr)} prism embeddings for conv (~{kmax*per_mb/1000:.0f}GB)")
+    emb = {}
+    with ac():
+        for i in cidx:
+            emb[i] = _dense(E, seg_tok, tr[i], size, qsize, dev, src=src_tr[i]).half().cpu()
     conv = SmoothHead(E.cfg.width).to(dev); opt2 = torch.optim.Adam(conv.parameters(), lr=1e-3)
     for e in range(epochs2):
         if progress:
             progress(f"fine-tune · conv epoch {e+1}/{epochs2}")
-        for i in rng.permutation(len(tr)):
+        for i in rng.permutation(cidx):
             pr = tr[i]; G = pr["gdim"]; bb = min(11, G); o = rng.integers(0, G - bb + 1, size=3)
-            ev = emb_tr[i].reshape(G, G, G, -1)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].to(dev).float()
+            ev = emb[i].reshape(G, G, G, -1)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].to(dev).float()
             y = torch.as_tensor(pr["gt"].reshape(G, G, G)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].reshape(-1), device=dev).long()
-            logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
             cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
-            opt2.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt2.step()
+            with ac():
+                logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
+            opt2.zero_grad(); torch.nn.functional.cross_entropy(logit.float(), y, weight=w).backward(); opt2.step()
     cpu = lambda sd: {k: v.detach().cpu() for k, v in sd.items()}
     return {"seg_tok": seg_tok.detach().cpu(), "query_seed": E.query_seed.detach().cpu(),
             "dec": [cpu(blk.state_dict()) for blk in dec], "lin": cpu(lin.state_dict()),
