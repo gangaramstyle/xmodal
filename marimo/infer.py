@@ -1,0 +1,292 @@
+"""In-molab inference: build tumor prisms, fine-tune the seg decoder readout, predict per lesion.
+Reuses the xmodal repo's data loader + sampling (identical to the CUBIC eval). Options exposed."""
+import sys, os
+sys.path.insert(0, "/marimo/xmodal/src")
+import numpy as np, torch
+from PIL import Image
+from xmodal import data as D, model as M, sampling as S
+
+MODS = ["t1", "t1c", "t2", "flair"]
+REGIONS = {"ET": {3}, "TC": {1, 3}, "WT": {1, 2, 3}}
+
+
+class SmoothHead(torch.nn.Module):
+    def __init__(self, w, n=4, h=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(torch.nn.Conv3d(w, h, 3, padding=1), torch.nn.GELU(),
+                                        torch.nn.Conv3d(h, h, 3, padding=1), torch.nn.GELU(), torch.nn.Conv3d(h, n, 1))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _at(vol, at, ai, pts, dev):
+    vox = ((pts - at) @ ai.T).round().long()
+    shp = torch.as_tensor(vol.shape, device=dev)
+    vox = vox.clamp(min=torch.zeros(3, device=dev, dtype=torch.long), max=shp - 1)
+    return vol[vox[..., 0], vox[..., 1], vox[..., 2]]
+
+
+def load_model(ckpt, width=768, heads=12, dev="cuda"):
+    ck = torch.load(ckpt, map_location=dev)
+    E = M.Phase0Encoder(M.EncoderConfig(width=width, depth=12, heads=heads, n_series=8, patch_grid=(8, 8, 8))).to(dev)
+    E.load_state_dict(ck["model"], strict=False)
+    for p in E.parameters():
+        p.requires_grad_(False)
+    return E
+
+
+def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, res=1.0, seed=0,
+                 cover=False, dev="cuda", progress=None):
+    unit = S._cube_unit(8, dev); rng = np.random.default_rng(seed); out = []
+    for ci, pd in enumerate(patient_dirs):
+        pid = os.path.basename(pd)
+        if progress:
+            progress(f"prisms {ci+1}/{len(patient_dirs)}: {pid}")
+        try:
+            if pd in _BCACHE:
+                b = _BCACHE[pd]
+            else:
+                b = D.load_local_bundle(pid, pd, device=dev, with_seg=True)[0]
+                _BCACHE[pd] = b            # cache the loaded bundle so re-runs skip the slow nifti read
+        except Exception:
+            continue
+        sc0 = b["t1c"]; tmm = sc0.tumor_np
+        if tmm is None or len(tmm) == 0:
+            continue
+        fgn = sc0.foreground_np if sc0.foreground_np is not None else sc0.foreground_mm.cpu().numpy()
+        at, ai = sc0.affine_trans, sc0.affine_inv; half = prism_mm / 2.0
+        lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); G = len(lin)
+        gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij"); grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
+        if cover:                                          # full-coverage lattice, shared across prisms
+            nper = int(round(prism_mm / size))             # 32mm / 4mm = 8 cubes per axis (non-overlapping tiling)
+            cl = np.arange(-half + size / 2, half, size, dtype=np.float32)[:nper]
+            cgx, cgy, cgz = np.meshgrid(cl, cl, cl, indexing="ij")
+            lat = np.stack([cgx, cgy, cgz], -1).reshape(-1, 3)      # (512, 3) centers rel. anchor
+            cover_rel = np.tile(lat, (4, 1)).astype(np.float32)     # (2048, 3): 512 cells x 4 modalities
+            cover_sm = np.repeat(np.arange(4), len(lat))           # modality per patch
+        for _ in range(n_prisms):
+            anch = tmm[rng.integers(len(tmm))].astype(np.float32)
+            gpts = (grid + anch).astype(np.float32)
+            if cover:
+                cs = (cover_rel + anch).astype(np.float32); sm = cover_sm   # 8^3 x 4mod = 2048, voxel-complete
+            else:
+                cm = fgn[np.abs(fgn - anch).max(-1) <= half]
+                if len(cm) < n_src // 2:
+                    continue
+                cs = cm[rng.integers(len(cm), size=n_src)].astype(np.float32)
+                sm = rng.integers(4, size=n_src)
+            sp = np.zeros((len(cs), 8, 8, 8), np.float16)
+            for mi, m in enumerate(MODS):
+                sel = np.nonzero(sm == mi)[0]
+                if sel.size:
+                    sp[sel] = S._gather_cubes(b[m], torch.as_tensor(cs[sel], device=dev),
+                                              torch.full((sel.size,), size, device=dev), unit, dev).half().cpu().numpy()
+            gp = torch.as_tensor(gpts, device=dev)
+            gt = _at(sc0.seg_vol, at, ai, gp, dev).long()
+            gt = torch.where(gt == 4, torch.full_like(gt, 3), gt).cpu().numpy().astype(np.int8)
+            imgs = np.stack([_at(b[m].volume, b[m].affine_trans, b[m].affine_inv, gp, dev).float().cpu().numpy()
+                             for m in MODS]).astype(np.float16)
+            out.append(dict(sp=sp, sc=cs - anch, sm=sm, gpts=gpts - anch, gt=gt, imgs=imgs, gdim=G, pid=ci, pname=pid,
+                            anch=anch.copy(), prism_mm=prism_mm, res=res))
+        torch.cuda.empty_cache()       # b stays in _BCACHE for reuse
+    return out
+
+
+_BCACHE = {}
+_PCACHE = {}
+
+
+def _load_patient_cached(pdir, dev="cuda"):
+    if pdir not in _PCACHE:
+        b = D.load_local_bundle(os.path.basename(pdir), pdir, device=dev, with_seg=True)[0]
+        vols = {m: b[m].volume.cpu().numpy() for m in MODS}
+        sc = b["t1c"]
+        _PCACHE[pdir] = (vols, sc.seg_vol.cpu().numpy(), sc.affine_trans.cpu().numpy(), sc.affine_inv.cpu().numpy())
+    return _PCACHE[pdir]
+
+
+def native_render(result, psl, patients_root="/marimo/assets/patients"):
+    """All 4 native sequences at this prism slice, each with the 1px red prism box + shared TP/FP/FN(ET)
+    overlay. The box interior is filled DENSELY from the prism grid (inverse of the diagonal affine), so
+    the anisotropic grid→voxel scaling doesn't leave gaps. Returns ({modality: uint8 RGB}, brain_z, et_peak_slice)."""
+    vols, seg, at, ai = _load_patient_cached(f"{patients_root}/{result['pname']}")
+    seg = np.where(seg == 4, 3, seg)
+    G = result["gdim"]; half = result["prism_mm"] / 2.0; res = result["res"]; anch = result["anch"]
+    lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); psl = int(min(psl, G - 1))
+    shp = vols["t1c"].shape
+    # box footprint in voxels: map the 4 grid corners + centre plane through the (diagonal) affine
+    gx, gy = np.meshgrid(lin, lin, indexing="ij")
+    W = np.stack([anch[0] + gx, anch[1] + gy, np.full_like(gx, anch[2] + lin[psl])], -1).reshape(-1, 3)
+    V = np.round((W - at) @ ai.T).astype(int)
+    bz = int(np.clip(np.median(V[:, 2]), 0, shp[2] - 1))
+    Vx = np.clip(V[:, 0], 0, shp[0] - 1); Vy = np.clip(V[:, 1], 0, shp[1] - 1)
+    x0, x1, y0, y1 = int(Vx.min()), int(Vx.max()), int(Vy.min()), int(Vy.max())
+    # DENSE fill: for each brain voxel row/col in the box, look up its nearest prism-grid index
+    aix, aiy = ai[0, 0], ai[1, 1]
+    xs = np.arange(x0, x1 + 1); ys = np.arange(y0, y1 + 1)
+    ii = np.clip(np.round(((xs / aix + at[0]) - anch[0] + half) / res).astype(int), 0, G - 1)
+    jj = np.clip(np.round(((ys / aiy + at[1]) - anch[1] + half) / res).astype(int), 0, G - 1)
+    gt2 = result["gt"][:, :, psl]; pred2 = result["pred"][:, :, psl]
+    box_gt = gt2[np.ix_(ii, jj)] == 3; box_pred = pred2[np.ix_(ii, jj)] == 3   # dense (box-shaped) ET masks
+    inbox = np.zeros(shp[:2], bool); inbox[x0:x1 + 1, y0:y1 + 1] = True
+    tp = np.zeros(shp[:2], bool); fp = np.zeros(shp[:2], bool); fn = np.zeros(shp[:2], bool)
+    tp[x0:x1 + 1, y0:y1 + 1] = box_gt & box_pred
+    fp[x0:x1 + 1, y0:y1 + 1] = box_pred & ~box_gt
+    fn[x0:x1 + 1, y0:y1 + 1] = box_gt & ~box_pred
+    outside_et = (seg[:, :, bz] == 3) & ~inbox                      # GT-ET elsewhere in the slice (context only)
+    et_peak = int((result["gt"] == 3).sum((0, 1)).argmax())
+    panels = {}; clean = {}
+    for name, key in [("T1", "t1"), ("T1c", "t1c"), ("T2", "t2"), ("FLAIR", "flair")]:
+        sl = vols[key][:, :, bz].astype(np.float32); lo, hi = np.percentile(sl, 1), np.percentile(sl, 99.5)
+        base = np.stack([np.clip((sl - lo) / (hi - lo + 1e-6), 0, 1)] * 3, -1)
+        clean[name] = (np.rot90(base) * 255).astype(np.uint8)              # raw, no overlay
+        rgb = base.copy()
+        rgb[outside_et] = 0.72 * rgb[outside_et] + 0.28 * np.array([1, .85, 0])
+        rgb[tp] = 0.45 * rgb[tp] + 0.55 * np.array([0, .9, .25])
+        rgb[fp] = 0.35 * rgb[fp] + 0.65 * np.array([1, .12, .12])
+        rgb[fn] = 0.35 * rgb[fn] + 0.65 * np.array([.2, .5, 1])
+        rgb[x0:x1 + 1, y0] = [1, 0, 0]; rgb[x0:x1 + 1, y1] = [1, 0, 0]
+        rgb[x0, y0:y1 + 1] = [1, 0, 0]; rgb[x1, y0:y1 + 1] = [1, 0, 0]
+        panels[name] = (np.rot90(rgb) * 255).astype(np.uint8)
+    return panels, clean, bz, et_peak
+
+
+def context_fill(result, psl, size=4.0, patients_root="/marimo/assets/patients", zt=2.0):
+    """A black canvas the size of the scan, with ONLY the sampled context-patch footprints filled in with
+    the native anatomy at those locations, per modality. Reads the display volume directly at each patch's
+    voxel footprint (sized from the patient's affine), so it stays exactly registered to the scan — no flip,
+    gap, or offset regardless of the acquisition grid. Black = the model never sampled there. Returns (panels, n_near)."""
+    vols, seg, at, ai = _load_patient_cached(f"{patients_root}/{result['pname']}")
+    G = result["gdim"]; half = result["prism_mm"] / 2.0; res = result["res"]; anch = result["anch"]
+    lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); psl = int(min(psl, G - 1))
+    shp = vols["t1c"].shape; world_z = anch[2] + lin[psl]
+    # brain slice for this prism plane (identical to native_render)
+    gx, gy = np.meshgrid(lin, lin, indexing="ij")
+    W = np.stack([anch[0] + gx, anch[1] + gy, np.full_like(gx, world_z)], -1).reshape(-1, 3)
+    bz = int(np.clip(np.median(np.round((W - at) @ ai.T)[:, 2]), 0, shp[2] - 1))
+    sm = result["sm"]
+    SW = anch[None, :] + result["sc"]; SV = np.round((SW - at) @ ai.T).astype(int)
+    near = np.abs(SW[:, 2] - world_z) <= zt                                # patches whose extent hits this slice
+    rx = max(1, int(round(size * abs(ai[0, 0]) / 2))); ry = max(1, int(round(size * abs(ai[1, 1]) / 2)))  # footprint in voxels
+    panels = {}
+    for mi, (name, key) in enumerate([("T1", "t1"), ("T1c", "t1c"), ("T2", "t2"), ("FLAIR", "flair")]):
+        sl = vols[key][:, :, bz].astype(np.float32); lo, hi = np.percentile(sl, 1), np.percentile(sl, 99.5)
+        norm = np.clip((sl - lo) / (hi - lo + 1e-6), 0, 1)                  # same normalisation as the raw row
+        canvas = np.zeros(shp[:2], np.float32); filled = np.zeros(shp[:2], bool)
+        for k in np.nonzero(near & (sm == mi))[0]:
+            vx, vy = int(SV[k, 0]), int(SV[k, 1])
+            xa, xb, ya, yb = vx - rx, vx + rx, vy - ry, vy + ry
+            if xa < 0 or ya < 0 or xb > shp[0] or yb > shp[1]:
+                continue
+            canvas[xa:xb, ya:yb] = norm[xa:xb, ya:yb]; filled[xa:xb, ya:yb] = True   # native anatomy, aligned
+        rgb = np.stack([canvas] * 3, -1); rgb[~filled] = 0
+        panels[name] = (np.rot90(rgb) * 255).astype(np.uint8)
+    return panels, int(near.sum())
+
+
+def _encode_src(E, sp, sc, sm, size, dev):
+    """Encode a prism's source bag once. Encoder is frozen, so the result is a constant that can be
+    reused across every query chunk and every fine-tune epoch. Returns (ctx, cc)."""
+    nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
+    zs = torch.full((nb, sp.shape[1], 3), size, device=dev)
+    with torch.no_grad():
+        x = E.encode(*E._context([E.embed(sp, zs, sm)], [sc], dev, nb))
+        ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
+    return ctx, cc
+
+
+def _decode_q(E, seg_tok, ctx, cc, qp, qsize, dev):
+    """Decode query points against a pre-encoded source context. Gradients flow through the decoder
+    (and seg_tok / query_seed), never the frozen ctx."""
+    nb = qp.shape[0]; zt = torch.full((nb, qp.shape[1], 3), qsize, device=dev)
+    q = (E.query_seed[None, None, :] + E._size_emb(zt) + seg_tok[None, None, :]).contiguous()
+    return E._decode(q, ctx, cc, qp)
+
+
+def _prism_src(E, pr, size, dev):
+    sp = torch.as_tensor(pr["sp"][None], device=dev).float(); sc = torch.as_tensor(pr["sc"][None], device=dev).float()
+    sm = torch.as_tensor(pr["sm"][None], device=dev).long()
+    return _encode_src(E, sp, sc, sm, size, dev)
+
+
+def _dense(E, seg_tok, pr, size, qsize, dev, src=None):
+    ctx, cc = _prism_src(E, pr, size, dev) if src is None else src   # encode source ONCE, reuse per chunk
+    coords = torch.as_tensor(pr["gpts"], device=dev).float()
+    with torch.no_grad():
+        sl = [_decode_q(E, seg_tok, ctx, cc, coords[c0:c0 + 4096][None], qsize, dev)[0]
+              for c0 in range(0, coords.shape[0], 4096)]
+    return torch.cat(sl)
+
+
+def _gl(head, sl, G):
+    return head(sl.reshape(G, G, G, -1).permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
+
+
+def _dsc(pred, gt):
+    inter = (pred & gt).sum().item(); s = pred.sum().item() + gt.sum().item()
+    return -1.0 if s == 0 else 2.0 * inter / s
+
+
+def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
+                size=4.0, qsize=2.0, seed=0, dev="cuda", progress=None):
+    """Fine-tune the seg readout on train_prisms (fit patients), then predict + score on eval_prisms
+    (disjoint eval patients). No k-fold: fit and eval patient pools are separate by construction."""
+    rng = np.random.default_rng(seed); tr, te = train_prisms, eval_prisms
+    results = []
+    if not tr or not te:
+        return results
+    src_tr = [_prism_src(E, pr, size, dev) for pr in tr]   # frozen source encodings, reused every epoch
+    seg_tok = (E.seg_query.detach().clone().to(dev) if (warmstart and hasattr(E, "seg_query"))
+               else torch.zeros(E.cfg.width, device=dev)).requires_grad_(True)
+    dec = list(E.decoder)[-unfreeze:]; lin = torch.nn.Linear(E.cfg.width, 4).to(dev)
+    if warmstart and hasattr(E, "seg_cls_head"):
+        with torch.no_grad():
+            lin.weight.copy_(E.seg_cls_head.weight); lin.bias.copy_(E.seg_cls_head.bias)
+    params = list(lin.parameters()) + [seg_tok, E.query_seed]
+    for blk in dec:
+        for p in blk.parameters():
+            p.requires_grad_(True); params.append(p)
+    opt = torch.optim.Adam(params, lr=1e-3)
+    for e in range(epochs):
+        if progress:
+            progress(f"fine-tune · decoder epoch {e+1}/{epochs}")
+        for i in rng.permutation(len(tr)):
+            pr = tr[i]; ctx, cc = src_tr[i]
+            sub = rng.integers(len(pr["gt"]), size=384)
+            qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
+            y = torch.as_tensor(pr["gt"][sub], device=dev).long()
+            cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
+            logit = lin(_decode_q(E, seg_tok, ctx, cc, qp, qsize, dev)).reshape(-1, 4)
+            opt.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt.step()
+    seg_tok.requires_grad_(False); E.query_seed.requires_grad_(False)
+    for m in [lin, *dec]:
+        for p in m.parameters():
+            p.requires_grad_(False)
+    emb_tr = [_dense(E, seg_tok, pr, size, qsize, dev, src=src_tr[i]).half().cpu() for i, pr in enumerate(tr)]
+    conv = SmoothHead(E.cfg.width).to(dev); opt2 = torch.optim.Adam(conv.parameters(), lr=1e-3)
+    for e in range(epochs2):
+        if progress:
+            progress(f"fine-tune · conv epoch {e+1}/{epochs2}")
+        for i in rng.permutation(len(tr)):
+            pr = tr[i]; G = pr["gdim"]; bb = min(11, G); o = rng.integers(0, G - bb + 1, size=3)
+            ev = emb_tr[i].reshape(G, G, G, -1)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].to(dev).float()
+            y = torch.as_tensor(pr["gt"].reshape(G, G, G)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].reshape(-1), device=dev).long()
+            logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
+            cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
+            opt2.zero_grad(); torch.nn.functional.cross_entropy(logit, y, weight=w).backward(); opt2.step()
+    with torch.no_grad():
+        for j, pr in enumerate(te):
+            if progress:
+                progress(f"evaluating {j+1}/{len(te)} lesions")
+            G = pr["gdim"]; sl = _dense(E, seg_tok, pr, size, qsize, dev)
+            pred = _gl(conv, sl, G).argmax(1).cpu().numpy().astype(np.int8)
+            gt = pr["gt"]
+            d = {r: _dsc(torch.as_tensor(np.isin(pred, list(cls))), torch.as_tensor(np.isin(gt, list(cls)))) for r, cls in REGIONS.items()}
+            results.append(dict(pname=pr["pname"], gdim=G, imgs=pr["imgs"].reshape(4, G, G, G),
+                                gt=gt.reshape(G, G, G), pred=pred.reshape(G, G, G),
+                                anch=pr["anch"], prism_mm=pr["prism_mm"], res=pr["res"],
+                                sp=pr["sp"], sc=pr["sc"], sm=pr["sm"],   # source context patch content + centers + modality
+                                et_vox=int((gt == 3).sum()), tc_vox=int(np.isin(gt, [1, 3]).sum()),
+                                dsc_et=d["ET"], dsc_tc=d["TC"], dsc_wt=d["WT"]))
+    return results
