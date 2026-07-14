@@ -37,7 +37,7 @@ def load_model(ckpt, width=768, heads=12, dev="cuda"):
 
 
 def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, res=1.0, seed=0,
-                 cover=False, dev="cuda", progress=None):
+                 cover=False, neg_frac=0.0, dev="cuda", progress=None):
     unit = S._cube_unit(8, dev); rng = np.random.default_rng(seed); out = []
     for ci, pd in enumerate(patient_dirs):
         pid = os.path.basename(pd)
@@ -66,7 +66,14 @@ def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, re
             cover_rel = np.tile(lat, (4, 1)).astype(np.float32)     # (2048, 3): 512 cells x 4 modalities
             cover_sm = np.repeat(np.arange(4), len(lat))           # modality per patch
         for _ in range(n_prisms):
-            anch = tmm[rng.integers(len(tmm))].astype(np.float32)
+            if rng.random() < neg_frac:                                    # hard-negative: a prism with NO tumor
+                cand = fgn[rng.integers(len(fgn), size=64)].astype(np.float32)
+                free = cand[~(np.abs(tmm[None] - cand[:, None]).max(-1) <= half).any(1)]  # no tumor within the prism box
+                if len(free) == 0:
+                    continue
+                anch = free[0]
+            else:
+                anch = tmm[rng.integers(len(tmm))].astype(np.float32)       # anchor ON a tumor voxel
             gpts = (grid + anch).astype(np.float32)
             if cover:
                 cs = (cover_rel + anch).astype(np.float32); sm = cover_sm   # 8^3 x 4mod = 2048, voxel-complete
