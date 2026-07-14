@@ -97,6 +97,7 @@ def main():
     ap.add_argument("--size", type=float, default=4.0, help="source patch mm (uniform, unless --src-sizes)"); ap.add_argument("--prism-mm", type=float, default=32.0)
     ap.add_argument("--src-sizes", default=None, help="mixed-scale source: comma sizes e.g. '2,3,4' — each source patch a random one (multi-scale context, matches multi-size training). None=uniform --size.")
     ap.add_argument("--src-mult", type=int, default=1, help="oversample source context by this factor (heavy multi-scale inference context, e.g. 3x the ~96 seen in training)")
+    ap.add_argument("--cover", action="store_true", help="full-coverage source: tile the prism with (prism_mm/size)^3 non-overlapping --size cubes x 4 modalities (voxel-complete context; ignores --n-src/--src-mult/--src-sizes)")
     ap.add_argument("--res", type=float, default=2.0, help="dense query grid STRIDE mm (metric resolution)")
     ap.add_argument("--qsize", type=float, default=4.0, help="query SIZE embedding mm (in-distribution w/ pretrain patch size, independent of stride)")
     ap.add_argument("--tol", type=float, default=2.0, help="NSD tolerance mm")
@@ -115,6 +116,14 @@ def main():
     def build_prisms(dirs, npat, nprism, exclude, label):
         """Build tumor-anchored dense prisms from up to npat patients in dirs (skip exclude ids / no-seg / no-tumor)."""
         out = []; ctr = 0
+        cover_rel = cover_sm = None
+        if a.cover:                                                            # full-coverage lattice (shared across prisms)
+            nper = int(round(a.prism_mm / a.size))                            # e.g. 32/4 = 8 cubes per axis
+            cl = np.arange(-a.prism_mm / 2 + a.size / 2, a.prism_mm / 2, a.size, dtype=np.float32)[:nper]
+            cgx, cgy, cgz = np.meshgrid(cl, cl, cl, indexing="ij")
+            lat = np.stack([cgx, cgy, cgz], -1).reshape(-1, 3)                # (nper^3, 3) centres rel. anchor
+            cover_rel = np.tile(lat, (4, 1)).astype(np.float32)              # x4 modalities
+            cover_sm = np.repeat(np.arange(4), len(lat))
         for d in dirs:
             if ctr >= npat:
                 break
@@ -139,14 +148,18 @@ def main():
             for _ in range(nprism):
                 anch = tmm[rng.integers(len(tmm))].astype(np.float32)            # anchor ON a tumor voxel
                 gpts = (grid + anch).astype(np.float32)                         # dense query voxels (world-mm)
-                cm = fgn[np.abs(fgn - anch).max(-1) <= half]                    # foreground INSIDE the prism
-                if len(cm) < a.n_src // 2:
-                    continue
-                nsrc = a.n_src * a.src_mult                                     # heavy multi-scale context = more patches
-                cs = cm[rng.integers(len(cm), size=nsrc)].astype(np.float32)     # source context sampled inside the prism
-                sm = rng.integers(4, size=nsrc)
-                ssz = (rng.choice(src_sizes, size=nsrc) if src_sizes is not None  # per-patch scale (mixed) or uniform --size
-                       else np.full(nsrc, a.size)).astype(np.float32)
+                if a.cover:                                                     # voxel-complete lattice x 4 modalities
+                    cs = (cover_rel + anch).astype(np.float32); sm = cover_sm
+                    nsrc = len(cs); ssz = np.full(nsrc, a.size, np.float32)
+                else:
+                    cm = fgn[np.abs(fgn - anch).max(-1) <= half]                # foreground INSIDE the prism
+                    if len(cm) < a.n_src // 2:
+                        continue
+                    nsrc = a.n_src * a.src_mult                                 # heavy multi-scale context = more patches
+                    cs = cm[rng.integers(len(cm), size=nsrc)].astype(np.float32)  # source context sampled inside the prism
+                    sm = rng.integers(4, size=nsrc)
+                    ssz = (rng.choice(src_sizes, size=nsrc) if src_sizes is not None  # per-patch scale (mixed) or uniform --size
+                           else np.full(nsrc, a.size)).astype(np.float32)
                 sp = np.zeros((nsrc, V, V, V), np.float16)
                 for mi, m in enumerate(MODS):
                     sel = np.nonzero(sm == mi)[0]
@@ -293,7 +306,7 @@ def main():
         rl, rc = run(E)
         pool = f"train{len(train_prisms)}p" if train_prisms is not None else "kfold5"
         ws = "+warmstart" if a.warmstart_seg else ""
-        src = f"src{a.src_sizes}x{a.src_mult}" if a.src_sizes else f"src{a.size}mm"
+        src = f"cover{a.size}mm(2048)" if a.cover else (f"src{a.src_sizes}x{a.src_mult}" if a.src_sizes else f"src{a.size}mm")
         tag = f"{nm} step{step} denseseg[{pool}{ws}] {src}/qsize{a.qsize}mm/stride{a.res}mm"
         print(f"{tag} [stage1 linear]: " + " | ".join(f"{k} DSC {v[0]:.3f} NSD {v[1]:.3f}(n{v[2]})" for k, v in rl.items()), flush=True)
         if rc is not None:

@@ -38,7 +38,7 @@ POOL=()
 .venv/bin/python -u scripts/eval_denseseg.py --data-root /tmp/ho --tracks mets_ho --device cuda \
     --n-patients "${NPAT:-51}" --val-frac "${VALFRAC:-0}" --n-src "${NSRC:-96}" \
     --unfreeze "${UNFREEZE:-12}" --res "${RES:-2}" --qsize "${QSIZE:-4}" --size "${SIZE:-4}" \
-    ${SRC_SIZES:+--src-sizes ${SRC_SIZES}} --src-mult "${SRC_MULT:-1}" \
+    ${SRC_SIZES:+--src-sizes ${SRC_SIZES}} --src-mult "${SRC_MULT:-1}" ${COVER:+--cover} \
     --head "${HEAD:-conv}" --block "${BLOCK:-11}" ${WARMSTART:+--warmstart-seg} \
     --train-root "${TRAIN_ROOT:-~/xmodal/data/brats26}" ${POOL[@]+"${POOL[@]}"} \
     --epochs "${EPOCHS:-30}" --epochs2 "${EPOCHS2:-60}" \
