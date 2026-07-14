@@ -28,9 +28,10 @@ nvidia-smi --query-gpu=name --format=csv,noheader
 [ -d /tmp/ho/mets_ho ] && [ -n "$(ls -A /tmp/ho/mets_ho 2>/dev/null)" ] || { echo "FATAL: held-out reconstruction failed"; exit 1; }
 
 ARMS="${ARMS:-v5_both_tumor_s0}"
+STEPGLOB="${STEPGLOB:-step_*.pt}"    # set e.g. step_070000.pt to eval a single checkpoint (fast A/B)
 CK=()
 for arm in $ARMS; do
-  ls runs/$arm/step_*.pt >/dev/null 2>&1 && CK+=("${arm}=runs/${arm}/step_*.pt")
+  ls runs/$arm/${STEPGLOB} >/dev/null 2>&1 && CK+=("${arm}=runs/${arm}/${STEPGLOB}")
 done
 echo "dense-seg (unfreeze=${UNFREEZE:-12} res=${RES:-2}mm) over: $ARMS"
 POOL=()
