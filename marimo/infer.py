@@ -185,6 +185,57 @@ def context_fill(result, psl, size=4.0, patients_root="/marimo/assets/patients",
     return panels, int(near.sum())
 
 
+_LBL = [("NCR", 1, [0, .45, 1]), ("edema", 2, [0, .85, .3]), ("ET", 3, [1, .25, .15])]  # blue / green / red
+
+
+def _box_map(result, psl, vols, at, ai):
+    """Dense map from the prism grid onto brain-voxel box coords at this slice (inverse of the diagonal
+    affine). Returns (bz, x0,x1,y0,y1, box_gt_labels, box_pred_labels) — full label maps (0..3), box-shaped."""
+    G = result["gdim"]; half = result["prism_mm"] / 2.0; res = result["res"]; anch = result["anch"]
+    lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); psl = int(min(psl, G - 1))
+    shp = vols["t1c"].shape
+    gx, gy = np.meshgrid(lin, lin, indexing="ij")
+    W = np.stack([anch[0] + gx, anch[1] + gy, np.full_like(gx, anch[2] + lin[psl])], -1).reshape(-1, 3)
+    V = np.round((W - at) @ ai.T).astype(int)
+    bz = int(np.clip(np.median(V[:, 2]), 0, shp[2] - 1))
+    Vx = np.clip(V[:, 0], 0, shp[0] - 1); Vy = np.clip(V[:, 1], 0, shp[1] - 1)
+    x0, x1, y0, y1 = int(Vx.min()), int(Vx.max()), int(Vy.min()), int(Vy.max())
+    xs = np.arange(x0, x1 + 1); ys = np.arange(y0, y1 + 1)
+    ii = np.clip(np.round(((xs / ai[0, 0] + at[0]) - anch[0] + half) / res).astype(int), 0, G - 1)
+    jj = np.clip(np.round(((ys / ai[1, 1] + at[1]) - anch[1] + half) / res).astype(int), 0, G - 1)
+    bg = result["gt"][:, :, psl][np.ix_(ii, jj)]; bp = result["pred"][:, :, psl][np.ix_(ii, jj)]
+    return bz, x0, x1, y0, y1, bg, bp
+
+
+def _dsc_lab(a, b):
+    inter = int((a & b).sum()); s = int(a.sum()) + int(b.sum())
+    return -1.0 if s == 0 else 2.0 * inter / s
+
+
+def multiclass_render(result, psl, bases=("T1c", "FLAIR"), patients_root="/marimo/assets/patients"):
+    """GT vs Pred with ALL tumor classes colour-coded (NCR blue, edema green, ET red) on the native
+    base modalities, dense box fill. Returns ({f'{base} {GT|Pred}': uint8 RGB}, bz, per-class dice)."""
+    vols, seg, at, ai = _load_patient_cached(f"{patients_root}/{result['pname']}")
+    bz, x0, x1, y0, y1, bg, bp = _box_map(result, psl, vols, at, ai)
+    keymap = {"T1": "t1", "T1c": "t1c", "T2": "t2", "FLAIR": "flair"}
+    def paint(base_rgb, labels):
+        rgb = base_rgb.copy()
+        for _, lab, col in _LBL:
+            m = np.zeros(rgb.shape[:2], bool); m[x0:x1 + 1, y0:y1 + 1] = labels == lab
+            rgb[m] = 0.35 * rgb[m] + 0.65 * np.array(col)
+        return (np.rot90(rgb) * 255).astype(np.uint8)
+    panels = {}
+    for base in bases:
+        sl = vols[keymap[base]][:, :, bz].astype(np.float32); lo, hi = np.percentile(sl, 1), np.percentile(sl, 99.5)
+        base_rgb = np.stack([np.clip((sl - lo) / (hi - lo + 1e-6), 0, 1)] * 3, -1)
+        panels[f"{base} GT"] = paint(base_rgb, bg); panels[f"{base} Pred"] = paint(base_rgb, bp)
+    g3, p3 = result["gt"], result["pred"]
+    dice = {n: _dsc_lab(p3 == lab, g3 == lab) for n, lab, _ in _LBL}
+    dice["TC"] = _dsc_lab(np.isin(p3, [1, 3]), np.isin(g3, [1, 3]))
+    dice["WT"] = _dsc_lab(np.isin(p3, [1, 2, 3]), np.isin(g3, [1, 2, 3]))
+    return panels, bz, dice
+
+
 def _encode_src(E, sp, sc, sm, size, dev):
     """Encode a prism's source bag once. Encoder is frozen, so the result is a constant that can be
     reused across every query chunk and every fine-tune epoch. Returns (ctx, cc)."""
