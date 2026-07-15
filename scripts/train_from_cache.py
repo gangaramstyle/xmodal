@@ -21,6 +21,11 @@ def load_prism(path, sampling, n_src):
     gpts = np.stack([gx, gy, gz], -1).reshape(-1, 3).astype(np.float32)   # anchor-relative query grid
     if sampling == "cover":
         sp, sc, sm = d["sp_cover"].numpy(), d["sc_cover"].numpy(), d["sm_cover"].numpy().astype(np.int64)
+    elif sampling == "hybrid":                                    # full cover + n_src random on top
+        k = min(n_src, d["sp_rand"].shape[0])
+        sp = np.concatenate([d["sp_cover"].numpy(), d["sp_rand"][:k].numpy()])
+        sc = np.concatenate([d["sc_cover"].numpy(), d["sc_rand"][:k].numpy()])
+        sm = np.concatenate([d["sm_cover"].numpy(), d["sm_rand"][:k].numpy()]).astype(np.int64)
     else:
         k = min(n_src, d["sp_rand"].shape[0])
         sp, sc, sm = d["sp_rand"][:k].numpy(), d["sc_rand"][:k].numpy(), d["sm_rand"][:k].numpy().astype(np.int64)
@@ -47,7 +52,7 @@ def main():
     ap.add_argument("--cache", default="prism_cache"); ap.add_argument("--val-cache", default="prism_cache_val")
     ap.add_argument("--data-root", default="data/brats26/mets_train")
     ap.add_argument("--n-patients", type=int, default=100); ap.add_argument("--n-tumor", type=int, default=6)
-    ap.add_argument("--n-neg", type=int, default=6); ap.add_argument("--sampling", default="random", choices=["random", "cover"])
+    ap.add_argument("--n-neg", type=int, default=6); ap.add_argument("--sampling", default="random", choices=["random", "cover", "hybrid"])
     ap.add_argument("--n-src", type=int, default=2048)
     ap.add_argument("--n-test", type=int, default=51); ap.add_argument("--test-tumor", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=20); ap.add_argument("--epochs2", type=int, default=40)
