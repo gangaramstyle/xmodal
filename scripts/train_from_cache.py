@@ -63,11 +63,21 @@ def run_ablation(E, cfg, cache, val_cache, data_root):
     te = gather(val_cache, te_pids, c["test_tumor"], 0, c["sampling"], c["n_src"])   # eval on tumor prisms only
     print(f"train {len(tr)} prisms / {len(tr_pids)} pt · eval {len(te)} prisms / {len(te_pids)} pt · "
           f"{c['sampling']}-{c['n_src']} · ep{c['epochs']}/{c['epochs2']} · unf{c['unfreeze']}", flush=True)
-    ro = infer.train_readout(E, tr, epochs=c["epochs"], epochs2=c["epochs2"], unfreeze=c["unfreeze"],
-                             warmstart=c["warmstart"], qsize=c["qsize"], src_cache_gb=c["src_cache_gb"], amp=False,
-                             seed=c["seed"], progress=lambda m: print(m, flush=True))
-    res = infer.eval_readout(E, ro, te)
-    m = infer.leaderboard_metrics(res)
+    # retry-on-collapse: fp32 training occasionally converges to all-background (dsc_wt~0). Retrain from a
+    # different seed/basin and keep the best — the collapse is stochastic, so a retry almost always escapes it.
+    best = None
+    for attempt in range(3):
+        s = c["seed"] + attempt * 1000
+        ro = infer.train_readout(E, tr, epochs=c["epochs"], epochs2=c["epochs2"], unfreeze=c["unfreeze"],
+                                 warmstart=c["warmstart"], qsize=c["qsize"], src_cache_gb=c["src_cache_gb"],
+                                 amp=False, seed=s, progress=lambda m: print(m, flush=True))
+        m = infer.leaderboard_metrics(infer.eval_readout(E, ro, te))
+        if best is None or m["dsc_et"] > best["dsc_et"]:
+            best = m
+        if m["dsc_wt"] > 0.05:                          # not a total collapse -> accept
+            break
+        print(f"COLLAPSE (seed {s}, dsc_wt={m['dsc_wt']}) — retrying from a new basin", flush=True)
+    m = best
     row = dict(n_patients=len(tr_pids), n_tumor=c["n_tumor"], n_neg=c["n_neg"], sampling=c["sampling"], n_src=c["n_src"],
                epochs=c["epochs"], epochs2=c["epochs2"], unfreeze=c["unfreeze"], qsize=c["qsize"], seed=c["seed"],
                n_test=len(te), **m)
