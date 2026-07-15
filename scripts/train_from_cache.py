@@ -14,7 +14,7 @@ from xmodal import data as D, holdout as H
 
 def load_prism(path, sampling, n_src):
     """Turn a cached .pt into the prism dict train_readout/eval_readout expect (sp/sc/sm/gpts/gt/imgs...)."""
-    d = torch.load(path, map_location="cpu")
+    d = torch.load(path, map_location="cpu", weights_only=False)   # prism dict holds a numpy array (anch); torch>=2.6 needs this
     G = d["gdim"]; half = d["prism_mm"] / 2.0; res = d["res"]
     lin = np.arange(-half, half + 1e-3, res, dtype=np.float32)[:G]
     gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")

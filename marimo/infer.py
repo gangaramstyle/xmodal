@@ -609,7 +609,7 @@ def cache_result(src, sampling="random", n_src=None):
     if isinstance(src, str):
         src = _r2_get_bytes(_r2_store(), src)
     if isinstance(src, (bytes, bytearray)):
-        src = torch.load(io.BytesIO(bytes(src)), map_location="cpu")
+        src = torch.load(io.BytesIO(bytes(src)), map_location="cpu", weights_only=False)
     G = src["gdim"]
     if sampling == "cover":
         sc, sm = src["sc_cover"].numpy(), src["sm_cover"].numpy().astype(int)
