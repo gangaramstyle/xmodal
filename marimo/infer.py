@@ -1,6 +1,6 @@
 """In-molab inference: build tumor prisms, fine-tune the seg decoder readout, predict per lesion.
 Reuses the xmodal repo's data loader + sampling (identical to the CUBIC eval). Options exposed."""
-import sys, os, io, json, hashlib, contextlib
+import sys, os, io, json, hashlib, contextlib, shutil
 sys.path.insert(0, "/marimo/xmodal/src")
 import numpy as np, torch
 try:
@@ -421,28 +421,35 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     for m in [lin, *dec]:
         for p in m.parameters():
             p.requires_grad_(False)
-    # stage 2: cache dense embeddings for only as many prisms as fit conv_cache_gb (conv is a light head)
+    # stage 2: the dense per-voxel embeddings are big (G^3 x width ~ 55MB/prism). Write them to node-local
+    # $TMPDIR (SLURM auto-wipes it at job end) and mmap per step — the job needs little RAM and never OOMs; the
+    # OS page cache keeps hot prisms in memory. Seeded subset capped by conv_cache_gb (disk) -> result-invariant.
     G0 = tr[0]["gdim"]; per_mb = (G0 ** 3) * E.cfg.width * 2 / 1e6
     kmax = max(1, min(len(tr), int(conv_cache_gb * 1000 / max(per_mb, 1e-6))))
     cidx = list(rng.permutation(len(tr))[:kmax])
+    tmpd = os.path.join(os.environ.get("TMPDIR") or "/tmp", f"convemb_{os.getpid()}")
+    os.makedirs(tmpd, exist_ok=True)
     if progress:
-        progress(f"caching {kmax}/{len(tr)} prism embeddings for conv (~{kmax*per_mb/1000:.0f}GB)")
-    emb = {}
+        progress(f"caching {kmax}/{len(tr)} prism embeddings to disk {tmpd} (~{kmax*per_mb/1000:.0f}GB)")
+    epaths = {}
     with ac():
         for i in cidx:
-            emb[i] = _dense(E, seg_tok, tr[i], size, qsize, dev, src=src_tr.get(i)).half().cpu()
+            arr = _dense(E, seg_tok, tr[i], size, qsize, dev, src=src_tr.get(i)).half().cpu().numpy()
+            epaths[i] = os.path.join(tmpd, f"{i}.npy"); np.save(epaths[i], arr)
     conv = SmoothHead(E.cfg.width).to(dev); opt2 = torch.optim.Adam(conv.parameters(), lr=1e-3)
     for e in range(epochs2):
         if progress:
             progress(f"fine-tune · conv epoch {e+1}/{epochs2}")
         for i in rng.permutation(cidx):
             pr = tr[i]; G = pr["gdim"]; bb = min(11, G); o = rng.integers(0, G - bb + 1, size=3)
-            ev = emb[i].reshape(G, G, G, -1)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].to(dev).float()
+            arr = np.load(epaths[i], mmap_mode="r").reshape(G, G, G, -1)   # mmap: only the crop's pages are read
+            ev = torch.from_numpy(np.ascontiguousarray(arr[o[0]:o[0]+bb, o[1]:o[1]+bb, o[2]:o[2]+bb])).to(dev).float()
             y = torch.as_tensor(pr["gt"].reshape(G, G, G)[o[0]:o[0] + bb, o[1]:o[1] + bb, o[2]:o[2] + bb].reshape(-1), device=dev).long()
             cnt = torch.bincount(y, minlength=4).float(); w = len(y) / (4 * cnt.clamp(min=1))
             with ac():
                 logit = conv(ev.permute(3, 0, 1, 2)[None])[0].permute(1, 2, 3, 0).reshape(-1, 4)
             opt2.zero_grad(); torch.nn.functional.cross_entropy(logit.float(), y, weight=w).backward(); opt2.step()
+    shutil.rmtree(tmpd, ignore_errors=True)             # belt-and-suspenders; SLURM also wipes $TMPDIR
     cpu = lambda sd: {k: v.detach().cpu() for k, v in sd.items()}
     return {"seg_tok": seg_tok.detach().cpu(), "query_seed": E.query_seed.detach().cpu(),
             "dec": [cpu(blk.state_dict()) for blk in dec], "lin": cpu(lin.state_dict()),

@@ -1,8 +1,9 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 #SBATCH --output=/cbica/home/gangarav/xmodal/awork_%A_%a.log
-# 64G covers the stage-2 conv embedding cache (~50GB for the largest configs); p100 nodes have ~185G.
+# Stage-2 conv embeddings now go to node-local $TMPDIR (mmap), so we no longer need to hold them in RAM.
+# 32G is page-cache headroom (never OOMs — overflow just re-reads from local disk).
 # partition / --gres=gpu:<type>:1 / --time / --mem are passed at submit time (see launch below).
 # TIER (small|big) and WALL (seconds, match --time) come from the environment.
 set -e
