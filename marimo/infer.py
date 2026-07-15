@@ -386,6 +386,9 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     n_src (>~2900 source patches) — the cross-attention loses too much precision. Left OFF by default; only
     enable for small source bags. Returns a portable (CPU) readout dict."""
     rng = np.random.default_rng(seed); tr = train_prisms
+    torch.manual_seed(seed)                               # seed TORCH too — else the linear head + conv init are
+    if str(dev) == "cuda":                                # random every run and the same config drifts ~0.1 DSC
+        torch.cuda.manual_seed_all(seed)
     def ac():
         return torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()
     src_tr = _SrcStore(E, tr, size, dev, budget_gb=src_cache_gb)   # cache-or-stream; INVARIANT to budget
