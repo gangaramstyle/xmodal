@@ -3,7 +3,10 @@ Reuses the xmodal repo's data loader + sampling (identical to the CUBIC eval). O
 import sys, os, io, json, hashlib, contextlib
 sys.path.insert(0, "/marimo/xmodal/src")
 import numpy as np, torch
-from PIL import Image
+try:
+    from PIL import Image   # only needed by the render helpers (molab); train/eval don't use it
+except ImportError:
+    Image = None
 from xmodal import data as D, model as M, sampling as S
 
 MODS = ["t1", "t1c", "t2", "flair"]
