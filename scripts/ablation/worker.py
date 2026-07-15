@@ -30,24 +30,25 @@ def claim(root):
     return None
 
 
-def reclaim_stale(root, jobid):
-    try:
-        live = set(subprocess.check_output(
-            ["squeue", "-u", os.environ.get("USER", "gangarav"), "-h", "-o", "%i"]).decode().split())
-    except Exception:
-        return
+def reclaim_stale(root, lease=7200):
+    """Return running tickets whose lease has expired (worker died mid-run) to pending. Time-based, NOT squeue-
+    based: a freshly-claimed ticket (started ~now) is never reclaimed, so concurrent workers don't fight over it.
+    lease=2h comfortably exceeds any single job's runtime."""
     run = os.path.join(root, "running")
     for f in os.listdir(run):
         if not f.endswith(".json"):
             continue
+        p = os.path.join(run, f)
         try:
-            t = json.load(open(os.path.join(run, f)))
+            t = json.load(open(p))
         except Exception:
             continue
-        w = t.get("worker")
-        if w and w != jobid and w not in live:
-            os.rename(os.path.join(run, f), os.path.join(root, "pending", f))
-            print(f"reclaimed stale {f} (worker {w} gone)", flush=True)
+        if time.time() - t.get("started", time.time()) > lease:
+            try:
+                os.rename(p, os.path.join(root, "pending", f))
+                print(f"reclaimed stale {f} (lease expired)", flush=True)
+            except OSError:
+                pass
 
 
 def _write(path, t):
@@ -69,7 +70,7 @@ def main():
     jobid = os.environ.get("SLURM_JOB_ID", "local")
     E = infer.load_model(a.ckpt, dev="cuda")
     print(f"worker {jobid} @ {socket.gethostname()} tier={a.gpu_tier} wall={a.wall}s — encoder loaded", flush=True)
-    reclaim_stale(a.root, jobid)
+    reclaim_stale(a.root)
     done = 0
     while time.time() - t0 < a.wall - a.reserve:
         tk = claim(a.root)
