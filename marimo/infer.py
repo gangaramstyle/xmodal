@@ -519,14 +519,25 @@ def _r2_get_bytes(store, key):
         return None
 
 
+def _r2_ready():
+    return all(os.environ.get(k) for k in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"))
+
+
 def r2_index():
-    """The tracking table: {hash: {'cfg':..., 'metrics':..., 'key':...}}."""
-    b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/index.json")
-    return json.loads(b) if b else {}
+    """The tracking table: {hash: {'cfg':..., 'metrics':..., 'key':...}}. Empty if creds not set yet."""
+    if not _r2_ready():
+        return {}
+    try:
+        b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/index.json")
+        return json.loads(b) if b else {}
+    except Exception:
+        return {}
 
 
 def r2_load_readout(cfg):
-    """Return the cached readout dict for this config, or None if not present."""
+    """Return the cached readout dict for this config, or None if not present / creds unset."""
+    if not _r2_ready():
+        return None
     b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/{readout_hash(cfg)}.pt")
     return None if b is None else torch.load(io.BytesIO(b), map_location="cuda")
 
@@ -544,6 +555,8 @@ def r2_save_readout(readout, cfg, metrics=None):
 
 def r2_load_by_hash(h):
     """Load a cached readout by its index hash (for eval driven by table selection)."""
+    if not _r2_ready():
+        return None
     b = _r2_get_bytes(_r2_store(), f"{R2_PREFIX}/{h}.pt")
     return None if b is None else torch.load(io.BytesIO(b), map_location="cuda")
 
