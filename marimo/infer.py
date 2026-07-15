@@ -386,14 +386,9 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     n_src (>~2900 source patches) — the cross-attention loses too much precision. Left OFF by default; only
     enable for small source bags. Returns a portable (CPU) readout dict."""
     rng = np.random.default_rng(seed); tr = train_prisms
-    torch.manual_seed(seed)                               # seed init (linear head + conv)
-    if str(dev) == "cuda":
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
-    try:                                                  # cut avoidable backward nondeterminism (atomicAdd order);
-        torch.use_deterministic_algorithms(True, warn_only=True)   # warn_only: ops w/o a det impl still run
-    except Exception:
-        pass
+    torch.manual_seed(seed)                               # standard, zero-cost: makes linear-head + conv init
+    if str(dev) == "cuda":                                # reproducible. Residual run-to-run noise is CUDA
+        torch.cuda.manual_seed_all(seed)                  # backward atomics (grid_sample/attn) — handled by seed-repeats
     def ac():
         return torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()
     src_tr = _SrcStore(E, tr, size, dev, budget_gb=src_cache_gb)   # cache-or-stream; INVARIANT to budget
