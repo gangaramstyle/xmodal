@@ -35,6 +35,9 @@ CONFIRM = [dict(n_patients=258, sampling="random", n_src=2048), dict(n_patients=
            dict(n_patients=40, sampling="random", n_src=2048), dict(n_patients=258, sampling="cover", n_src=2048)]
 CONFIRM_OVR = dict(n_tumor=8, n_neg=1, epochs=30, epochs2=60, unfreeze=12)
 
+# patient x epochs 2-D slice: does more DATA beat more EPOCHS? (epochs help most when data is scarce)
+INTERACT = [dict(n_patients=p, epochs=e, epochs2=2 * e) for p in (40, 300, 648) for e in (10, 30)]
+
 HKEYS = ["n_patients", "n_tumor", "n_neg", "sampling", "n_src", "epochs", "epochs2", "unfreeze", "warmstart", "seed"]
 
 
@@ -53,10 +56,13 @@ def mem_tier(cfg):
     return "big" if cfg["n_src"] >= 2048 else "small"    # soft hint; streaming cache bounds GPU peak regardless
 
 
-def build(sweep, confirm, nrandom):
+def build(sweep, confirm, nrandom, interact=False):
     cfgs = {}
     def add(cfg):
         cfg = canon(cfg); cfgs[cfg_hash(cfg)] = cfg
+    if interact:
+        for c in INTERACT:
+            add({**BASELINE, **c})
     if sweep:
         add(BASELINE)
         for axis, vals in AXES.items():
@@ -88,15 +94,16 @@ def main():
     ap.add_argument("--sweep", action="store_true", help="the 1-D OFAT sweep (default if no set chosen)")
     ap.add_argument("--confirm", action="store_true", help="the 4 old-readout reproductions")
     ap.add_argument("--random", type=int, default=0, help="N random-joint spot-check configs")
+    ap.add_argument("--interact", action="store_true", help="patient x epochs 2-D slice (data-vs-epochs interaction)")
     a = ap.parse_args()
-    if not (a.sweep or a.confirm or a.random):
+    if not (a.sweep or a.confirm or a.random or a.interact):
         a.sweep = True
     for d in ("pending", "running", "done", "failed"):
         os.makedirs(os.path.join(a.root, d), exist_ok=True)
     have = set()
     for d in ("pending", "running", "done", "failed"):
         have |= {f[:-5] for f in os.listdir(os.path.join(a.root, d)) if f.endswith(".json")}
-    cfgs = build(a.sweep, a.confirm, a.random); new = 0
+    cfgs = build(a.sweep, a.confirm, a.random, a.interact); new = 0
     for h, cfg in cfgs.items():
         if h in have:
             continue
