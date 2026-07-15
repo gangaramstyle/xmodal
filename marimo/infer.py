@@ -427,8 +427,9 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     G0 = tr[0]["gdim"]; per_mb = (G0 ** 3) * E.cfg.width * 2 / 1e6
     kmax = max(1, min(len(tr), int(conv_cache_gb * 1000 / max(per_mb, 1e-6))))
     cidx = list(rng.permutation(len(tr))[:kmax])
-    tmpd = os.path.join(os.environ.get("TMPDIR") or "/tmp", f"convemb_{os.getpid()}")
-    os.makedirs(tmpd, exist_ok=True)
+    import tempfile
+    tmpd = tempfile.mkdtemp(prefix="convemb_", dir=os.environ.get("TMPDIR") or "/tmp")   # unique per call — a
+    # pid-keyed path is reused across configs/retries in one worker process and can serve a stale/missing file
     if progress:
         progress(f"caching {kmax}/{len(tr)} prism embeddings to disk {tmpd} (~{kmax*per_mb/1000:.0f}GB)")
     epaths = {}
