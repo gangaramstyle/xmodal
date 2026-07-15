@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--n-test", type=int, default=51); ap.add_argument("--test-tumor", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=20); ap.add_argument("--epochs2", type=int, default=40)
     ap.add_argument("--unfreeze", type=int, default=12); ap.add_argument("--qsize", type=float, default=2.0)
+    ap.add_argument("--src-cache-gb", type=float, default=None, help="VRAM budget for the encode-once source cache; overflow is streamed (result-invariant). None=auto (half free VRAM)")
     ap.add_argument("--warmstart", action="store_true", default=True)
     ap.add_argument("--ckpt", required=True); ap.add_argument("--enc-width", type=int, default=768); ap.add_argument("--enc-heads", type=int, default=12)
     ap.add_argument("--results", default="ablation_results.csv"); ap.add_argument("--seed", type=int, default=0)
@@ -73,7 +74,8 @@ def main():
     print(f"train {len(tr)} prisms / {len(tr_pids)} pt · eval {len(te)} prisms / {len(te_pids)} pt · "
           f"{a.sampling}-{a.n_src} · ep{a.epochs}/{a.epochs2}", flush=True)
     ro = infer.train_readout(E, tr, epochs=a.epochs, epochs2=a.epochs2, unfreeze=a.unfreeze,
-                             warmstart=a.warmstart, qsize=a.qsize, amp=False, seed=a.seed)
+                             warmstart=a.warmstart, qsize=a.qsize, src_cache_gb=a.src_cache_gb, amp=False,
+                             seed=a.seed, progress=lambda m: print(m, flush=True))
     res = infer.eval_readout(E, ro, te)
     m = infer.leaderboard_metrics(res)
     row = dict(n_patients=len(tr_pids), n_tumor=a.n_tumor, n_neg=a.n_neg, sampling=a.sampling, n_src=a.n_src,

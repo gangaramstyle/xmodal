@@ -343,8 +343,42 @@ def leaderboard_metrics(results, small_vox=50):
     return m
 
 
+def _nbytes(x):
+    if torch.is_tensor(x):
+        return x.element_size() * x.nelement()
+    if isinstance(x, (list, tuple)):
+        return sum(_nbytes(y) for y in x)
+    return 0
+
+
+class _SrcStore:
+    """Encode-once source cache with a VRAM budget. Prisms up to the budget stay encoded on-GPU (reused every
+    epoch, exactly like before); prisms beyond it are re-encoded on demand each step. The encoder is frozen, so
+    re-encoding is BIT-IDENTICAL to caching — results are INVARIANT to the budget; only speed/memory change.
+    Lets a small GPU (p100) run any config by streaming the overflow, while a big GPU (a100) caches it all."""
+
+    def __init__(self, E, prisms, size, dev, budget_gb=None):
+        self.E, self.prisms, self.size, self.dev = E, prisms, size, dev
+        self.cache = {}
+        if not prisms:
+            self.kmax = self.per_gb = 0
+            return
+        if budget_gb is None and str(dev) == "cuda":
+            free, _ = torch.cuda.mem_get_info(); budget_gb = free * 0.5 / 1e9   # half of what's free after load
+        c0 = _prism_src(E, prisms[0], size, dev); per = _nbytes(c0) / 1e9
+        kmax = len(prisms) if not budget_gb else min(len(prisms), max(1, int(budget_gb / max(per, 1e-9))))
+        self.cache[0] = c0
+        for i in range(1, kmax):
+            self.cache[i] = _prism_src(E, prisms[i], size, dev)
+        self.kmax, self.per_gb = kmax, per
+
+    def get(self, i):
+        c = self.cache.get(i)
+        return c if c is not None else _prism_src(self.E, self.prisms[i], self.size, self.dev)
+
+
 def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
-                  size=4.0, qsize=2.0, seed=0, conv_cache_gb=50.0, amp=False, dev="cuda", progress=None):
+                  size=4.0, qsize=2.0, seed=0, conv_cache_gb=50.0, src_cache_gb=None, amp=False, dev="cuda", progress=None):
     """Fine-tune the seg readout on train_prisms. Stage 1 (decoder+seg-token+query_seed+linear) trains on ALL
     prisms; stage 2 (conv SmoothHead) caches dense embeddings for only as many prisms as fit in conv_cache_gb
     of RAM (a light head — a subset suffices), so res=1mm at large scale doesn't OOM.
@@ -354,7 +388,9 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     rng = np.random.default_rng(seed); tr = train_prisms
     def ac():
         return torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()
-    src_tr = [_prism_src(E, pr, size, dev) for pr in tr]   # encoded once, fp32 (safe to reuse under autocast)
+    src_tr = _SrcStore(E, tr, size, dev, budget_gb=src_cache_gb)   # cache-or-stream; INVARIANT to budget
+    if progress and tr:
+        progress(f"src cache: {src_tr.kmax}/{len(tr)} prisms on GPU ({src_tr.per_gb*1e3:.0f}MB each), rest streamed")
     seg_tok = (E.seg_query.detach().clone().to(dev) if (warmstart and hasattr(E, "seg_query"))
                else torch.zeros(E.cfg.width, device=dev)).requires_grad_(True)
     dec = list(E.decoder)[-unfreeze:]; lin = torch.nn.Linear(E.cfg.width, 4).to(dev)
@@ -370,7 +406,7 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
         if progress:
             progress(f"fine-tune · decoder epoch {e+1}/{epochs}")
         for i in rng.permutation(len(tr)):
-            pr = tr[i]; ctx, cc = src_tr[i]
+            pr = tr[i]; ctx, cc = src_tr.get(i)
             sub = rng.integers(len(pr["gt"]), size=384)
             qp = torch.as_tensor(pr["gpts"][sub][None], device=dev).float()
             y = torch.as_tensor(pr["gt"][sub], device=dev).long()
@@ -391,7 +427,7 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     emb = {}
     with ac():
         for i in cidx:
-            emb[i] = _dense(E, seg_tok, tr[i], size, qsize, dev, src=src_tr[i]).half().cpu()
+            emb[i] = _dense(E, seg_tok, tr[i], size, qsize, dev, src=src_tr.get(i)).half().cpu()
     conv = SmoothHead(E.cfg.width).to(dev); opt2 = torch.optim.Adam(conv.parameters(), lr=1e-3)
     for e in range(epochs2):
         if progress:
