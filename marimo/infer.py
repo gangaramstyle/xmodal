@@ -449,6 +449,27 @@ def fit_predict(E, train_prisms, eval_prisms, epochs=30, epochs2=60, unfreeze=12
     return eval_readout(E, ro, eval_prisms, dev, progress)
 
 
+def lin_vs_conv(E, readout, result, dev="cuda"):
+    """From the SAME decoder embeddings, return the stage-1 linear prediction (pre-conv) and the stage-2 conv
+    prediction (post-smoothing) for a prism, so you can see whether the conv head helps or hurts.
+    Returns (lin_pred_3d, conv_pred_3d)."""
+    seg_tok, lin, conv, size, qsize = _apply_readout(E, readout, dev)
+    sp = torch.as_tensor(result["sp"][None], device=dev).float()
+    sc = torch.as_tensor(result["sc"][None], device=dev).float()
+    sm = torch.as_tensor(result["sm"][None], device=dev).long()
+    ctx, cc = _encode_src(E, sp, sc, sm, size, dev)
+    G = result["gdim"]; half = result["prism_mm"] / 2.0; res = result["res"]
+    lin_c = np.arange(-half, half + 1e-3, res, dtype=np.float32)[:G]
+    gx, gy, gz = np.meshgrid(lin_c, lin_c, lin_c, indexing="ij")
+    coords = torch.as_tensor(np.stack([gx, gy, gz], -1).reshape(-1, 3), device=dev).float()
+    with torch.no_grad():
+        sl = torch.cat([_decode_q(E, seg_tok, ctx, cc, coords[c0:c0 + 4096][None], qsize, dev)[0]
+                        for c0 in range(0, coords.shape[0], 4096)])
+        lin_pred = lin(sl).argmax(1).cpu().numpy().astype(np.int8).reshape(G, G, G)   # pre-conv (linear)
+        conv_pred = _gl(conv, sl, G).argmax(1).cpu().numpy().astype(np.int8).reshape(G, G, G)  # post-conv
+    return lin_pred, conv_pred
+
+
 def _apply_readout(E, readout, dev="cuda"):
     """Load a readout dict onto E's frozen encoder; return (seg_tok, lin, conv, size, qsize)."""
     seg_tok = readout["seg_tok"].to(dev)
