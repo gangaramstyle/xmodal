@@ -341,11 +341,13 @@ def leaderboard_metrics(results, small_vox=50):
 
 
 def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart=True,
-                  size=4.0, qsize=2.0, seed=0, conv_cache_gb=50.0, amp=True, dev="cuda", progress=None):
+                  size=4.0, qsize=2.0, seed=0, conv_cache_gb=50.0, amp=False, dev="cuda", progress=None):
     """Fine-tune the seg readout on train_prisms. Stage 1 (decoder+seg-token+query_seed+linear) trains on ALL
     prisms; stage 2 (conv SmoothHead) caches dense embeddings for only as many prisms as fit in conv_cache_gb
-    of RAM (a light head — a subset suffices), so res=1mm at large scale doesn't OOM. amp=bf16 autocast on the
-    repeated decode/conv forwards for ~2x speed. Returns a portable (CPU) readout dict."""
+    of RAM (a light head — a subset suffices), so res=1mm at large scale doesn't OOM.
+    NOTE: amp=True (bf16 autocast) is ~2x faster but SILENTLY COLLAPSES training to all-background at large
+    n_src (>~2900 source patches) — the cross-attention loses too much precision. Left OFF by default; only
+    enable for small source bags. Returns a portable (CPU) readout dict."""
     rng = np.random.default_rng(seed); tr = train_prisms
     def ac():
         return torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()
