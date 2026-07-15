@@ -31,7 +31,7 @@ def load_prism(path, sampling, n_src):
         sp, sc, sm = d["sp_rand"][:k].numpy(), d["sc_rand"][:k].numpy(), d["sm_rand"][:k].numpy().astype(np.int64)
     return dict(sp=sp.astype(np.float16), sc=sc.astype(np.float32), sm=sm, gpts=gpts,
                 gt=d["gt"].numpy().reshape(-1).astype(np.int8), gdim=G, pid=d["pid"], pname=d["pid"],
-                anch=d["anch"].numpy(), prism_mm=d["prism_mm"], res=res,
+                anch=np.asarray(d["anch"]), prism_mm=d["prism_mm"], res=res,   # anch stored as numpy, not a tensor
                 imgs=np.zeros((4, G, G, G), np.float16))   # imgs only used by the renderer, not train/eval
 
 

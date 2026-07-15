@@ -617,7 +617,7 @@ def cache_result(src, sampling="random", n_src=None):
         k = src["sp_rand"].shape[0] if n_src is None else min(int(n_src), src["sp_rand"].shape[0])
         sc, sm = src["sc_rand"][:k].numpy(), src["sm_rand"][:k].numpy().astype(int)
     return dict(pname=src["pid"], kind=src["kind"], idx=int(src["idx"]),
-                gdim=G, prism_mm=float(src["prism_mm"]), res=float(src["res"]), anch=src["anch"].numpy(),
+                gdim=G, prism_mm=float(src["prism_mm"]), res=float(src["res"]), anch=np.asarray(src["anch"]),
                 sc=sc.astype(np.float32), sm=sm,
                 gt=src["gt"].numpy().reshape(G, G, G).astype(int), pred=np.zeros((G, G, G), int))
 
