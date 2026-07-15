@@ -585,6 +585,43 @@ def r2_load_by_hash(h):
     return None if b is None else torch.load(io.BytesIO(b), map_location="cuda")
 
 
+def r2_list_prisms(prefix="prism_cache_val"):
+    """List cached prism keys under `prefix` on R2 (e.g. the uploaded val cache). Returns sorted
+    '<prefix>/<pid>/<kind>_<i>.pt' keys. Empty if creds unset."""
+    if not _r2_ready():
+        return []
+    import obstore
+    keys = []
+    for batch in obstore.list(_r2_store(), prefix=prefix):
+        for o in batch:
+            k = o["path"] if isinstance(o, dict) else o.path
+            if k.endswith(".pt"):
+                keys.append(k)
+    return sorted(keys)
+
+
+def cache_result(src, sampling="random", n_src=None):
+    """Build a renderer-ready result dict from ONE cached prism — for confirming the cache visually (no model).
+    `src` is an R2 key (str), raw .pt bytes, or an already-loaded torch dict. `pred` is all-zeros: the point is
+    to see the GT + the source coverage the trainer would slice. sampling='random' shows the deterministic
+    random-N bag (prefix of n_src, default all stored); 'cover' shows the full-coverage lattice. Feed the
+    result straight into multiclass_render / context_fill / proj_render."""
+    if isinstance(src, str):
+        src = _r2_get_bytes(_r2_store(), src)
+    if isinstance(src, (bytes, bytearray)):
+        src = torch.load(io.BytesIO(bytes(src)), map_location="cpu")
+    G = src["gdim"]
+    if sampling == "cover":
+        sc, sm = src["sc_cover"].numpy(), src["sm_cover"].numpy().astype(int)
+    else:
+        k = src["sp_rand"].shape[0] if n_src is None else min(int(n_src), src["sp_rand"].shape[0])
+        sc, sm = src["sc_rand"][:k].numpy(), src["sm_rand"][:k].numpy().astype(int)
+    return dict(pname=src["pid"], kind=src["kind"], idx=int(src["idx"]),
+                gdim=G, prism_mm=float(src["prism_mm"]), res=float(src["res"]), anch=src["anch"].numpy(),
+                sc=sc.astype(np.float32), sm=sm,
+                gt=src["gt"].numpy().reshape(G, G, G).astype(int), pred=np.zeros((G, G, G), int))
+
+
 def r2_set_metrics(h, metrics, eval_cfg=None):
     """Attach eval metrics to an already-cached readout's index entry (no re-upload of the .pt)."""
     import obstore
