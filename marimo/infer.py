@@ -421,6 +421,11 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     for m in [lin, *dec]:
         for p in m.parameters():
             p.requires_grad_(False)
+    if epochs2 <= 0:                                       # stage-1-only: skip the (slow) conv stage entirely;
+        cpu0 = lambda sd: {k: v.detach().cpu() for k, v in sd.items()}   # eval predicts with the linear head.
+        return {"seg_tok": seg_tok.detach().cpu(), "query_seed": E.query_seed.detach().cpu(),
+                "dec": [cpu0(blk.state_dict()) for blk in dec], "lin": cpu0(lin.state_dict()),
+                "conv": None, "stage1": True, "unfreeze": unfreeze, "size": size, "qsize": qsize}
     # stage 2: the dense per-voxel embeddings are big (G^3 x width ~ 55MB/prism). Write them to node-local
     # $TMPDIR (SLURM auto-wipes it at job end) and mmap per step — the job needs little RAM and never OOMs; the
     # OS page cache keeps hot prisms in memory. Seeded subset capped by conv_cache_gb (disk) -> result-invariant.
@@ -468,14 +473,16 @@ def eval_readout(E, readout, eval_prisms, dev="cuda", progress=None):
     for blk, sd in zip(dec, readout["dec"]):
         blk.load_state_dict({k: v.to(dev) for k, v in sd.items()})
     lin = torch.nn.Linear(E.cfg.width, 4).to(dev); lin.load_state_dict({k: v.to(dev) for k, v in readout["lin"].items()})
-    conv = SmoothHead(E.cfg.width).to(dev); conv.load_state_dict({k: v.to(dev) for k, v in readout["conv"].items()})
+    conv = None
+    if readout.get("conv") is not None:                   # stage1-only readouts have no conv -> predict with lin
+        conv = SmoothHead(E.cfg.width).to(dev); conv.load_state_dict({k: v.to(dev) for k, v in readout["conv"].items()})
     results = []
     with torch.no_grad():
         for j, pr in enumerate(eval_prisms):
             if progress:
                 progress(f"evaluating {j+1}/{len(eval_prisms)} lesions")
             G = pr["gdim"]; sl = _dense(E, seg_tok, pr, size, qsize, dev)
-            pred = _gl(conv, sl, G).argmax(1).cpu().numpy().astype(np.int8)
+            pred = (_gl(conv, sl, G) if conv is not None else lin(sl)).argmax(1).cpu().numpy().astype(np.int8)
             gt = pr["gt"]; coords = torch.as_tensor(pr["gpts"], device=dev)   # mm coords for NSD
             rec = dict(pname=pr["pname"], gdim=G, imgs=pr["imgs"].reshape(4, G, G, G),
                        gt=gt.reshape(G, G, G), pred=pred.reshape(G, G, G),
