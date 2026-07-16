@@ -426,12 +426,13 @@ def train_readout(E, train_prisms, epochs=30, epochs2=60, unfreeze=12, warmstart
     # OS page cache keeps hot prisms in memory. Seeded subset capped by conv_cache_gb (disk) -> result-invariant.
     G0 = tr[0]["gdim"]; per_mb = (G0 ** 3) * E.cfg.width * 2 / 1e6
     kmax = max(1, min(len(tr), int(conv_cache_gb * 1000 / max(per_mb, 1e-6))))
-    cidx = list(rng.permutation(len(tr))[:kmax])
     import tempfile
-    tmpd = tempfile.mkdtemp(prefix="convemb_", dir=os.environ.get("TMPDIR") or "/tmp")   # unique per call — a
-    # pid-keyed path is reused across configs/retries in one worker process and can serve a stale/missing file
+    tmpd = tempfile.mkdtemp(prefix="convemb_", dir=os.environ.get("TMPDIR") or "/tmp")   # unique per call
+    free_mb = shutil.disk_usage(tmpd).free / 1e6                       # node-local scratch is SHARED across the
+    kmax = max(1, min(kmax, int(free_mb * 0.45 / max(per_mb, 1e-6))))  # workers on this node — cap to 45% of free
+    cidx = list(rng.permutation(len(tr))[:kmax])                       # so a later np.save can't silently fail
     if progress:
-        progress(f"caching {kmax}/{len(tr)} prism embeddings to disk {tmpd} (~{kmax*per_mb/1000:.0f}GB)")
+        progress(f"caching {kmax}/{len(tr)} prism embeddings to disk {tmpd} (~{kmax*per_mb/1000:.0f}GB, {free_mb/1e3:.0f}GB free)")
     epaths = {}
     with ac():
         for i in cidx:
