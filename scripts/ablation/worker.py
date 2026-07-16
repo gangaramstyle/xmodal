@@ -69,16 +69,19 @@ def main():
     a = ap.parse_args()
     t0 = time.time()
     jobid = os.environ.get("SLURM_JOB_ID", "local")
-    E = {"path": None, "model": None}
+    E = {"key": None, "model": None}
     def get_E(cfg):
-        """Load the encoder for this ticket's checkpoint, reloading only when it changes (so a checkpoint
-        sweep works; a fixed-ckpt fleet never reloads). cfg['ckpt'] is 'run/step' -> runs/run/step.pt."""
+        """Load the encoder for this ticket's checkpoint + width, reloading only when it changes (so a
+        checkpoint sweep works; a fixed-ckpt fleet never reloads). cfg['ckpt'] is 'run/step' -> runs/run/step.pt;
+        cfg['enc_width'] picks the arch (768=ViT-base default, 384=ViT-small e.g. MAE runs)."""
         ck = cfg.get("ckpt")
         path = os.path.join(a.ckpt_root, ck + ".pt") if ck else a.ckpt
-        if path != E["path"]:
+        w = cfg.get("enc_width", 768); hh = cfg.get("enc_heads", w // 64)
+        key = (path, w)
+        if key != E["key"]:
             E["model"] = None; import torch as _t; _t.cuda.empty_cache()
-            E["model"] = infer.load_model(path, dev="cuda"); E["path"] = path
-            print(f"loaded encoder: {path}", flush=True)
+            E["model"] = infer.load_model(path, width=w, heads=hh, dev="cuda"); E["key"] = key
+            print(f"loaded encoder: {path} (width {w})", flush=True)
         return E["model"]
     print(f"worker {jobid} @ {socket.gethostname()} tier={a.gpu_tier} wall={a.wall}s — up", flush=True)
     reclaim_stale(a.root)
