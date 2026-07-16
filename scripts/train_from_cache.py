@@ -78,9 +78,9 @@ def run_ablation(E, cfg, cache, val_cache, data_root):
             break
         print(f"COLLAPSE (seed {s}, dsc_wt={m['dsc_wt']}) — retrying from a new basin", flush=True)
     m = best
-    row = dict(n_patients=len(tr_pids), n_tumor=c["n_tumor"], n_neg=c["n_neg"], sampling=c["sampling"], n_src=c["n_src"],
-               epochs=c["epochs"], epochs2=c["epochs2"], unfreeze=c["unfreeze"], qsize=c["qsize"], seed=c["seed"],
-               n_test=len(te), **m)
+    row = dict(ckpt=c.get("ckpt", "default"), n_patients=len(tr_pids), n_tumor=c["n_tumor"], n_neg=c["n_neg"],
+               sampling=c["sampling"], n_src=c["n_src"], epochs=c["epochs"], epochs2=c["epochs2"],
+               unfreeze=c["unfreeze"], qsize=c["qsize"], seed=c["seed"], n_test=len(te), **m)
     print("RESULT " + " ".join(f"{k}={v}" for k, v in row.items()), flush=True)
     return row
 

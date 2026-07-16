@@ -65,11 +65,22 @@ def main():
     ap.add_argument("--gpu-tier", default="big", choices=["small", "big"], help="small workers skip big-tier tickets")
     ap.add_argument("--wall", type=int, default=5400, help="worker wall-clock budget (s); stop claiming near the end")
     ap.add_argument("--reserve", type=int, default=1200, help="s reserved so a claimed job can finish before the wall")
+    ap.add_argument("--ckpt-root", default="/cbica/home/gangarav/xmodal/runs")
     a = ap.parse_args()
     t0 = time.time()
     jobid = os.environ.get("SLURM_JOB_ID", "local")
-    E = infer.load_model(a.ckpt, dev="cuda")
-    print(f"worker {jobid} @ {socket.gethostname()} tier={a.gpu_tier} wall={a.wall}s — encoder loaded", flush=True)
+    E = {"path": None, "model": None}
+    def get_E(cfg):
+        """Load the encoder for this ticket's checkpoint, reloading only when it changes (so a checkpoint
+        sweep works; a fixed-ckpt fleet never reloads). cfg['ckpt'] is 'run/step' -> runs/run/step.pt."""
+        ck = cfg.get("ckpt")
+        path = os.path.join(a.ckpt_root, ck + ".pt") if ck else a.ckpt
+        if path != E["path"]:
+            E["model"] = None; import torch as _t; _t.cuda.empty_cache()
+            E["model"] = infer.load_model(path, dev="cuda"); E["path"] = path
+            print(f"loaded encoder: {path}", flush=True)
+        return E["model"]
+    print(f"worker {jobid} @ {socket.gethostname()} tier={a.gpu_tier} wall={a.wall}s — up", flush=True)
     reclaim_stale(a.root)
     done = 0
     while time.time() - t0 < a.wall - a.reserve:
@@ -86,7 +97,7 @@ def main():
         t.update(worker=jobid, host=socket.gethostname(), started=time.time()); _write(tk, t)
         print(f"=== claim {h} · {cfg} ===", flush=True)
         try:
-            row = T.run_ablation(E, cfg, a.cache, a.val_cache, a.data_root)
+            row = T.run_ablation(get_E(cfg), cfg, a.cache, a.val_cache, a.data_root)
             t.update(status="done", metrics=row, elapsed=round(time.time() - t["started"])); _write(tk, t)
             os.rename(tk, os.path.join(a.root, "done", f))
             done += 1
