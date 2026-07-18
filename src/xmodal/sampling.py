@@ -594,14 +594,41 @@ def _gather_cubes(scan, centers, sizes, unit, device):
     return sample_patches(scan.volume, vox)                                        # [K,V,V,V]
 
 
+def _native_thick(scan):
+    """Native through-plane VOXEL axis of a scan = the outlier-shaped dim (e.g. 240x240x155 -> 2).
+    Robust to isotropic storage; for axial data this is the superior-inferior axis."""
+    shp = np.asarray(scan.volume.shape, dtype=np.float32)
+    return int(np.argmax(np.abs(shp - np.median(shp))))
+
+
+def _mk_scan_plan(C, Kk, I, Kidx, Z):
+    """Concatenate per-item gather lists and sort by scan key -> {ctr,sz,i,k, uniq,starts,counts} so each
+    resident scan's patches form ONE contiguous block (one grid_sample per scan)."""
+    key = np.concatenate(Kk); order = np.argsort(key, kind="stable"); ks = key[order]
+    uniq, starts, counts = np.unique(ks, return_index=True, return_counts=True)
+    return dict(ctr=np.concatenate(C)[order], sz=np.concatenate(Z)[order],
+                i=np.concatenate(I)[order], k=np.concatenate(Kidx)[order],
+                uniq=uniq, starts=starts, counts=counts)
+
+
 def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
-                 prism_patch=None, voxels=8, rng, tumor_frac=0.0, src_spacing="random"):
+                 prism_patch=None, voxels=8, rng, tumor_frac=0.0, src_spacing="random",
+                 src_shape="cube", slab_per_cube=3, slab_thin_mm=1.0):
     """PURE-CPU geometry stage of v5 sampling (no GPU ops -> thread-safe & parallelizable for prefetch).
-    Builds per-item coords/sizes/series + a scan-sorted gather PLAN (numpy). Returns a dict consumed by
-    _v5_gather on the main thread. See sample_v5_batch for the task semantics."""
+    Builds per-item coords/sizes/series + scan-sorted gather PLANS (numpy), consumed by _v5_gather.
+
+    `src_shape` picks the SOURCE patch shape (targets are always cubes so the ordering/MAE difficulty stays
+    matched to the cube baseline):
+      'cube' -> each source position is one voxels^3 cube (the reference run).
+      'slab' -> each source position expands into `slab_per_cube` V×V×1 AXIAL slabs at RANDOM superior-
+                inferior depths within ±ps/2 of the cube it replaces (world axis 2 = S-I, axial assumption).
+                Coverage matches the cube run in expectation; each slab keeps its own center-relative mm coord
+                (so mm-RoPE sees the depth) and a size extent thin (=slab_thin_mm) on the scan's native axis."""
     prism_patch = prism_patch or {32.0: 4.0, 64.0: 8.0}
     prism_patch = {float(k): (list(v) if hasattr(v, "__len__") else [float(v)]) for k, v in prism_patch.items()}
+    slab = (src_shape == "slab"); Ksl = int(slab_per_cube) if slab else 1
     P, V, nS = n_tgt, voxels, n_src + n_anchor
+    nS_tok = nS * Ksl                                                  # source tokens per item (slab: expanded)
     req = {0, 1, 2, 3}
     elig = [b for b in bundles if req.issubset({sc.series_idx for sc in b.values()})]
     if not elig:
@@ -611,11 +638,13 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
         for sc in bnd.values():
             if id(sc) not in gid:
                 gid[id(sc)] = len(scan_list); scan_list.append(sc)
-    csrc_np = np.zeros((batch_size, nS, 3), np.float32); ctgt_np = np.zeros((batch_size, P, 3), np.float32)
-    ser_np = np.zeros((batch_size, nS), np.int64); mod_np = np.zeros((batch_size, P), np.int64)
-    zsrc_np = np.zeros((batch_size, nS, 3), np.float32); ztgt_np = np.zeros((batch_size, P, 3), np.float32)
+    nthick_arr = np.array([_native_thick(sc) for sc in scan_list], np.int64)   # native through-plane voxel axis per scan
+    csrc_np = np.zeros((batch_size, nS_tok, 3), np.float32); ctgt_np = np.zeros((batch_size, P, 3), np.float32)
+    ser_np = np.zeros((batch_size, nS_tok), np.int64); mod_np = np.zeros((batch_size, P), np.int64)
+    zsrc_np = np.zeros((batch_size, nS_tok, 3), np.float32); ztgt_np = np.zeros((batch_size, P, 3), np.float32)
     tumor_hits = 0
-    G_ctr, G_key, G_buf, G_i, G_k, G_sz = [], [], [], [], [], []
+    S_ctr, S_key, S_i, S_k, S_sz = [], [], [], [], []                 # source gather lists (slabs or cubes)
+    T_ctr, T_key, T_i, T_k, T_sz = [], [], [], [], []                 # target gather lists (always cubes)
     item_bnd = rng.integers(len(elig), size=batch_size)                # assign each item a random bundle (i.i.d.)
     from collections import defaultdict as _dd
     groups = _dd(list)
@@ -687,44 +716,58 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
             tgt_pos = local[_v5_pick_np(local, n_tgt, ps, rng)]
             src_all = np.concatenate([src_pos, anc_pos], 0).astype(np.float32)      # [nS,3] world
             mods = np.concatenate([src_mod, np.full(n_anchor, D, np.int64)])
-            csrc_np[i] = src_all - a_a[None]; ser_np[i] = mods
-            ctgt_np[i] = tgt_pos - a_a[None]; mod_np[i] = D
-            zsrc_np[i] = ps; ztgt_np[i] = ps                                        # cube: per-axis extent = ps
-            for ctr, mm, buf in ((src_all, mods, 0), (tgt_pos.astype(np.float32), np.full(n_tgt, D, np.int64), 1)):
-                G_ctr.append(ctr); G_key.append(bmap[mm]); G_buf.append(np.full(len(mm), buf, np.int64))
-                G_i.append(np.full(len(mm), i, np.int64)); G_k.append(np.arange(len(mm), dtype=np.int64))
-                G_sz.append(np.full(len(mm), ps, np.float32))
+            if slab:
+                u = (rng.random((nS, Ksl)) * 2 - 1) * (ps / 2.0)                    # S-I depth offset (mm) within ±ps/2
+                sctr = np.repeat(src_all, Ksl, axis=0)                              # [nS*Ksl,3] world
+                sctr[:, 2] = sctr[:, 2] + u.reshape(-1)                             # jitter world axis 2 = S-I (axial)
+                smod = np.repeat(mods, Ksl)                                         # [nS*Ksl]
+                zext = np.full((nS_tok, 3), ps, np.float32)                         # in-plane axes = ps
+                zext[np.arange(nS_tok), nthick_arr[bmap[smod]]] = slab_thin_mm      # thin on each token's native axis
+                csrc_np[i] = sctr - a_a[None]; ser_np[i] = smod; zsrc_np[i] = zext
+                S_ctr.append(sctr.astype(np.float32)); S_key.append(bmap[smod])
+                S_i.append(np.full(nS_tok, i, np.int64)); S_k.append(np.arange(nS_tok, dtype=np.int64))
+                S_sz.append(np.full(nS_tok, ps, np.float32))
+            else:
+                csrc_np[i] = src_all - a_a[None]; ser_np[i] = mods; zsrc_np[i] = ps  # cube: isotropic extent = ps
+                S_ctr.append(src_all); S_key.append(bmap[mods])
+                S_i.append(np.full(nS, i, np.int64)); S_k.append(np.arange(nS, dtype=np.int64))
+                S_sz.append(np.full(nS, ps, np.float32))
+            ctgt_np[i] = tgt_pos - a_a[None]; mod_np[i] = D; ztgt_np[i] = ps        # target: always cube, extent = ps
+            tmods = np.full(n_tgt, D, np.int64)
+            T_ctr.append(tgt_pos.astype(np.float32)); T_key.append(bmap[tmods])
+            T_i.append(np.full(n_tgt, i, np.int64)); T_k.append(np.arange(n_tgt, dtype=np.int64))
+            T_sz.append(np.full(n_tgt, ps, np.float32))
 
-    # scan-sorted gather plan (all CPU numpy -> stays in the parallelizable stage)
-    allkey = np.concatenate(G_key); order = np.argsort(allkey, kind="stable")
-    allkey_s = allkey[order]
-    uniq, starts, counts = np.unique(allkey_s, return_index=True, return_counts=True)
     return dict(csrc_np=csrc_np, ctgt_np=ctgt_np, ser_np=ser_np, mod_np=mod_np, zsrc_np=zsrc_np, ztgt_np=ztgt_np,
-                ctr_s=np.concatenate(G_ctr)[order], sz_s=np.concatenate(G_sz)[order],
-                alli_s=np.concatenate(G_i)[order], allk_s=np.concatenate(G_k)[order],
-                allbuf_s=np.concatenate(G_buf)[order],
-                uniq=uniq, starts=starts, counts=counts, scan_list=scan_list,
-                batch_size=batch_size, nS=nS, P=P, V=V, tumor_hits=tumor_hits)
+                src_plan=_mk_scan_plan(S_ctr, S_key, S_i, S_k, S_sz),
+                tgt_plan=_mk_scan_plan(T_ctr, T_key, T_i, T_k, T_sz),
+                scan_list=scan_list, batch_size=batch_size, nS=nS_tok, P=P, V=V,
+                tumor_hits=tumor_hits, src_shape=src_shape)
 
 
 def _v5_gather(geom, device):
-    """GPU stage of v5 sampling (main thread): H2D the geometry plan + gather cubes per resident scan."""
+    """GPU stage of v5 sampling (main thread): H2D the geometry plans + gather each resident scan's patches
+    in ONE grid_sample. Source is slabs (V×V×1) or cubes (V×V×V) per geom['src_shape']; targets are cubes."""
     import torch
-    V, nS, P, B = geom["V"], geom["nS"], geom["P"], geom["batch_size"]
-    unit = _cube_unit(V, device)
-    Src = torch.empty(B, nS, V, V, V, device=device); Tgt = torch.empty(B, P, V, V, V, device=device)
-    ctr_g = _h2d(geom["ctr_s"], device); sz_g = _h2d(geom["sz_s"], device)
-    alli_s, allk_s, allbuf_s = geom["alli_s"], geom["allk_s"], geom["allbuf_s"]
+    V, B, nS, P = geom["V"], geom["batch_size"], geom["nS"], geom["P"]
+    slab = (geom.get("src_shape", "cube") == "slab")
     scan_list = geom["scan_list"]
-    N = ctr_g.shape[0]
-    Patches = torch.empty(N, V, V, V, device=device)
-    for u, s, c in zip(geom["uniq"].tolist(), geom["starts"].tolist(), geom["counts"].tolist()):  # 1 grid_sample/scan
-        Patches[s:s + c] = _gather_cubes(scan_list[u], ctr_g[s:s + c], sz_g[s:s + c], unit, device)  # contiguous, no sync
-    for bb, buf in ((0, Src), (1, Tgt)):                                      # exactly two integer-index scatters (no sync)
-        mb = np.nonzero(allbuf_s == bb)[0]
-        if mb.size:
-            buf[_h2d(alli_s[mb], device), _h2d(allk_s[mb], device)] = Patches[_h2d(mb.astype(np.int64), device)]
-    return dict(patches_src=Src, held=Tgt,                             # [B,*,V,V,V] (grid is V^3; stem adds channel)
+    cube_unit = _cube_unit(V, device)
+
+    def _run(plan, slots, shape, as_slab):
+        ctr = _h2d(plan["ctr"], device); sz = _h2d(plan["sz"], device)
+        N = ctr.shape[0]; buf = torch.empty(N, *shape, device=device)
+        for u, s, c in zip(plan["uniq"].tolist(), plan["starts"].tolist(), plan["counts"].tolist()):  # 1 grid_sample/scan
+            sc = scan_list[u]
+            buf[s:s + c] = (_gather_slabs(sc, ctr[s:s + c], sz[s:s + c], _native_thick(sc), V, device) if as_slab
+                            else _gather_cubes(sc, ctr[s:s + c], sz[s:s + c], cube_unit, device))
+        out = torch.empty(B, slots, *shape, device=device)
+        out[_h2d(plan["i"], device), _h2d(plan["k"], device)] = buf                 # integer-index scatter (no sync)
+        return out
+
+    Src = _run(geom["src_plan"], nS, (V, V, 1) if slab else (V, V, V), slab)
+    Tgt = _run(geom["tgt_plan"], P, (V, V, V), False)
+    return dict(patches_src=Src, held=Tgt,                             # src [B,nS,V,V,1|V]; held [B,P,V,V,V]
                 coords_src=_h2d(geom["csrc_np"], device), coords_tgt=_h2d(geom["ctgt_np"], device),
                 sizes_src=_h2d(geom["zsrc_np"], device), sizes_tgt=_h2d(geom["ztgt_np"], device),
                 series_src=_h2d(geom["ser_np"], device), mod_tgt=_h2d(geom["mod_np"], device),
@@ -732,16 +775,21 @@ def _v5_gather(geom, device):
 
 
 def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
-                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0, src_spacing="random"):
+                    prism_patch=None, voxels=8, rng, device, tumor_frac=0.0, src_spacing="random",
+                    src_shape="cube", slab_per_cube=3, slab_thin_mm=1.0):
     """Per item: pick a target modality D; the source bag = `n_src` patches of the OTHER 3 modalities
     (random position+modality) + `n_anchor` D anchors; the targets = `n_tgt` held D patches to ORDER.
-    Cube patches (voxels^3), prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common
-    foreground. Because every target is modality D, the ordering match is honest (no modality shortcut).
-    Returns patches_src/held [B,*,V,V,V], coords_src/tgt [B,*,3], series_src [B,nS], mod_tgt [B,P],
-    sizes_src/tgt [B,*,3]. (CPU geometry + GPU gather; see _v5_geometry/_v5_gather for the prefetch split.)"""
+    Prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common foreground. Because every
+    target is modality D, the ordering match is honest (no modality shortcut).
+
+    `src_shape='cube'` (default) = the reference run (voxels^3 source cubes). `src_shape='slab'` expands
+    each source cube into `slab_per_cube` axial V×V×1 slabs at random S-I depths within it (coverage-matched
+    to the cube run) while KEEPING cube targets — isolating source patch SHAPE as the only changed variable.
+    Returns patches_src [B,nS,V,V,1|V], held [B,P,V,V,V], coords/sizes_src/tgt, series_src, mod_tgt."""
     geom = _v5_geometry(bundles, batch_size=batch_size, n_src=n_src, n_anchor=n_anchor, n_tgt=n_tgt,
                         prism_choices=prism_choices, prism_patch=prism_patch, voxels=voxels, rng=rng,
-                        tumor_frac=tumor_frac, src_spacing=src_spacing)
+                        tumor_frac=tumor_frac, src_spacing=src_spacing,
+                        src_shape=src_shape, slab_per_cube=slab_per_cube, slab_thin_mm=slab_thin_mm)
     return _v5_gather(geom, device)
 
 

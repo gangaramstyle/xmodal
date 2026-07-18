@@ -36,7 +36,8 @@ class EncoderConfig:
     n_registers: int = 4
     decoder_depth: int = 4
     patch_voxels: int = 16            # 2.5D slab sample grid (V,V,1); physical size is per-patch (size embed)
-    patch_grid: tuple | None = None   # v5: explicit sample grid, e.g. (8,8,8) for 3D CUBE patches; None -> (V,V,1) slab
+    patch_grid: tuple | None = None   # v5: explicit SOURCE stem grid, e.g. (8,8,8) cube or (8,8,1) slab; None -> (V,V,1)
+    tgt_grid: tuple | None = None     # v5 slab-source: separate grid for held-target content heads (color/MAE); None -> patch_grid
     rope_lambda_min_mm: float = 2.0
     rope_lambda_max_mm: float = 1024.0
 
@@ -140,8 +141,13 @@ class Phase0Encoder(nn.Module):
         # one Conv3d stem + one pixel head + one color head handle all sizes. Physical scale rides
         # along as a per-patch SIZE EMBEDDING (MLP of size in mm), added to the token + decoder query.
         V = cfg.patch_voxels
-        self.grid = tuple(cfg.patch_grid) if cfg.patch_grid else (V, V, 1)   # v5: (8,8,8) cube or (V,V,1) slab
+        self.grid = tuple(cfg.patch_grid) if cfg.patch_grid else (V, V, 1)   # SOURCE stem: (8,8,8) cube or (V,V,1) slab
         self.pv = int(np.prod(self.grid))
+        # held-TARGET content geometry (color/MAE heads). Defaults to the source grid, but the slab-source
+        # v5 ablation feeds slab sources (grid=(V,V,1)) while KEEPING cube targets (tgt_grid=(V,V,V)), so the
+        # ordering/MAE difficulty stays matched to the cube baseline and only the source patch shape changes.
+        self.tgt_grid = tuple(cfg.tgt_grid) if cfg.tgt_grid else self.grid
+        self.tgt_pv = int(np.prod(self.tgt_grid))
         self.stem = nn.Conv3d(1, cfg.width, self.grid, stride=self.grid)
         # per-axis physical extent (mm) [.,.,3] -> W. For a 2.5D slab two axes = the size, the thin
         # (through-plane) axis ~= 0, so this encodes BOTH scale AND orientation (which plane the slab is).
@@ -169,10 +175,10 @@ class Phase0Encoder(nn.Module):
         self.query_seed = nn.Parameter(torch.zeros(cfg.width))
         self.seg_query = nn.Parameter(torch.zeros(cfg.width))            # seg as a 5th "modality" query (seg-prediction task)
         self.seg_cls_head = nn.Linear(cfg.width, 4)                      # 0 nontumor / 1 NCR / 2 edema / 3 ET
-        self.dec_pixel_head = nn.Linear(cfg.width, self.pv)
+        self.dec_pixel_head = nn.Linear(cfg.width, self.tgt_pv)   # reconstructs held-TARGET content (tgt_grid)
         self.match_slot_proj = nn.Linear(cfg.width, cfg.width)
         self.match_logit_scale = nn.Parameter(torch.tensor(default_log_logit_scale(0.07)))
-        self.color_head = ColorHead(cfg.width, self.grid)
+        self.color_head = ColorHead(cfg.width, self.tgt_grid)   # embeds held-TARGET content (tgt_grid)
         # EMA (target) copy of the SINGLE shared color_head (BYOL/DINO-style stable matching target).
         # Init identical; updated by EMA (never by grad). Used only when ema_color is enabled.
         self.color_head_ema = copy.deepcopy(self.color_head)
@@ -369,7 +375,7 @@ class Phase0Encoder(nn.Module):
         query = (self.query_seed[None, None, :] + self._size_emb(zt) + self.series_q_embed(modt)).contiguous()
         query = self._decode(query, ctx, cc, ct)
         recon = self.dec_pixel_head(query)
-        mae = F.l1_loss(recon, hp.reshape(B, m, self.pv))
+        mae = F.l1_loss(recon, hp.reshape(B, m, self.tgt_pv))
         slots = F.normalize(self.match_slot_proj(query), dim=-1)
         colors = F.normalize(self.color_head(blur_contents(hp, content_blur)), dim=-1)
         m_loss, met = slot_match_loss(slots, colors, self.match_logit_scale)

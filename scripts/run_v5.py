@@ -41,6 +41,10 @@ def main():
     ap.add_argument("--n-anchor", type=int, default=6)
     ap.add_argument("--n-tgt", type=int, default=32)
     ap.add_argument("--voxels", type=int, default=8, help="cube sample grid (voxels^3)")
+    ap.add_argument("--src-shape", choices=["cube", "slab"], default="cube",
+                    help="SOURCE patch shape: 'cube' (reference) | 'slab' = coverage-matched V×V×1 axial slabs")
+    ap.add_argument("--slab-per-cube", type=int, default=3, help="slab source: axial slabs per source cube (random S-I depth)")
+    ap.add_argument("--decoder-depth", type=int, default=4, help="cross-attention decoder blocks (lower = push work into encoder)")
     ap.add_argument("--prisms", type=float, nargs="+", default=[32., 64.])
     ap.add_argument("--prism-patch", default=None,
                     help="patch sizes per prism, e.g. '32:2,3,4;64:8' (default 32->4, 64->8). Enables multi-scale.")
@@ -70,6 +74,7 @@ def main():
     except Exception:
         git = branch = "unknown"
     print(f"GIT {branch}@{git} | v5 n_src={args.n_src} n_anchor={args.n_anchor} n_tgt={args.n_tgt} vox={args.voxels} "
+          f"src_shape={args.src_shape} slab_per_cube={args.slab_per_cube} dec_depth={args.decoder_depth} "
           f"match_w={args.match_weight} mae_w={args.mae_weight} tumor={args.tumor_frac}", flush=True)
     dev = args.device
     root = os.path.expanduser(args.data_root)
@@ -103,8 +108,15 @@ def main():
     val_bundles = [D.load_local_bundle(p, pid2dir[p], device=dev)[0] for p in val_pids[:args.val_patients]]
 
     torch.manual_seed(args.seed)
+    # source stem grid: cube (V,V,V) or slab (V,V,1). Slab source keeps CUBE targets (tgt_grid), so the
+    # held-target ordering/MAE difficulty stays matched to the cube baseline (only source shape changes).
+    if args.src_shape == "slab":
+        src_grid, tgt_grid = (args.voxels, args.voxels, 1), (args.voxels,) * 3
+    else:
+        src_grid, tgt_grid = (args.voxels,) * 3, None
     enc = M.Phase0Encoder(M.EncoderConfig(width=args.width, depth=args.depth, heads=args.heads, n_series=8,
-                                          patch_grid=(args.voxels,) * 3)).to(dev)      # 3D cube patches
+                                          decoder_depth=args.decoder_depth,
+                                          patch_grid=src_grid, tgt_grid=tgt_grid)).to(dev)
     cfg = T.TrainConfig(steps=args.steps, batch_size=args.batch_size, lr=args.lr, seed=args.seed,
                         compile=not args.no_compile, content_blur=args.content_blur,
                         mae_weight=args.mae_weight, match_weight=args.match_weight,
@@ -112,6 +124,7 @@ def main():
                         v5_prisms=tuple(args.prisms), v5_prism_patch=_parse_prism_patch(args.prism_patch),
                         tumor_frac=args.tumor_frac, v5_sampler_workers=args.sampler_workers,
                         v5_seg_task=args.seg_task, v5_seg_frac=args.seg_frac,
+                        v5_src_shape=args.src_shape, v5_slab_per_cube=args.slab_per_cube,
                         git_commit=git, git_branch=branch,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | grid {enc.grid} pv {enc.pv} | bs {args.batch_size}", flush=True)
