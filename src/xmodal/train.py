@@ -100,6 +100,7 @@ class TrainConfig:
     v5_seg_frac: float = 0.1          # fraction of steps that do the seg task instead of ordering
     v5_src_shape: str = "cube"        # v5 SOURCE patch shape: 'cube' (reference) | 'slab' (coverage-matched V×V×1)
     v5_slab_per_cube: int = 3         # slab-source: axial slabs sampled per source cube (random S-I depth within it)
+    v5_slab_random: bool = False      # slab-source: draw slabs at independent random positions (no cube grouping) — ablates the cube constraint
     git_commit: str = ""
     git_branch: str = ""
 
@@ -531,7 +532,8 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
                                  n_tgt=cfg.v5_n_tgt, prism_choices=prism_choices or cfg.v5_prisms,
                                  prism_patch=prism_patch or cfg.v5_prism_patch, voxels=cfg.v5_voxels,
                                  rng=rng, device=device, tumor_frac=cfg.tumor_frac,
-                                 src_shape=cfg.v5_src_shape, slab_per_cube=cfg.v5_slab_per_cube)
+                                 src_shape=cfg.v5_src_shape, slab_per_cube=cfg.v5_slab_per_cube,
+                                 slab_random=cfg.v5_slab_random)
 
     # parallel prefetch: worker threads run the pure-CPU _v5_geometry stage; the main thread does the GPU
     # gather + step. Hides the ~1s CPU geometry behind the GPU work -> keeps the A40 fed.
@@ -548,7 +550,8 @@ def train_v5(model, train_bundles, val_bundles, specs, cfg: TrainConfig, *, devi
                     g = S._v5_geometry(train_bundles.resident(), batch_size=cfg.batch_size, n_src=cfg.v5_n_src,
                                        n_anchor=cfg.v5_n_anchor, n_tgt=cfg.v5_n_tgt, prism_choices=cfg.v5_prisms,
                                        prism_patch=cfg.v5_prism_patch, voxels=cfg.v5_voxels, rng=wrng, tumor_frac=cfg.tumor_frac,
-                                       src_shape=cfg.v5_src_shape, slab_per_cube=cfg.v5_slab_per_cube)
+                                       src_shape=cfg.v5_src_shape, slab_per_cube=cfg.v5_slab_per_cube,
+                                       slab_random=cfg.v5_slab_random)
                 except Exception as e:
                     log(f"[prefetch w{wid}] {type(e).__name__}: {e}"); continue
                 while not _pf_stop.is_set():

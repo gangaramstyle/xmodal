@@ -613,7 +613,7 @@ def _mk_scan_plan(C, Kk, I, Kidx, Z):
 
 def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
                  prism_patch=None, voxels=8, rng, tumor_frac=0.0, src_spacing="random",
-                 src_shape="cube", slab_per_cube=3, slab_thin_mm=1.0):
+                 src_shape="cube", slab_per_cube=3, slab_thin_mm=1.0, slab_random=False):
     """PURE-CPU geometry stage of v5 sampling (no GPU ops -> thread-safe & parallelizable for prefetch).
     Builds per-item coords/sizes/series + scan-sorted gather PLANS (numpy), consumed by _v5_gather.
 
@@ -717,10 +717,20 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
             src_all = np.concatenate([src_pos, anc_pos], 0).astype(np.float32)      # [nS,3] world
             mods = np.concatenate([src_mod, np.full(n_anchor, D, np.int64)])
             if slab:
-                u = (rng.random((nS, Ksl)) * 2 - 1) * (ps / 2.0)                    # S-I depth offset (mm) within ±ps/2
-                sctr = np.repeat(src_all, Ksl, axis=0)                              # [nS*Ksl,3] world
-                sctr[:, 2] = sctr[:, 2] + u.reshape(-1)                             # jitter world axis 2 = S-I (axial)
-                smod = np.repeat(mods, Ksl)                                         # [nS*Ksl]
+                if slab_random:
+                    # RANDOM slabs (no cube grouping): draw nS*Ksl independent positions straight from the
+                    # prism's local fg, each its own random (x,y,z) + modality. Ablates the cube constraint —
+                    # tests whether cube-tied triples (shared x,y, z-band) were load-bearing vs just coverage.
+                    nctx = n_src * Ksl; nanc = n_anchor * Ksl
+                    ctxp = local[rng.integers(K, size=nctx)].astype(np.float32)
+                    ancp = local[rng.integers(K, size=nanc)].astype(np.float32)
+                    sctr = np.concatenate([ctxp, ancp], 0)
+                    smod = np.concatenate([ctx[rng.integers(3, size=nctx)], np.full(nanc, D, np.int64)])
+                else:
+                    u = (rng.random((nS, Ksl)) * 2 - 1) * (ps / 2.0)                # S-I depth offset (mm) within ±ps/2
+                    sctr = np.repeat(src_all, Ksl, axis=0)                          # [nS*Ksl,3] world
+                    sctr[:, 2] = sctr[:, 2] + u.reshape(-1)                         # jitter world axis 2 = S-I (axial)
+                    smod = np.repeat(mods, Ksl)                                     # [nS*Ksl]
                 zext = np.full((nS_tok, 3), ps, np.float32)                         # in-plane axes = ps
                 zext[np.arange(nS_tok), nthick_arr[bmap[smod]]] = slab_thin_mm      # thin on each token's native axis
                 csrc_np[i] = sctr - a_a[None]; ser_np[i] = smod; zsrc_np[i] = zext
@@ -776,7 +786,7 @@ def _v5_gather(geom, device):
 
 def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
                     prism_patch=None, voxels=8, rng, device, tumor_frac=0.0, src_spacing="random",
-                    src_shape="cube", slab_per_cube=3, slab_thin_mm=1.0):
+                    src_shape="cube", slab_per_cube=3, slab_thin_mm=1.0, slab_random=False):
     """Per item: pick a target modality D; the source bag = `n_src` patches of the OTHER 3 modalities
     (random position+modality) + `n_anchor` D anchors; the targets = `n_tgt` held D patches to ORDER.
     Prism-conditional size (32mm->4mm, 64mm->8mm). Positions from the common foreground. Because every
@@ -789,7 +799,8 @@ def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choice
     geom = _v5_geometry(bundles, batch_size=batch_size, n_src=n_src, n_anchor=n_anchor, n_tgt=n_tgt,
                         prism_choices=prism_choices, prism_patch=prism_patch, voxels=voxels, rng=rng,
                         tumor_frac=tumor_frac, src_spacing=src_spacing,
-                        src_shape=src_shape, slab_per_cube=slab_per_cube, slab_thin_mm=slab_thin_mm)
+                        src_shape=src_shape, slab_per_cube=slab_per_cube, slab_thin_mm=slab_thin_mm,
+                        slab_random=slab_random)
     return _v5_gather(geom, device)
 
 

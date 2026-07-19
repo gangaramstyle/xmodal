@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--src-shape", choices=["cube", "slab"], default="cube",
                     help="SOURCE patch shape: 'cube' (reference) | 'slab' = coverage-matched V×V×1 axial slabs")
     ap.add_argument("--slab-per-cube", type=int, default=3, help="slab source: axial slabs per source cube (random S-I depth)")
+    ap.add_argument("--slab-random", action="store_true", help="slab source: independent random slab positions (no cube grouping) — ablates the cube constraint")
     ap.add_argument("--decoder-depth", type=int, default=4, help="cross-attention decoder blocks (lower = push work into encoder)")
     ap.add_argument("--prisms", type=float, nargs="+", default=[32., 64.])
     ap.add_argument("--prism-patch", default=None,
@@ -74,7 +75,7 @@ def main():
     except Exception:
         git = branch = "unknown"
     print(f"GIT {branch}@{git} | v5 n_src={args.n_src} n_anchor={args.n_anchor} n_tgt={args.n_tgt} vox={args.voxels} "
-          f"src_shape={args.src_shape} slab_per_cube={args.slab_per_cube} dec_depth={args.decoder_depth} "
+          f"src_shape={args.src_shape} slab_per_cube={args.slab_per_cube} slab_random={args.slab_random} dec_depth={args.decoder_depth} "
           f"match_w={args.match_weight} mae_w={args.mae_weight} tumor={args.tumor_frac}", flush=True)
     dev = args.device
     root = os.path.expanduser(args.data_root)
@@ -125,6 +126,7 @@ def main():
                         tumor_frac=args.tumor_frac, v5_sampler_workers=args.sampler_workers,
                         v5_seg_task=args.seg_task, v5_seg_frac=args.seg_frac,
                         v5_src_shape=args.src_shape, v5_slab_per_cube=args.slab_per_cube,
+                        v5_slab_random=args.slab_random,
                         git_commit=git, git_branch=branch,
                         ckpt_dir=args.ckpt_dir, wandb=args.wandb, wandb_run=args.wandb_run)
     print(f"model {sum(p.numel() for p in enc.parameters())/1e6:.1f}M | grid {enc.grid} pv {enc.pv} | bs {args.batch_size}", flush=True)
