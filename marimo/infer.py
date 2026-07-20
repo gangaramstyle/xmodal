@@ -717,11 +717,13 @@ def r2_set_metrics(h, metrics, eval_cfg=None):
 # ---------------------------------------------------------------------------
 
 def build_tiles(b, src_shape="cube", stride_mm=16.0, prism_mm=32.0, size=4.0, res=1.0,
-                n_src=512, sampling="hybrid", dev="cuda"):
+                n_src=512, sampling="hybrid", query="mm", dev="cuda"):
     """Sliding-window prisms over the whole foreground (no oracle/tumor anchoring). Each tile: a source bag
     (cube or slab per src_shape) + a dense query grid whose WORLD coords are kept in `_gworld` for stitching.
-    Mirrors build_prisms' source gather; sampling = 'random'|'cover'|'hybrid'."""
-    slab = src_shape == "slab"
+    query='mm': a res-spaced mm lattice (queries land at interpolated positions). query='voxel': the query
+    grid SNAPS to actual voxel centers around the anchor (pixel-level — each query IS a real voxel, exact
+    label, exact stitch-back, no interpolation). Mirrors build_prisms' source gather; sampling='random'|'cover'|'hybrid'."""
+    slab = src_shape == "slab"; voxq = query == "voxel"
     sc = b["t1c"]; fg = sc.foreground_np if sc.foreground_np is not None else sc.foreground_mm.cpu().numpy()
     half = prism_mm / 2.0; unit = S._cube_unit(8, dev)
     lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); G = len(lin)
@@ -732,6 +734,16 @@ def build_tiles(b, src_shape="cube", stride_mm=16.0, prism_mm=32.0, size=4.0, re
     lo, hi = fg.min(0), fg.max(0); rng = np.random.default_rng(0)
     axes = [np.arange(lo[i] + half, hi[i] - half + 1e-3, stride_mm) for i in range(3)]
     thick = S._native_thick(sc) if slab else 0
+    if voxq:                                                  # voxel-aligned query lattice (pixel-level)
+        aiff = np.asarray(sc.affine_inv.detach().cpu()); taff = np.asarray(sc.affine_trans.detach().cpu())
+        Raff = np.linalg.inv(aiff)                            # voxel->world rotation
+        spc = float(np.linalg.norm(Raff, axis=0).mean())     # mean voxel spacing (mm)
+        npq = int(round(half / spc)); vq = np.arange(-npq, npq + 1)
+        vgx, vgy, vgz = np.meshgrid(vq, vq, vq, indexing="ij")
+        voff = np.stack([vgx, vgy, vgz], -1).reshape(-1, 3)   # integer voxel offsets [Gq^3,3]
+        G = 2 * npq + 1
+        segv = np.where(np.asarray(sc.seg_vol.detach().cpu()) == 4, 3, np.asarray(sc.seg_vol.detach().cpu())).astype(np.int8)
+        shp = np.array(segv.shape)
     tiles = []
     for ax in axes[0]:
         for ay in axes[1]:
@@ -739,7 +751,15 @@ def build_tiles(b, src_shape="cube", stride_mm=16.0, prism_mm=32.0, size=4.0, re
                 anch = np.array([ax, ay, az], np.float32); cm_ = fg[np.abs(fg - anch).max(-1) <= half]
                 if len(cm_) < n_src // 2:
                     continue
-                gpts = (grid + anch).astype(np.float32)
+                if voxq:
+                    avox = np.round((anch - taff) @ aiff.T).astype(int)
+                    absv = avox[None] + voff                                   # [Gq^3,3] voxel indices
+                    gw = (absv @ Raff.T + taff).astype(np.float32)             # exact voxel-center world coords
+                    clp = np.clip(absv, 0, shp - 1)
+                    gt_vals = segv[clp[:, 0], clp[:, 1], clp[:, 2]]            # exact per-voxel label
+                else:
+                    gw = (grid + anch).astype(np.float32); gt_vals = np.zeros(len(gw), np.int8)
+                gpts = gw
                 if sampling == "cover":
                     cs = (cover_rel + anch).astype(np.float32); sm = cover_sm
                 elif sampling == "hybrid":
@@ -757,22 +777,23 @@ def build_tiles(b, src_shape="cube", stride_mm=16.0, prism_mm=32.0, size=4.0, re
                           else S._gather_cubes(b[m], cc_, sz_, unit, dev))
                     sp[sel] = pt.half().cpu().numpy()
                 tiles.append(dict(sp=sp, sc=(cs - anch).astype(np.float32), sm=sm.astype(np.int64),
-                                  gpts=(gpts - anch).astype(np.float32), gt=np.zeros(len(gpts), np.int8), gdim=G,
+                                  gpts=(gpts - anch).astype(np.float32), gt=gt_vals.astype(np.int8), gdim=G,
                                   pid=0, pname="tile", anch=anch.copy(), prism_mm=prism_mm, res=res,
                                   imgs=np.zeros((4, G, G, G), np.float16), _gworld=gpts))
     return tiles
 
 
 def stitch_tiles(b, ro, E, src_shape="cube", stride_mm=16.0, sampling="hybrid", n_src=512,
-                 size=4.0, dev="cuda", progress=None):
+                 size=4.0, query="mm", dev="cuda", progress=None):
     """Tile the whole scan, decode every query position, scatter per-class votes back to the full voxel grid.
-    Returns vote volumes (vet/vtc/vwt) + coverage + GT for whole-brain Dice via tile_metrics."""
+    query='voxel' snaps queries to voxel centers (pixel-level, exact stitch-back). Returns vote volumes
+    (vet/vtc/vwt) + coverage + GT for whole-brain Dice via tile_metrics."""
     sc = b["t1c"]
     at = np.asarray(sc.affine_trans.detach().cpu()); ai = np.asarray(sc.affine_inv.detach().cpu())
     gt = np.asarray(sc.seg_vol.detach().cpu()); gt = np.where(gt == 4, 3, gt).astype(np.int8); shape = gt.shape
     vol = np.asarray(sc.volume.detach().cpu()).astype(np.float32)
     tiles = build_tiles(b, src_shape=src_shape, stride_mm=stride_mm, size=size, res=1.0,
-                        n_src=n_src, sampling=sampling, dev=dev)
+                        n_src=n_src, sampling=sampling, query=query, dev=dev)
     res_ = eval_readout(E, ro, tiles, dev=dev, progress=progress)
     cov, vet, vtc, vwt = (np.zeros(shape, np.int32) for _ in range(4))
     covf, vetf, vtcf, vwtf = (a.reshape(-1) for a in (cov, vet, vtc, vwt))
