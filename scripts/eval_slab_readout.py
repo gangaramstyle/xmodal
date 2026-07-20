@@ -17,6 +17,13 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "marimo"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import infer  # noqa: E402
+from xmodal import data as D  # noqa: E402
+
+
+def _patient_dirs(root, n):
+    """Canonical BraTS patient finder (handles nested track dirs; a flat BraTS-* glob misses them)."""
+    found = D.find_brats_patients(os.path.expanduser(root))   # {pid: dir}
+    return [found[p] for p in sorted(found)][:n]
 
 
 def main():
@@ -32,8 +39,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
-    train_dirs = sorted(glob.glob(os.path.join(os.path.expanduser(a.train_root), "BraTS-*")))[:a.n_train]
-    eval_dirs = sorted(glob.glob(os.path.join(os.path.expanduser(a.eval_root), "BraTS-*")))[:a.n_eval]
+    train_dirs = _patient_dirs(a.train_root, a.n_train)
+    eval_dirs = _patient_dirs(a.eval_root, a.n_eval)
     print(f"train patients {len(train_dirs)} | eval patients {len(eval_dirs)} | "
           f"n_src={a.n_src} n_pri={a.n_pri} res={a.res} ep={a.epochs}/{a.epochs2} unf={a.unfreeze}", flush=True)
     assert train_dirs and eval_dirs
