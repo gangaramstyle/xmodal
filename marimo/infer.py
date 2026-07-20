@@ -44,7 +44,8 @@ def load_model(ckpt, width=768, heads=12, dev="cuda"):
 
 
 def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, res=1.0, seed=0,
-                 cover=False, neg_frac=0.0, cache=True, dev="cuda", progress=None, hybrid=False, src_shape="cube"):
+                 cover=False, neg_frac=0.0, cache=True, dev="cuda", progress=None, hybrid=False,
+                 src_shape="cube", query="mm"):
     unit = S._cube_unit(8, dev); rng = np.random.default_rng(seed); out = []
     slab = src_shape == "slab"                            # source patch shape must match the encoder's stem
     for ci, pd in enumerate(patient_dirs):
@@ -67,6 +68,12 @@ def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, re
         at, ai = sc0.affine_trans, sc0.affine_inv; half = prism_mm / 2.0
         lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); G = len(lin)
         gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij"); grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
+        if query == "voxel":                                  # snap query grid to voxel centers (pixel-level)
+            _aiff = np.asarray(sc0.affine_inv.detach().cpu()); _taff = np.asarray(sc0.affine_trans.detach().cpu())
+            _Raff = np.linalg.inv(_aiff); _spc = float(np.linalg.norm(_Raff, axis=0).mean())
+            _npq = int(round(half / _spc)); _vq = np.arange(-_npq, _npq + 1)
+            _vgx, _vgy, _vgz = np.meshgrid(_vq, _vq, _vq, indexing="ij")
+            _voff = np.stack([_vgx, _vgy, _vgz], -1).reshape(-1, 3); G = 2 * _npq + 1
         if cover or hybrid:                                # full-coverage lattice (also used by hybrid)
             nper = int(round(prism_mm / size))             # 32mm / 4mm = 8 cubes per axis (non-overlapping tiling)
             cl = np.arange(-half + size / 2, half, size, dtype=np.float32)[:nper]
@@ -83,7 +90,11 @@ def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, re
                 anch = free[0]
             else:
                 anch = tmm[rng.integers(len(tmm))].astype(np.float32)       # anchor ON a tumor voxel
-            gpts = (grid + anch).astype(np.float32)
+            if query == "voxel":
+                _av = np.round((anch - _taff) @ _aiff.T)                    # anchor voxel; queries at exact voxel centers
+                gpts = ((_av[None] + _voff) @ _Raff.T + _taff).astype(np.float32)
+            else:
+                gpts = (grid + anch).astype(np.float32)
             if cover:
                 cs = (cover_rel + anch).astype(np.float32); sm = cover_sm   # 8^3 x 4mod = 2048, voxel-complete
             else:

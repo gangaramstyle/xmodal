@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--unfreeze", type=int, default=12); ap.add_argument("--qsize", type=float, default=2.0)
     ap.add_argument("--stride-mm", type=float, default=16.0); ap.add_argument("--consensus", type=float, default=0.5)
     ap.add_argument("--min-vox", type=int, default=0); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--query", choices=["mm", "voxel"], default="mm")
     a = ap.parse_args()
     samp = SAMP[a.sampling]
 
@@ -49,7 +50,7 @@ def main():
         E = infer.load_model(g[-1])
         print(f"[{nm}] loaded stem-grid {E.grid} src_shape={shape}; training readout...", flush=True)
         tr = infer.build_prisms(train_dirs, n_prisms=a.n_pri, n_src=a.n_src, res=1.0, neg_frac=0.3,
-                                cache=False, seed=a.seed, src_shape=shape, **samp)
+                                cache=False, seed=a.seed, src_shape=shape, query=a.query, **samp)
         ro = infer.train_readout(E, tr, epochs=a.epochs, epochs2=a.epochs2, unfreeze=a.unfreeze,
                                  warmstart=True, qsize=a.qsize, seed=a.seed)
         print(f"[{nm}] readout trained ({time.time()-t0:.0f}s); tiling {len(val_dirs)} val patients...", flush=True)
@@ -58,7 +59,7 @@ def main():
             pid = os.path.basename(vd)
             b = D.load_local_bundle(pid, vd, device="cuda", with_seg=True)[0]
             store = infer.stitch_tiles(b, ro, E, src_shape=shape, stride_mm=a.stride_mm,
-                                       sampling=a.sampling, n_src=a.n_src, dev="cuda")
+                                       sampling=a.sampling, n_src=a.n_src, query=a.query, dev="cuda")
             m = infer.tile_metrics(store, consensus=a.consensus, min_vox=a.min_vox)
             for k in dsc:
                 if m[f"dsc_{k}"] >= 0:
