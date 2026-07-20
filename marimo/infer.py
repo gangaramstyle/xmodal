@@ -32,16 +32,21 @@ def _at(vol, at, ai, pts, dev):
 
 def load_model(ckpt, width=768, heads=12, dev="cuda"):
     ck = torch.load(ckpt, map_location=dev)
-    E = M.Phase0Encoder(M.EncoderConfig(width=width, depth=12, heads=heads, n_series=8, patch_grid=(8, 8, 8))).to(dev)
-    E.load_state_dict(ck["model"], strict=False)
+    grid = tuple(int(x) for x in ck["model"]["stem.weight"].shape[2:])   # auto: (8,8,8) cube or (8,8,1) slab source
+    E = M.Phase0Encoder(M.EncoderConfig(width=width, depth=12, heads=heads, n_series=8, patch_grid=grid)).to(dev)
+    # readout uses the encoder + decoder, NOT the cube target heads; slab source has cube targets (tgt_grid !=
+    # source grid) so color_head/dec_pixel_head would shape-mismatch here — drop them, load non-strict.
+    sd = {k: v for k, v in ck["model"].items() if not k.startswith(("color_head", "dec_pixel_head"))}
+    E.load_state_dict(sd, strict=False)
     for p in E.parameters():
         p.requires_grad_(False)
     return E
 
 
 def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, res=1.0, seed=0,
-                 cover=False, neg_frac=0.0, cache=True, dev="cuda", progress=None):
+                 cover=False, neg_frac=0.0, cache=True, dev="cuda", progress=None, hybrid=False, src_shape="cube"):
     unit = S._cube_unit(8, dev); rng = np.random.default_rng(seed); out = []
+    slab = src_shape == "slab"                            # source patch shape must match the encoder's stem
     for ci, pd in enumerate(patient_dirs):
         pid = os.path.basename(pd)
         if progress:
@@ -62,7 +67,7 @@ def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, re
         at, ai = sc0.affine_trans, sc0.affine_inv; half = prism_mm / 2.0
         lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); G = len(lin)
         gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij"); grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
-        if cover:                                          # full-coverage lattice, shared across prisms
+        if cover or hybrid:                                # full-coverage lattice (also used by hybrid)
             nper = int(round(prism_mm / size))             # 32mm / 4mm = 8 cubes per axis (non-overlapping tiling)
             cl = np.arange(-half + size / 2, half, size, dtype=np.float32)[:nper]
             cgx, cgy, cgz = np.meshgrid(cl, cl, cl, indexing="ij")
@@ -87,12 +92,20 @@ def build_prisms(patient_dirs, n_prisms=6, n_src=96, size=4.0, prism_mm=32.0, re
                     continue
                 cs = cm[rng.integers(len(cm), size=n_src)].astype(np.float32)
                 sm = rng.integers(4, size=n_src)
-            sp = np.zeros((len(cs), 8, 8, 8), np.float16)
+                if hybrid:                                   # add full cover patches on top of the random ones
+                    cs = np.concatenate([(cover_rel + anch).astype(np.float32), cs])
+                    sm = np.concatenate([cover_sm, sm])
+            sp = np.zeros((len(cs), 8, 8, 1 if slab else 8), np.float16)
             for mi, m in enumerate(MODS):
                 sel = np.nonzero(sm == mi)[0]
-                if sel.size:
-                    sp[sel] = S._gather_cubes(b[m], torch.as_tensor(cs[sel], device=dev),
-                                              torch.full((sel.size,), size, device=dev), unit, dev).half().cpu().numpy()
+                if not sel.size:
+                    continue
+                cc_ = torch.as_tensor(cs[sel], device=dev); sz_ = torch.full((sel.size,), size, device=dev)
+                if slab:
+                    pt = S._gather_slabs(b[m], cc_, sz_, S._native_thick(b[m]), 8, dev)      # [k,8,8,1] axial slab
+                else:
+                    pt = S._gather_cubes(b[m], cc_, sz_, unit, dev)                          # [k,8,8,8] cube
+                sp[sel] = pt.half().cpu().numpy()
             gp = torch.as_tensor(gpts, device=dev)
             gt = _at(sc0.seg_vol, at, ai, gp, dev).long()
             gt = torch.where(gt == 4, torch.full_like(gt, 3), gt).cpu().numpy().astype(np.int8)
@@ -271,7 +284,10 @@ def _encode_src(E, sp, sc, sm, size, dev):
     """Encode a prism's source bag once. Encoder is frozen, so the result is a constant that can be
     reused across every query chunk and every fine-tune epoch. Returns (ctx, cc)."""
     nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
-    zs = torch.full((nb, sp.shape[1], 3), size, device=dev)
+    if sp.shape[-1] == 1:                                              # slab source (V,V,1): thin extent on native axis 2
+        zs = S.size_to_extent(torch.full((nb, sp.shape[1]), size, device=dev), 2)
+    else:
+        zs = torch.full((nb, sp.shape[1], 3), size, device=dev)       # cube source: isotropic extent
     with torch.no_grad():
         x = E.encode(*E._context([E.embed(sp, zs, sm)], [sc], dev, nb))
         ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
