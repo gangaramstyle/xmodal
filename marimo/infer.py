@@ -332,7 +332,11 @@ def _nsd(pred, gt, coords, tol=2.0):
     if pred.sum() == 0 or gt.sum() == 0:
         return None
     pc, gc = coords[pred], coords[gt]
-    d_pg = torch.cdist(pc, gc).min(1).values; d_gp = torch.cdist(gc, pc).min(1).values
+
+    def _mind(a, b, chunk=1024):                          # row-chunked cdist-min: bounds peak mem (else a big
+        return torch.cat([torch.cdist(a[i:i + chunk], b).min(1).values   # lesion's [Na,Nb] matrix OOMs small GPUs)
+                          for i in range(0, len(a), chunk)])
+    d_pg = _mind(pc, gc); d_gp = _mind(gc, pc)
     return float(((d_pg <= tol).float().sum() + (d_gp <= tol).float().sum()) / (len(pc) + len(gc)))
 
 
