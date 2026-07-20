@@ -95,7 +95,7 @@ class _TorchLogReg:
         return self.classes_[(Xt @ self.W.T + self.b).argmax(1).cpu().numpy()]
 
 
-def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", cube=0,
+def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", cube=0, slab_vox=16,
                 sampling="random", grid_step=8.0, grid_cap=6000,
                 n_prisms=24, per_prism=96, prism_tumor=0.7, prism_mm=64.0, sizes=None):
     """Whole-brain modes (readout = one big per-PATIENT bag): sampling='random' (K sparse foreground
@@ -160,7 +160,7 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", c
             vi = vi.clamp(min=torch.zeros(3, device=device, dtype=torch.long), max=shp - 1)
             sl = segt[vi[..., 0], vi[..., 1], vi[..., 2]].reshape(K, -1)
         else:
-            thick = naxis(sc0); unit = S.slab_unit_offsets(thick, 16, device)
+            thick = naxis(sc0); unit = S.slab_unit_offsets(thick, slab_vox, device)
             vi = S.mixed_bag_vox(sc0, c[None], torch.full((1, K), float(LS), device=device), unit).round().long()
             vi = vi.clamp(min=torch.zeros(3, device=device, dtype=torch.long), max=shp - 1)
             sl = segt[vi[..., 0], vi[..., 1], vi[..., 2]].reshape(K, -1)
@@ -181,20 +181,28 @@ def build_cache(data_root, tracks, out, *, K=700, LS=4, seed=0, device="cuda", c
     arrs = {k: np.concatenate(v).astype(np.float16) for k, v in store.items()}
     np.savez(out, coords=np.concatenate(COORD).astype(np.float32), labels=np.concatenate(LAB).astype(np.int8),
              groups=np.concatenate(GRP).astype(np.int16), prisms=np.concatenate(PID).astype(np.int32),
-             cube=np.int16(cube), sampling=np.str_(sampling), **arrs)
+             cube=np.int16(cube), slab_vox=np.int16(slab_vox), sampling=np.str_(sampling), **arrs)
     lab_all = np.concatenate(LAB); npr = len(np.unique(np.concatenate(PID)))
     print(f"cache built: {used} patients, {len(lab_all)} patches ({len(lab_all)//max(used,1)}/patient), "
           f"{npr} bags ({len(lab_all)//max(npr,1)}/bag), cube={cube} sampling={sampling} -> {out}", flush=True)
 
 
-def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda", mixed=False, cube=0):
+def eval_ckpt(cache, ckpt, *, sizes=(4, 8), device="cuda", mixed=False, cube=0, width=384, heads=6):
     Z = np.load(cache); coords = Z["coords"]; labels = Z["labels"].astype(int); groups = Z["groups"].astype(int)
     cube = int(cube or Z["cube"]) if "cube" in Z else cube                 # cache remembers its geometry
+    slab_vox = int(Z["slab_vox"]) if "slab_vox" in Z else 16               # slab-source grid (V,V,1); 16 = legacy
     mixed = mixed or bool(cube)                                            # v5 (cube) always uses series conditioning
     ck = torch.load(ckpt, map_location=device); step = int(ck.get("step", -1))
-    ecfg = M.EncoderConfig(width=384, depth=12, heads=6, n_series=8, patch_grid=(cube, cube, cube) if cube else None)
+    grid = (cube, cube, cube) if cube else (slab_vox, slab_vox, 1)         # source stem grid must match training
+    ecfg = M.EncoderConfig(width=width, depth=12, heads=heads, n_series=8, patch_grid=grid)
     E = M.Phase0Encoder(ecfg).to(device)
-    E.load_state_dict(ck["model"]); E.eval()
+    # readout uses the ENCODER only (teacher_readout). Slab-source v5 has cube target heads (tgt_grid !=
+    # source grid), so color_head/dec_pixel_head would shape-mismatch here — drop them and load non-strict.
+    sd = {k: v for k, v in ck["model"].items() if not k.startswith(("color_head", "dec_pixel_head"))}
+    miss, unexp = E.load_state_dict(sd, strict=False)
+    enc_miss = [k for k in miss if not k.startswith(("color_head", "dec_pixel_head"))]
+    assert not enc_miss, f"encoder weights missing from checkpoint: {enc_miss[:8]}"
+    E.eval()
     gids = sorted(set(groups.tolist()))
 
     def feats_for(s):
@@ -246,14 +254,19 @@ def main():
                     help="mixed-modality checkpoint: pass per-patch series_ids to teacher_readout (Site A "
                          "conditioning) so the readout matches training. Off for legacy phased checkpoints.")
     ap.add_argument("--cube", type=int, default=0,
-                    help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy 2.5D slabs.")
+                    help="v5 3D-cube encoders: cube voxel grid (e.g. 8). 0 = legacy/slab 2.5D slabs.")
+    ap.add_argument("--slab-vox", type=int, default=16,
+                    help="slab-source (cube=0) grid V (V,V,1); 8 for v5 slab-source encoders, 16 for legacy phased.")
+    ap.add_argument("--width", type=int, default=384, help="encoder width (768 = ViT-base v5 runs)")
+    ap.add_argument("--heads", type=int, default=6, help="attention heads (12 for 768-wide)")
     ap.add_argument("--sampling", choices=["random", "grid", "prism_random", "prism_grid"], default="random",
                     help="random = train-like sparse foreground centers; grid = dense full-coverage lattice.")
     a = ap.parse_args()
     if a.build or not os.path.exists(a.cache):
-        build_cache(a.data_root, a.tracks, a.cache, device=a.device, cube=a.cube, sampling=a.sampling)
+        build_cache(a.data_root, a.tracks, a.cache, device=a.device, cube=a.cube, slab_vox=a.slab_vox, sampling=a.sampling)
     if a.checkpoint:
-        print(eval_ckpt(a.cache, a.checkpoint, sizes=tuple(a.sizes), device=a.device, mixed=a.mixed, cube=a.cube))
+        print(eval_ckpt(a.cache, a.checkpoint, sizes=tuple(a.sizes), device=a.device, mixed=a.mixed, cube=a.cube,
+                        width=a.width, heads=a.heads))
 
 
 if __name__ == "__main__":
