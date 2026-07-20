@@ -707,3 +707,100 @@ def r2_set_metrics(h, metrics, eval_cfg=None):
             idx[h]["eval"] = eval_cfg
         obstore.put(store, f"{R2_PREFIX}/index.json", json.dumps(idx).encode())
     return h
+
+
+# ---------------------------------------------------------------------------
+# Whole-brain tiling readout: slide prisms across the WHOLE scan, classify every query position with the
+# decoder, stitch overlapping votes -> whole-brain segmentation Dice. Cube vs slab differ ONLY in how the
+# source context patches are gathered (8x8x8 cube vs 8x8x1 axial slab) — the sliding/decode/stitch is
+# identical (src_shape drives the one gather swap, exactly like build_prisms).
+# ---------------------------------------------------------------------------
+
+def build_tiles(b, src_shape="cube", stride_mm=16.0, prism_mm=32.0, size=4.0, res=1.0,
+                n_src=512, sampling="hybrid", dev="cuda"):
+    """Sliding-window prisms over the whole foreground (no oracle/tumor anchoring). Each tile: a source bag
+    (cube or slab per src_shape) + a dense query grid whose WORLD coords are kept in `_gworld` for stitching.
+    Mirrors build_prisms' source gather; sampling = 'random'|'cover'|'hybrid'."""
+    slab = src_shape == "slab"
+    sc = b["t1c"]; fg = sc.foreground_np if sc.foreground_np is not None else sc.foreground_mm.cpu().numpy()
+    half = prism_mm / 2.0; unit = S._cube_unit(8, dev)
+    lin = np.arange(-half, half + 1e-3, res, dtype=np.float32); G = len(lin)
+    gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij"); grid = np.stack([gx, gy, gz], -1).reshape(-1, 3)
+    nper = int(round(prism_mm / size)); cl = np.arange(-half + size / 2, half, size, dtype=np.float32)[:nper]
+    cgx, cgy, cgz = np.meshgrid(cl, cl, cl, indexing="ij"); lat = np.stack([cgx, cgy, cgz], -1).reshape(-1, 3)
+    cover_rel = np.tile(lat, (4, 1)).astype(np.float32); cover_sm = np.repeat(np.arange(4), len(lat))
+    lo, hi = fg.min(0), fg.max(0); rng = np.random.default_rng(0)
+    axes = [np.arange(lo[i] + half, hi[i] - half + 1e-3, stride_mm) for i in range(3)]
+    thick = S._native_thick(sc) if slab else 0
+    tiles = []
+    for ax in axes[0]:
+        for ay in axes[1]:
+            for az in axes[2]:
+                anch = np.array([ax, ay, az], np.float32); cm_ = fg[np.abs(fg - anch).max(-1) <= half]
+                if len(cm_) < n_src // 2:
+                    continue
+                gpts = (grid + anch).astype(np.float32)
+                if sampling == "cover":
+                    cs = (cover_rel + anch).astype(np.float32); sm = cover_sm
+                elif sampling == "hybrid":
+                    rcs = cm_[rng.integers(len(cm_), size=n_src)].astype(np.float32); rsm = rng.integers(4, size=n_src)
+                    cs = np.concatenate([(cover_rel + anch).astype(np.float32), rcs]); sm = np.concatenate([cover_sm, rsm])
+                else:
+                    cs = cm_[rng.integers(len(cm_), size=n_src)].astype(np.float32); sm = rng.integers(4, size=n_src)
+                sp = np.zeros((len(cs), 8, 8, 1 if slab else 8), np.float16)
+                for mi, m in enumerate(MODS):
+                    sel = np.nonzero(sm == mi)[0]
+                    if not sel.size:
+                        continue
+                    cc_ = torch.as_tensor(cs[sel], device=dev); sz_ = torch.full((sel.size,), size, device=dev)
+                    pt = (S._gather_slabs(b[m], cc_, sz_, thick, 8, dev) if slab
+                          else S._gather_cubes(b[m], cc_, sz_, unit, dev))
+                    sp[sel] = pt.half().cpu().numpy()
+                tiles.append(dict(sp=sp, sc=(cs - anch).astype(np.float32), sm=sm.astype(np.int64),
+                                  gpts=(gpts - anch).astype(np.float32), gt=np.zeros(len(gpts), np.int8), gdim=G,
+                                  pid=0, pname="tile", anch=anch.copy(), prism_mm=prism_mm, res=res,
+                                  imgs=np.zeros((4, G, G, G), np.float16), _gworld=gpts))
+    return tiles
+
+
+def stitch_tiles(b, ro, E, src_shape="cube", stride_mm=16.0, sampling="hybrid", n_src=512,
+                 size=4.0, dev="cuda", progress=None):
+    """Tile the whole scan, decode every query position, scatter per-class votes back to the full voxel grid.
+    Returns vote volumes (vet/vtc/vwt) + coverage + GT for whole-brain Dice via tile_metrics."""
+    sc = b["t1c"]
+    at = np.asarray(sc.affine_trans.detach().cpu()); ai = np.asarray(sc.affine_inv.detach().cpu())
+    gt = np.asarray(sc.seg_vol.detach().cpu()); gt = np.where(gt == 4, 3, gt).astype(np.int8); shape = gt.shape
+    vol = np.asarray(sc.volume.detach().cpu()).astype(np.float32)
+    tiles = build_tiles(b, src_shape=src_shape, stride_mm=stride_mm, size=size, res=1.0,
+                        n_src=n_src, sampling=sampling, dev=dev)
+    res_ = eval_readout(E, ro, tiles, dev=dev, progress=progress)
+    cov, vet, vtc, vwt = (np.zeros(shape, np.int32) for _ in range(4))
+    covf, vetf, vtcf, vwtf = (a.reshape(-1) for a in (cov, vet, vtc, vwt))
+    for pr, rc in zip(tiles, res_):
+        gw = pr["_gworld"]; pred = rc["pred"].reshape(-1)
+        vi = np.round((gw - at) @ ai.T).astype(int)
+        ok = ((vi >= 0) & (vi < np.array(shape))).all(1); vi = vi[ok]; pdv = pred[ok]
+        fl = vi[:, 0] * shape[1] * shape[2] + vi[:, 1] * shape[2] + vi[:, 2]
+        np.add.at(covf, fl, 1); np.add.at(vetf, fl, (pdv == 3))
+        np.add.at(vtcf, fl, np.isin(pdv, [1, 3])); np.add.at(vwtf, fl, (pdv > 0))
+    return dict(vol=vol, gt=gt, cov=cov, vet=vet, vtc=vtc, vwt=vwt, shape=shape, n_tiles=len(tiles))
+
+
+def tile_metrics(store, consensus=0.5, min_vox=0):
+    """Whole-brain voxel Dice per region from stitched votes: pred = (votes/coverage) >= consensus, optional
+    small-component removal. Returns dsc_{et,tc,wt} + gt/pred voxel counts (pred_vox reveals over-prediction)."""
+    gt = store["gt"]; cov = np.maximum(store["cov"], 1); out = {"n_tiles": store["n_tiles"]}
+    regions = {"et": (store["vet"], gt == 3), "tc": (store["vtc"], np.isin(gt, [1, 3])), "wt": (store["vwt"], gt > 0)}
+    for k, (votes, gm) in regions.items():
+        pred = (votes / cov) >= consensus
+        if min_vox > 0:
+            from scipy import ndimage as ndi
+            lbl, n = ndi.label(pred)
+            if n:
+                sz = ndi.sum(np.ones_like(lbl), lbl, range(1, n + 1)); rem = np.nonzero(sz < min_vox)[0] + 1
+                if len(rem):
+                    pred = pred & ~np.isin(lbl, rem)
+        inter = int((pred & gm).sum()); s = int(pred.sum() + gm.sum())
+        out[f"dsc_{k}"] = (2.0 * inter / s) if s > 0 else -1.0
+        out[f"gt_vox_{k}"] = int(gm.sum()); out[f"pred_vox_{k}"] = int(pred.sum())
+    return out
