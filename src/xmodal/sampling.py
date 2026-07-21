@@ -181,6 +181,7 @@ class CachedScan:
     foreground_mm: object   # torch [M, 3]  world-mm anchor cloud (patch/prism centers)
     thick_axis: int         # acquisition/through-plane voxel axis (thin axis for 2.5D)
     plane_id: int = 0       # 0=axial 1=coronal 2=sagittal (from geometry)
+    world_thin_axis: int = 2  # WORLD axis (0=LR 1=AP 2=SI) the thru-plane points along -> patient-space slab shape
     modality: str = "?"     # e.g. "t1","t1c","t2","flair","CT"
     series_idx: int = 0
     patient: str = ""
@@ -209,6 +210,7 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
     affine = np.asarray(affine, np.float32)
     R, t = affine[:3, :3], affine[:3, 3]
     thick, plane, spacing = _thick_and_plane(R, thick_axis)
+    wthin = int(np.argmax(np.abs(R[:, thick])))              # world axis the thru-plane points along (patient-space slab)
     # foreground anchors: voxels above a fraction of max intensity -> world mm
     hi = float(vol_np.max()) or 1.0
     vox = np.argwhere(vol_np > fg_thresh * hi).astype(np.float32)
@@ -226,7 +228,7 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
         affine_trans=torch.as_tensor(t.copy(), device=device),
         foreground_mm=torch.as_tensor(fg, device=device),
         foreground_np=np.ascontiguousarray(fg, dtype=np.float32),   # CPU mirror -> no per-batch GPU->CPU sync
-        thick_axis=thick, plane_id=plane, modality=modality, series_idx=series_idx,
+        thick_axis=thick, plane_id=plane, world_thin_axis=wthin, modality=modality, series_idx=series_idx,
         patient=patient, spacing=spacing,
     )
 
