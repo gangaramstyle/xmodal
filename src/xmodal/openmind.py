@@ -186,7 +186,7 @@ def place_openmind(raw, rec, device="cuda", iso_ratio=1.3):
         thick = int(np.argmax(np.abs(np.asarray(aff)[2, :3])))   # world-Z-aligned voxel axis (axial default)
     else:
         thick = S.native_thru_plane(spacing)
-    return S.to_device_scan(vol, aff, modality=rec["seq"], device=device, thick_axis=thick,
+    return S.to_device_scan(vol, aff, modality=rec.get("modality", rec.get("seq", "?")), device=device, thick_axis=thick,
                             series_idx=rec["modality_id"], patient=str(rec["patient_id"]))
 
 

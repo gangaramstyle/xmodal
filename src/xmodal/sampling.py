@@ -214,12 +214,22 @@ def _thick_and_plane(affine_R: np.ndarray, thick_axis):
 
 
 def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient="",
-                   thick_axis=None, fg_thresh=0.02, max_fg=200_000, normalize=True, seed=0) -> CachedScan:
+                   thick_axis=None, fg_thresh=0.02, max_fg=200_000, normalize=True, seed=0,
+                   store_dtype="float32", max_voxels=40_000_000) -> CachedScan:
     """Build a CachedScan on `device` from a numpy volume + 4x4 affine. Derives thick_axis
-    and plane_id from geometry; builds the world-mm foreground anchor cloud."""
+    and plane_id from geometry; builds the world-mm foreground anchor cloud.
+
+    Volumes are kept at NATIVE resolution (no 1 mm cap). Only genuine monsters (> `max_voxels` ~= 340^3, e.g. a
+    sub-mm 512^3) are integer-strided down just enough to fit, with the affine rescaled so physical-mm sampling
+    stays exact — this bounds cache VRAM without touching normal (256^3/320^3) scans. `store_dtype` stays fp32
+    (grid_sample needs it + fp16 can't represent large voxel coords)."""
     import torch
     vol_np = np.ascontiguousarray(volume_np, dtype=np.float32)
     affine = np.asarray(affine, np.float32)
+    if vol_np.size > max_voxels:                              # monster-guard: stride down only extreme volumes
+        f = int(np.ceil((vol_np.size / max_voxels) ** (1 / 3)))
+        vol_np = np.ascontiguousarray(vol_np[::f, ::f, ::f])
+        affine = affine.copy(); affine[:3, :3] = affine[:3, :3] * f
     R, t = affine[:3, :3], affine[:3, 3]
     thick, plane, spacing = _thick_and_plane(R, thick_axis)
     axis_map = tuple(int(np.argmax(np.abs(R[:, k]))) for k in range(3))   # voxel axis -> dominant world axis
@@ -236,7 +246,8 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
         lo, hiP = np.percentile(vol_np[vol_np > fg_thresh * hi], [0.5, 99.5]) if (vol_np > fg_thresh * hi).any() else (0.0, hi)
         vol_np = np.clip((vol_np - lo) / max(hiP - lo, 1e-6), 0.0, 1.0)
     return CachedScan(
-        volume=torch.as_tensor(np.ascontiguousarray(vol_np, dtype=np.float32), device=device, dtype=torch.float32),
+        volume=torch.as_tensor(np.ascontiguousarray(vol_np, dtype=np.float32), device=device,
+                               dtype=getattr(torch, store_dtype)),   # fp16 by default -> half cache VRAM, native res
         affine_inv=torch.as_tensor(np.linalg.inv(R).copy(), device=device),
         affine_trans=torch.as_tensor(t.copy(), device=device),
         foreground_mm=torch.as_tensor(fg, device=device),
