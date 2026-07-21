@@ -77,14 +77,21 @@ def main():
     def placer(raw):                           # main thread: -> LIST of CachedScan (flatten in the loop)
         if raw[0] == "om":
             return [OM.place_openmind(raw[1], raw[2], device=dev)]
-        cpu, pid = raw[1], raw[2]; out = []
+        cpu, pid = raw[1], raw[2]                         # cpu = {mod: _cpu_payload dict}
+        bundle = D.place_bundle(cpu, dev)                 # proven BraTS GPU placement (dict -> CachedScan)
+        out = []
         for mod in MODS:
-            if mod not in cpu:
+            if mod not in bundle:
                 continue
-            vol, aff = cpu[mod][0], cpu[mod][1]
-            thick = S.native_or_axial_thick([float(np.linalg.norm(np.asarray(aff)[:3, k])) for k in range(3)], aff)
-            out.append(S.to_device_scan(vol, aff, modality=mod, device=dev, thick_axis=thick,
-                                        series_idx=SER_OFF + D.LOCAL_SERIES[mod], patient=str(PAT_OFF + bpid_idx[pid])))
+            sc, p = bundle[mod], cpu[mod]
+            R = np.linalg.inv(np.asarray(p["affine_inv"], np.float32))
+            aff = np.eye(4, dtype=np.float32); aff[:3, :3] = R; aff[:3, 3] = np.asarray(p["affine_trans"], np.float32)
+            thick = S.native_or_axial_thick(p["spacing"], aff)      # BraTS axial: S-I through-plane
+            sc.thick_axis = thick
+            sc.world_thin_axis = int(np.argmax(np.abs(R[:, thick])))  # patient-space slab orientation
+            sc.series_idx = SER_OFF + D.LOCAL_SERIES[mod]             # offset: no OpenMind/BraTS cross positives
+            sc.patient = str(PAT_OFF + bpid_idx[pid])
+            out.append(sc)
         return out
 
     cache = D.JitteredRotatingCache(list(range(len(items))), loader, size=a.cache_size, placer=placer, warmup_log_every=8)
