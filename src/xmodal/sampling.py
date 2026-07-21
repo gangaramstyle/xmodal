@@ -1005,16 +1005,19 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
 
 def sample_provenance_batch(scans, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
                             prism_choices=(32., 64., 128.), size_per_bag=False, orient="scan", rng, device,
-                            pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1):
-    """Provenance (series-CLS + view-CLS) paired-view batch over a FLAT list of single-volume scans (BraTS
-    per-modality scans + OpenMind scans, unified). Per item: two prisms (a,b) from ONE scan ~log-uniform apart.
-    Slab patches are thin along the scan's native through-plane (`orient='scan'` -> sc.thick_axis), but the
-    SHAPE fed to the size-embedding is in PATIENT space (thin dim on sc.world_thin_axis). series[B] =
-    sc.series_idx (modality label); patient[B] = int(sc.patient). rel_targets [B,5] = 3 spatial-order + 2 window."""
+                            pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1,
+                            refs=None):
+    """Provenance (series-CLS + view-CLS) paired-view batch over a FLAT list of single-volume scans. Per item:
+    two prisms (a,b) from ONE scan ~log-uniform apart. Slab patches thin along the native through-plane, SHAPE in
+    PATIENT space. series[B] = sc.series_idx = (dataset,modality); patient[B] = int(sc.patient). rel_targets [B,5].
+    `refs` (list of scan indices, one per batch item) overrides the default random draw — pass it from a
+    series-aware sampler to GUARANTEE same-series/different-patient positives co-occur in the batch."""
     import torch
     from collections import defaultdict
     n = token_count
-    refs = [int(rng.integers(len(scans))) for _ in range(batch_size)]
+    if refs is None:
+        refs = [int(rng.integers(len(scans))) for _ in range(batch_size)]
+    batch_size = len(refs)
     groups = defaultdict(list)
     for k, si in enumerate(refs):
         groups[si].append(k)

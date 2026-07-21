@@ -99,8 +99,16 @@ def main():
     rng0 = np.random.default_rng(a.seed)
     npool = min(a.om_pool, len(recs))
     items = [recs[i] for i in rng0.choice(len(recs), size=npool, replace=False, p=w)]
-    print(f"POOL {len(items)} | contrasts {dict(Counter(r['modality'] for r in items).most_common(10))}", flush=True)
+    print(f"POOL {len(items)} scans | contrasts {dict(Counter(r['modality'] for r in items).most_common(10))}", flush=True)
     print(f"POOL planes {dict(Counter(r['plane'] for r in items))}", flush=True)
+    # series-aware pool: group by series=(dataset,modality); keep series with >=2 distinct patients so every batch
+    # scan is guaranteed a same-series / different-patient positive (each cache slot = one such pair).
+    from collections import defaultdict as _dd
+    s2r = _dd(list)
+    for r in items:
+        s2r[r["modality_id"]].append(r)
+    SERIES = [sid for sid, rs in s2r.items() if len({x["patient_id"] for x in rs}) >= 2]
+    print(f"PAIRED POOL: {len(SERIES)} series with >=2 patients (of {len(s2r)} in pool)", flush=True)
 
     # ---- held-out eval set: scans DISJOINT from the pool, contrast/plane-weighted, streamed once & kept resident ----
     heldout = []
@@ -119,13 +127,20 @@ def main():
                     pass
         print(f"HELD-OUT eval set: {len(heldout)} scans | contrasts {dict(Counter(s.modality for s in heldout).most_common(8))}", flush=True)
 
-    def loader(i):                             # CPU-only (prefetch threads): stream/decode one scan
-        return ("om", OM.load_openmind_raw(items[i]), items[i])
+    import random as _random
 
-    def placer(raw):                           # main thread -> LIST of CachedScan (flatten in the loop)
-        return [OM.place_openmind(raw[1], raw[2], device=dev)]
+    def loader(i):                             # prefetch threads: stream a same-series PAIR (2 different-patient scans)
+        byp = _dd(list)
+        for r in s2r[SERIES[i]]:
+            byp[r["patient_id"]].append(r)
+        p1, p2 = _random.sample(list(byp), 2)
+        r1, r2 = _random.choice(byp[p1]), _random.choice(byp[p2])
+        return ("ompair", (OM.load_openmind_raw(r1), OM.load_openmind_raw(r2)), (r1, r2))
 
-    cache = D.JitteredRotatingCache(list(range(len(items))), loader, size=a.cache_size, placer=placer, warmup_log_every=8)
+    def placer(raw):                           # main thread -> [scanA, scanB] (same series, different patient)
+        return [OM.place_openmind(raw[1][0], raw[2][0], device=dev), OM.place_openmind(raw[1][1], raw[2][1], device=dev)]
+
+    cache = D.JitteredRotatingCache(list(range(len(SERIES))), loader, size=a.cache_size, placer=placer, warmup_log_every=8)
     cache.start_prefetch(workers=a.prefetch_workers, depth=8)
 
     torch.manual_seed(a.seed)
@@ -164,12 +179,17 @@ def main():
     print("step   total   series  rel_sp  rel_wn  rel_acc  s_viol   pd_lo  pd_hi     lr", flush=True)
     t0 = time.time()
     for step in range(a.steps + 1):
-        scans = [sc for lst in cache.resident() for sc in lst]         # flatten lists -> flat scan pool
+        pairs = [lst for lst in cache.resident() if len(lst) >= 2]     # resident same-series/diff-patient pairs
+        if len(pairs) < 2:
+            continue
+        chosen = [pairs[int(rng.integers(len(pairs)))] for _ in range(max(1, a.batch_size // 2))]
+        scans = [sc for pr in chosen for sc in pr[:2]]                 # flat; consecutive 2 = a same-series pair
+        refs = list(range(len(scans)))                                # each scan once -> its pair-partner is in-batch
         pdmin, pdmax = pd_at(step)
-        batch = S.sample_provenance_batch(scans, batch_size=a.batch_size, token_count=a.token_count,
+        batch = S.sample_provenance_batch(scans, batch_size=len(scans), token_count=a.token_count,
                                           patch_sizes=tuple(a.patch_sizes), voxels=a.voxels,
                                           prism_choices=tuple(a.prisms), orient="scan", rng=rng, device=dev,
-                                          pair_dist_min=pdmin, pair_dist_max=pdmax)
+                                          pair_dist_min=pdmin, pair_dist_max=pdmax, refs=refs)
         lr = lr_at(step)
         for g in opt.param_groups:
             g["lr"] = lr
