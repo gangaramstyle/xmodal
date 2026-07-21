@@ -193,6 +193,7 @@ class CachedScan:
     thick_axis: int         # acquisition/through-plane voxel axis (thin axis for 2.5D)
     plane_id: int = 0       # 0=axial 1=coronal 2=sagittal (from geometry)
     world_thin_axis: int = 2  # WORLD axis (0=LR 1=AP 2=SI) the thru-plane points along -> patient-space slab shape
+    axis_map: tuple = (0, 1, 2)  # voxel axis k -> the WORLD axis it points along (argmax|R[:,k]|); orients slabs in patient space
     modality: str = "?"     # e.g. "t1","t1c","t2","flair","CT"
     series_idx: int = 0
     patient: str = ""
@@ -221,7 +222,8 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
     affine = np.asarray(affine, np.float32)
     R, t = affine[:3, :3], affine[:3, 3]
     thick, plane, spacing = _thick_and_plane(R, thick_axis)
-    wthin = int(np.argmax(np.abs(R[:, thick])))              # world axis the thru-plane points along (patient-space slab)
+    axis_map = tuple(int(np.argmax(np.abs(R[:, k]))) for k in range(3))   # voxel axis -> dominant world axis
+    wthin = axis_map[thick]                                  # world axis the thru-plane points along (patient-space slab)
     # foreground anchors: voxels above a fraction of max intensity -> world mm
     hi = float(vol_np.max()) or 1.0
     vox = np.argwhere(vol_np > fg_thresh * hi).astype(np.float32)
@@ -239,7 +241,7 @@ def to_device_scan(volume_np, affine, *, modality, device, series_idx=0, patient
         affine_trans=torch.as_tensor(t.copy(), device=device),
         foreground_mm=torch.as_tensor(fg, device=device),
         foreground_np=np.ascontiguousarray(fg, dtype=np.float32),   # CPU mirror -> no per-batch GPU->CPU sync
-        thick_axis=thick, plane_id=plane, world_thin_axis=wthin, modality=modality, series_idx=series_idx,
+        thick_axis=thick, plane_id=plane, world_thin_axis=wthin, axis_map=axis_map, modality=modality, series_idx=series_idx,
         patient=patient, spacing=spacing,
     )
 
@@ -1010,8 +1012,9 @@ def sample_provenance_batch(scans, *, batch_size, token_count, patch_sizes=(4., 
     ser = [0] * batch_size; pat = [0] * batch_size
     for si, ks in groups.items():
         sc = scans[si]; G = len(ks); fg = sc.foreground_mm; Mf = fg.shape[0]
-        _thick = resolve_thick_axis(sc, orient, rng)              # VOXEL thin axis for the slab gather (native plane)
-        unit = slab_unit_offsets(_thick, voxels, device)
+        _thick = resolve_thick_axis(sc, orient, rng)              # VOXEL thin axis (native plane)
+        _wthin = sc.axis_map[_thick]                              # -> WORLD through-plane axis (patient-space slab orient)
+        unit = slab_unit_offsets(_wthin, voxels, device)          # slab lies in the true acquisition plane, any voxel storage
         half = draw_prism_half(rng, G, prism_choices, device)
         anchors_a = fg[torch.randint(Mf, (G,), device=device)]
         d = np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max), size=G)).astype(np.float32)
@@ -1028,8 +1031,8 @@ def sample_provenance_batch(scans, *, batch_size, token_count, patch_sizes=(4., 
         pat_a = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_a, sizes_a, unit))
         pat_b = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_b, sizes_b, unit))
         st = (anchors_b - anchors_a > 0).float()
-        ext_a = size_to_extent(sizes_a, sc.world_thin_axis)       # PATIENT-space shape (thin on anatomical thru-plane)
-        ext_b = size_to_extent(sizes_b, sc.world_thin_axis)
+        ext_a = size_to_extent(sizes_a, _wthin)                   # PATIENT-space shape (thin on anatomical thru-plane)
+        ext_b = size_to_extent(sizes_b, _wthin)
         _p = int(sc.patient) if str(sc.patient).lstrip("-").isdigit() else si
         for gi, k in enumerate(ks):
             pa[k], pb[k] = pat_a[gi], pat_b[gi]
@@ -1065,7 +1068,8 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 
     for (bi, m), ks in groups.items():
         sc = bundles[bi][m]; G = len(ks)
         _thick = resolve_thick_axis(sc, orient, rng)
-        unit = slab_unit_offsets(_thick, voxels, device)
+        _wthin = sc.axis_map[_thick]                                                      # WORLD through-plane axis
+        unit = slab_unit_offsets(_wthin, voxels, device)
         half = draw_prism_half(rng, G, prism_choices, device)                            # [G,1,1]
         M = sc.foreground_mm.shape[0]
         anchors = sc.foreground_mm[torch.randint(M, (G,), device=device)]
@@ -1073,7 +1077,7 @@ def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 
         coords = centers - anchors[:, None]
         sizes = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)                         # [G,n]
         p = sample_patches_group(sc.volume, mixed_bag_vox(sc, centers, sizes, unit))
-        ext = size_to_extent(sizes, _thick)                                              # [G,n,3]
+        ext = size_to_extent(sizes, _wthin)                                              # [G,n,3] patient-space
         for gi, k in enumerate(ks):
             patch_l[k], coord_l[k], size_l[k], ser[k] = p[gi], coords[gi], ext[gi], sc.series_idx
     return dict(patches=torch.stack(patch_l).float(), coords=torch.stack(coord_l).float(),
