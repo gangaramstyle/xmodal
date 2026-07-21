@@ -121,25 +121,30 @@ def _plane_from_header(client, key, bucket="openmind", nbytes=65536, iso_ratio=1
     return {0: "sagittal", 1: "coronal", 2: "axial"}[int(np.argmax(np.abs(R[:, thick])))]
 
 
-def probe_planes(recs, client=None, cache_path=None, workers=24):
-    """Attach rec['plane'] (native acquisition plane) to each record via a threaded header-only probe. Cached to
-    `cache_path` (JSON key->plane) so it's computed once and reused across runs."""
+def probe_planes(recs, client=None, cache_path=None, workers=32, group_key=("dataset", "modality"), verbose=True):
+    """Attach rec['plane'] (native acquisition plane). Plane is a fixed acquisition-protocol property -> CONSTANT
+    within a series group (dataset, modality), so we probe ONE header per group (~hundreds, not ~37k images) and
+    broadcast. Cached to `cache_path` (JSON group->plane) so it's computed once and reused across runs."""
     import json
     from concurrent.futures import ThreadPoolExecutor, as_completed
     client = client or om_client()
-    cache = {}
-    if cache_path and os.path.exists(cache_path):
-        cache = json.load(open(cache_path))
-    todo = [r for r in recs if r["key"] not in cache]
+    gk = lambda r: "|".join(str(r[k]) for k in group_key)
+    reps = {}
+    for r in recs:
+        reps.setdefault(gk(r), r)                                   # one representative per series group
+    cache = json.load(open(cache_path)) if (cache_path and os.path.exists(cache_path)) else {}
+    todo = {g: rep for g, rep in reps.items() if g not in cache}
+    if verbose:
+        print(f"[probe_planes] {len(reps)} series groups, {len(todo)} to probe", flush=True)
     if todo:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_plane_from_header, client, r["key"]): r for r in todo}
+            futs = {ex.submit(_plane_from_header, client, rep["key"]): g for g, rep in todo.items()}
             for f in as_completed(futs):
-                cache[futs[f]["key"]] = f.result() or "axial"
+                cache[futs[f]] = f.result() or "axial"
         if cache_path:
             json.dump(cache, open(cache_path, "w"))
     for r in recs:
-        r["plane"] = cache.get(r["key"], "axial")
+        r["plane"] = cache.get(gk(r), "axial")
     return recs
 
 
