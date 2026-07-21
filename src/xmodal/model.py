@@ -316,6 +316,32 @@ class Phase0Encoder(nn.Module):
                     rel_spatial=spatial.detach(), rel_window=window.detach(),
                     rel_acc=float(rel_acc), series_viol=float(series_viol))
 
+    def _cls_readout(self, patches, coords, sizes):
+        """Encode a bag (unconditioned) -> (series-CLS, view-CLS) token outputs [B,W] each. No decoder."""
+        B = patches.shape[0]
+        toks, ccs = self._context([self.embed(patches, sizes)], [coords], patches.device, B)
+        x = self.encode(toks, ccs)
+        return x[:, 0], x[:, 1]
+
+    def forward_provenance(self, batch, *, series_weight=1.0, rel_spatial_weight=0.25, rel_window_weight=0.25,
+                           n_xmod=1):
+        """Encoder-ONLY provenance objective: series-CLS (rank-hinge; same-scan + same-modality/different-
+        patient positives) + view-CLS (5-way BCE: 3 spatial-order + 2 window signs of views a,b). No MAE /
+        matching / decoder — cheap enough for a long dual-dataset (BraTS + OpenMind) run."""
+        from xmodal.losses import rank_hinge_xmod_loss
+        sa, va = self._cls_readout(batch["patches_a"], batch["coords_a"], batch["sizes_a"])
+        sb, vb = self._cls_readout(batch["patches_b"], batch["coords_b"], batch["sizes_b"])
+        series_loss, series_viol = rank_hinge_xmod_loss(sa.float(), sb.float(), batch["series"],
+                                                        batch["patient"], n_xmod=n_xmod)
+        rel_logits = self.rel_view_head(torch.cat([va, vb], dim=1))
+        rel_bce = F.binary_cross_entropy_with_logits(rel_logits, batch["rel_targets"], reduction="none")
+        spatial = rel_bce[:, :3].mean(); window = rel_bce[:, 3:5].mean()
+        total = series_weight * series_loss + rel_spatial_weight * spatial + rel_window_weight * window
+        with torch.no_grad():
+            rel_acc = ((rel_logits > 0).float() == batch["rel_targets"]).float().mean()
+        return dict(loss=total, series=series_loss.detach(), rel_spatial=spatial.detach(),
+                    rel_window=window.detach(), rel_acc=float(rel_acc), series_viol=float(series_viol))
+
     # ---- mixed-modality conditioned SSL (docs/MIXED_MODAL_DESIGN.md) ------------------
     def _view_repr(self, patches, coords, sizes, series_ids):
         """Encode a bag (per-patch source series, Site A) -> its view-CLS output [B,W] (for view-CLS)."""

@@ -979,6 +979,62 @@ def sample_paired_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8.
                 patient=torch.tensor(pat, device=device, dtype=torch.long))
 
 
+def sample_provenance_batch(scans, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
+                            prism_choices=(32., 64., 128.), size_per_bag=False, orient="scan", rng, device,
+                            pair_dist_min=16.0, pair_dist_max=96.0, win_center_std=0.1, win_width_log_std=0.1):
+    """Provenance (series-CLS + view-CLS) paired-view batch over a FLAT list of single-volume scans (BraTS
+    per-modality scans + OpenMind scans, unified). Per item: two prisms (a,b) from ONE scan ~log-uniform apart.
+    Slab patches are thin along the scan's native through-plane (`orient='scan'` -> sc.thick_axis), but the
+    SHAPE fed to the size-embedding is in PATIENT space (thin dim on sc.world_thin_axis). series[B] =
+    sc.series_idx (modality label); patient[B] = int(sc.patient). rel_targets [B,5] = 3 spatial-order + 2 window."""
+    import torch
+    from collections import defaultdict
+    n = token_count
+    refs = [int(rng.integers(len(scans))) for _ in range(batch_size)]
+    groups = defaultdict(list)
+    for k, si in enumerate(refs):
+        groups[si].append(k)
+    pa = [None] * batch_size; pb = [None] * batch_size; ca = [None] * batch_size; cb = [None] * batch_size
+    za = [None] * batch_size; zb = [None] * batch_size; spat = [None] * batch_size
+    ser = [0] * batch_size; pat = [0] * batch_size
+    for si, ks in groups.items():
+        sc = scans[si]; G = len(ks); fg = sc.foreground_mm; Mf = fg.shape[0]
+        _thick = resolve_thick_axis(sc, orient, rng)              # VOXEL thin axis for the slab gather (native plane)
+        unit = slab_unit_offsets(_thick, voxels, device)
+        half = draw_prism_half(rng, G, prism_choices, device)
+        anchors_a = fg[torch.randint(Mf, (G,), device=device)]
+        d = np.exp(rng.uniform(np.log(pair_dist_min), np.log(pair_dist_max), size=G)).astype(np.float32)
+        dt = torch.as_tensor(d, device=device)
+        dvec = (fg[None] - anchors_a[:, None]).norm(dim=-1)
+        band = ((dvec >= 0.7 * dt[:, None]) & (dvec <= 1.3 * dt[:, None])).float()
+        near = (dvec - dt[:, None]).abs().argmin(1)
+        add = torch.zeros_like(band); add[torch.arange(G, device=device), near] = (band.sum(1) == 0).float()
+        anchors_b = fg[torch.multinomial(band + add, 1)[:, 0]]
+        ctr_a = anchors_a[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
+        ctr_b = anchors_b[:, None] + (torch.rand(G, n, 3, device=device) * 2 - 1) * half
+        sizes_a = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)
+        sizes_b = draw_patch_sizes(rng, G, n, patch_sizes, device, size_per_bag)
+        pat_a = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_a, sizes_a, unit))
+        pat_b = sample_patches_group(sc.volume, mixed_bag_vox(sc, ctr_b, sizes_b, unit))
+        st = (anchors_b - anchors_a > 0).float()
+        ext_a = size_to_extent(sizes_a, sc.world_thin_axis)       # PATIENT-space shape (thin on anatomical thru-plane)
+        ext_b = size_to_extent(sizes_b, sc.world_thin_axis)
+        _p = int(sc.patient) if str(sc.patient).lstrip("-").isdigit() else si
+        for gi, k in enumerate(ks):
+            pa[k], pb[k] = pat_a[gi], pat_b[gi]
+            ca[k] = ctr_a[gi] - anchors_a[gi][None]; cb[k] = ctr_b[gi] - anchors_b[gi][None]
+            za[k], zb[k] = ext_a[gi], ext_b[gi]
+            spat[k] = st[gi]; ser[k] = sc.series_idx; pat[k] = _p
+    Pa = torch.stack(pa).float(); Pb = torch.stack(pb).float()
+    Pa, ta = apply_window_jitter(Pa, center_std=win_center_std, width_log_std=win_width_log_std)
+    Pb, tb = apply_window_jitter(Pb, center_std=win_center_std, width_log_std=win_width_log_std)
+    rel = torch.cat([torch.stack(spat), (tb - ta > 0).float()], dim=1)
+    return dict(patches_a=Pa, patches_b=Pb, coords_a=torch.stack(ca).float(), coords_b=torch.stack(cb).float(),
+                sizes_a=torch.stack(za).float(), sizes_b=torch.stack(zb).float(),
+                rel_targets=rel, series=torch.tensor(ser, device=device, dtype=torch.long),
+                patient=torch.tensor(pat, device=device, dtype=torch.long))
+
+
 def sample_self_batch(bundles, *, batch_size, token_count, patch_sizes=(4., 8., 16.), voxels=16,
                       prism_choices=(32., 64., 128.), size_per_bag=False, orient="scan", rng, device):
     """Phase-0 (self) batch: one bag of patches per item from a single random scan. Vectorized

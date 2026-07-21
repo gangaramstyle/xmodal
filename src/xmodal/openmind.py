@@ -72,12 +72,18 @@ def load_openmind_raw(rec, client=None):
         os.unlink(path)
 
 
-def place_openmind(raw, rec, device="cuda"):
+def place_openmind(raw, rec, device="cuda", iso_ratio=1.3):
     """(volume, affine, spacing) + record -> CachedScan on `device` with native-plane thick axis and
-    provenance labels (series_idx = modality_id, patient = str(patient_id))."""
+    provenance labels (series_idx = modality_id, patient = str(patient_id)). ISOTROPIC 3D scans (no true
+    acquisition plane, max/min spacing < iso_ratio) default to AXIAL: thin along the voxel axis most aligned
+    with world S-I."""
     from xmodal import sampling as S
     vol, aff, spacing = raw
-    thick = S.native_thru_plane(spacing)
+    sp = np.asarray(spacing, float)
+    if float(sp.max() / max(sp.min(), 1e-6)) < iso_ratio:
+        thick = int(np.argmax(np.abs(np.asarray(aff)[2, :3])))   # world-Z-aligned voxel axis (axial default)
+    else:
+        thick = S.native_thru_plane(spacing)
     return S.to_device_scan(vol, aff, modality=rec["seq"], device=device, thick_axis=thick,
                             series_idx=rec["modality_id"], patient=str(rec["patient_id"]))
 
