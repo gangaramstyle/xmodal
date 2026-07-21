@@ -129,10 +129,36 @@ def resolve_thick_axis(sc: "CachedScan", orient: str, rng):
 def size_to_extent(sizes, thick_axis: int, thin_mm: float = 1.0):
     """Scalar in-plane sizes [G,n] (mm) -> per-axis extent [G,n,3]: the two in-plane axes = the size,
     the thin (through-plane) `thick_axis` = `thin_mm`. Feeds the model's size embedding both the scale
-    AND the slab orientation (which axis is thin)."""
+    AND the slab orientation (which axis is thin). NB: `thick_axis` is a VOXEL axis, so for mixed
+    orientations this encodes the voxel-frame thin axis; use `world_shape_axis` + this for patient-space."""
     ext = sizes[..., None].repeat(1, 1, 3)
     ext[..., thick_axis] = thin_mm
     return ext
+
+
+def native_thru_plane(spacing) -> int:
+    """Radiologist native through-plane VOXEL axis = the axis whose voxel SPACING is the odd one out (the two
+    in-plane axes share spacing; the acquisition axis differs). Robust across axial/coronal/sagittal AND to
+    isotropic-SHAPE data (keys on spacing, not shape). Use for slab thin-axis on mixed-orientation data."""
+    import numpy as _np
+    s = _np.asarray(spacing, float)
+    return int(_np.argmax(_np.abs(s - _np.median(s))))
+
+
+def world_shape_axis(thick_vox_axis: int, affine) -> int:
+    """Which WORLD axis (0=L-R x, 1=A-P y, 2=S-I z) the through-plane voxel axis points along (via the affine
+    rotation). Lets the shape embedding live in PATIENT space: the slab's thin dimension is placed on the true
+    anatomical through-plane, so the size embedding encodes the acquisition ORIENTATION (axial/coronal/sagittal),
+    not a scan-specific voxel-frame index."""
+    import numpy as _np
+    R = _np.asarray(affine)[:3, :3]
+    return int(_np.argmax(_np.abs(R[:, thick_vox_axis])))
+
+
+def world_shape_extent(sizes, thick_vox_axis: int, affine, thin_mm: float = 1.0):
+    """Patch shape in PATIENT space: per-WORLD-axis extent [.,.,3] with the thin dim on the anatomical
+    through-plane (see world_shape_axis). Two in-plane world axes = `sizes`, thin world axis = `thin_mm`."""
+    return size_to_extent(sizes, world_shape_axis(thick_vox_axis, affine), thin_mm)
 
 
 def mixed_bag_vox(sc: "CachedScan", centers, sizes, unit_off):
