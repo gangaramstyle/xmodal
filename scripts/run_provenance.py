@@ -142,6 +142,7 @@ def main():
         out["loss"].backward()
         torch.nn.utils.clip_grad_norm_(E.parameters(), 1.0)
         opt.step()
+        cache.step()                                                  # rotate: stream fresh scans from R2 (else only cache_size seen)
         if step % 50 == 0:
             print(f"{step:6d} {out['loss'].item():7.4f} {float(out['series']):7.4f} {float(out['rel_spatial']):7.4f} "
                   f"{float(out['rel_window']):7.4f} {out['rel_acc']:7.3f} {out['series_viol']:7.3f} {lr:.2e}", flush=True)
