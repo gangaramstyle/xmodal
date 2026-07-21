@@ -145,6 +145,17 @@ def native_thru_plane(spacing) -> int:
     return int(_np.argmax(_np.abs(s - _np.median(s))))
 
 
+def native_or_axial_thick(spacing, affine, iso_ratio: float = 1.3) -> int:
+    """Slab thin (through-plane) VOXEL axis: the odd-spacing axis for anisotropic acquisitions, else (isotropic
+    3D scan, no true acquisition plane) the world-S-I-aligned voxel axis (axial default). Use for BraTS (iso)
+    and OpenMind (mixed) alike."""
+    import numpy as _np
+    s = _np.asarray(spacing, float)
+    if float(s.max() / max(s.min(), 1e-6)) < iso_ratio:
+        return int(_np.argmax(_np.abs(_np.asarray(affine)[2, :3])))     # axial: voxel axis aligned with world S-I
+    return native_thru_plane(spacing)
+
+
 def world_shape_axis(thick_vox_axis: int, affine) -> int:
     """Which WORLD axis (0=L-R x, 1=A-P y, 2=S-I z) the through-plane voxel axis points along (via the affine
     rotation). Lets the shape embedding live in PATIENT space: the slab's thin dimension is placed on the true
