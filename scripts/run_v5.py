@@ -56,6 +56,9 @@ def main():
     ap.add_argument("--seg-task", choices=["none", "ce", "supcon"], default="none", help="aux seg-prediction task")
     ap.add_argument("--seg-frac", type=float, default=0.1, help="fraction of steps doing the seg task")
     ap.add_argument("--patient-frac", type=float, default=1.0, help="fraction of train patients to keep (data-bottleneck ablation)")
+    ap.add_argument("--series-latent-cls", default=None,
+                    help="path to a precomputed {(patient,modality): np[D]} frozen provenance series-CLS pkl. When given, "
+                         "conditioning uses proj(latent) in place of the one-hot series lookup (the ablation).")
     ap.add_argument("--width", type=int, default=384, help="encoder width (384=ViT-small, 768=ViT-base)")
     ap.add_argument("--depth", type=int, default=12, help="encoder depth (transformer blocks)")
     ap.add_argument("--heads", type=int, default=6, help="attention heads (768-wide -> 12)")
@@ -101,12 +104,27 @@ def main():
         print(f"patient_frac={args.patient_frac}: train patients {len(train_pids)}", flush=True)
     print(f"total {len(all_pids)} | train {len(train_pids)} | val {len(val_pids)}", flush=True)
 
+    # latent-conditioning arm: load the frozen per-scan provenance series-CLS lookup {(patient,modality): np[D]}
+    cls_dict, series_latent_dim = None, 0
+    if args.series_latent_cls:
+        import pickle
+        cls_dict = pickle.load(open(os.path.expanduser(args.series_latent_cls), "rb"))
+        series_latent_dim = int(next(iter(cls_dict.values())).shape[0])
+        _cov = sum(1 for p in train_pids for m in D.LOCAL_SUFFIX if (p, m) in cls_dict)
+        print(f"series-latent CLS: dim {series_latent_dim} | {len(cls_dict)} entries | train coverage {_cov}/{4*len(train_pids)}", flush=True)
+
+    def _attach_cls(bundle):
+        if cls_dict is not None:
+            for sc in bundle.values():
+                sc.series_cls = cls_dict.get((sc.patient, sc.modality))
+        return bundle
+
     _seg = args.tumor_frac > 0                                          # only pay seg-loading cost for tumor-focus
     loader = lambda pid: D.load_local_cpu(pid, pid2dir[pid], with_seg=_seg)[0]   # noqa: E731
-    placer = lambda raw: D.place_bundle(raw, dev)                       # noqa: E731
+    placer = lambda raw: _attach_cls(D.place_bundle(raw, dev))          # noqa: E731
     cache = D.JitteredRotatingCache(train_pids, loader, size=args.cache_size, placer=placer, warmup_log_every=8)
     cache.start_prefetch(workers=args.prefetch_workers, depth=8)
-    val_bundles = [D.load_local_bundle(p, pid2dir[p], device=dev)[0] for p in val_pids[:args.val_patients]]
+    val_bundles = [_attach_cls(D.load_local_bundle(p, pid2dir[p], device=dev)[0]) for p in val_pids[:args.val_patients]]
 
     torch.manual_seed(args.seed)
     # source stem grid: cube (V,V,V) or slab (V,V,1). Slab source keeps CUBE targets (tgt_grid), so the
@@ -116,7 +134,7 @@ def main():
     else:
         src_grid, tgt_grid = (args.voxels,) * 3, None
     enc = M.Phase0Encoder(M.EncoderConfig(width=args.width, depth=args.depth, heads=args.heads, n_series=8,
-                                          decoder_depth=args.decoder_depth,
+                                          decoder_depth=args.decoder_depth, series_latent_dim=series_latent_dim,
                                           patch_grid=src_grid, tgt_grid=tgt_grid)).to(dev)
     cfg = T.TrainConfig(steps=args.steps, batch_size=args.batch_size, lr=args.lr, seed=args.seed,
                         compile=not args.no_compile, content_blur=args.content_blur,

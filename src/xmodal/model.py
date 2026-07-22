@@ -40,6 +40,8 @@ class EncoderConfig:
     tgt_grid: tuple | None = None     # v5 slab-source: separate grid for held-target content heads (color/MAE); None -> patch_grid
     rope_lambda_min_mm: float = 2.0
     rope_lambda_max_mm: float = 1024.0
+    series_latent_dim: int = 0        # >0: condition on a FROZEN per-scan series-CLS latent (via a learned proj)
+                                      #     instead of the one-hot series_in_embed/series_q_embed lookups.
 
 
 # --- mm-RoPE over physical-mm coords --------------------------------------------------
@@ -159,6 +161,9 @@ class Phase0Encoder(nn.Module):
         self.series_q_embed = nn.Embedding(cfg.n_series, cfg.width)
         nn.init.normal_(self.series_in_embed.weight, std=0.02)
         nn.init.normal_(self.series_q_embed.weight, std=0.02)
+        if cfg.series_latent_dim > 0:    # latent conditioning: project a frozen per-scan series-CLS in place of the one-hot lookup
+            self.series_proj_in = nn.Linear(cfg.series_latent_dim, cfg.width)
+            self.series_proj_q = nn.Linear(cfg.series_latent_dim, cfg.width)
         self.pixel_head = nn.Linear(cfg.width, self.pv)
         # cross-modal decoder fuses each patch encoding with its (frozen-teacher) series-CLS so the
         # decoder can tell sources apart (no series_embed lookup — series identity is the CLS output).
@@ -193,15 +198,18 @@ class Phase0Encoder(nn.Module):
         """Per-patch per-axis physical extent (mm) [B,k,3] -> additive size+orientation embedding [B,k,W]."""
         return self.size_embed(sizes)
 
-    def embed(self, patches, sizes, series_ids=None):
+    def embed(self, patches, sizes, series_ids=None, series_latent=None):
         """patches [B,n,V,V,1] + per-patch sizes (mm) [B,n,3] -> tokens [B,n,W]. Single stem (all patches
         are V×V×1 grids regardless of physical size); physical scale rides in via the additive size
-        embedding. `series_ids` [B,n] (long) additively injects the patch's modality (Site A) for the
-        mixed-modality design — None keeps the legacy phased behavior (series identity via the CLS)."""
+        embedding. Site-A modality: `series_latent` [B,n,D] (a FROZEN per-scan series-CLS) additively injects
+        via a learned projection when given; else `series_ids` [B,n] (long) uses the one-hot series_in_embed;
+        both None keeps the legacy phased behavior (series identity via the CLS)."""
         B, n = patches.shape[:2]
         tok = self.stem(patches.reshape(B * n, 1, *patches.shape[2:])).reshape(B, n, self.cfg.width)
         tok = tok + self._size_emb(sizes).to(tok.dtype)
-        if series_ids is not None:
+        if series_latent is not None:
+            tok = tok + self.series_proj_in(series_latent).to(tok.dtype)
+        elif series_ids is not None:
             tok = tok + self.series_in_embed(series_ids).to(tok.dtype)
         return tok
 
@@ -393,12 +401,14 @@ class Phase0Encoder(nn.Module):
         dev = batch["patches_src"].device
         nreg = 2 + self.registers.shape[0]
         ps, cs, zs, sers = batch["patches_src"], batch["coords_src"], batch["sizes_src"], batch["series_src"]
+        slat = batch.get("series_latent_src"); tlat = batch.get("series_latent_tgt")   # frozen per-scan CLS (latent arm) or None
         B, n = ps.shape[:2]
-        x = self.encode(*self._context([self.embed(ps, zs, sers)], [cs], dev, B))
+        x = self.encode(*self._context([self.embed(ps, zs, sers, series_latent=slat)], [cs], dev, B))
         ctx, cc = self._context([x[:, nreg:]], [cs], dev, B)
         hp, ct, zt, modt = batch["held"], batch["coords_tgt"], batch["sizes_tgt"], batch["mod_tgt"]
         m = hp.shape[1]
-        query = (self.query_seed[None, None, :] + self._size_emb(zt) + self.series_q_embed(modt)).contiguous()
+        q_series = self.series_proj_q(tlat) if tlat is not None else self.series_q_embed(modt)
+        query = (self.query_seed[None, None, :] + self._size_emb(zt) + q_series).contiguous()
         query = self._decode(query, ctx, cc, ct)
         recon = self.dec_pixel_head(query)
         mae = F.l1_loss(recon, hp.reshape(B, m, self.tgt_pv))

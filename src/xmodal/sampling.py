@@ -202,6 +202,7 @@ class CachedScan:
     foreground_np: object = None   # CPU numpy [M,3] mirror of foreground_mm -> sampler geometry never syncs the GPU
     tumor_np: object = None        # CPU numpy [T,3] mirror of tumor_mm (v5 tumor-focus); None if no seg
     seg_vol: object = None         # torch [D,H,W] int seg volume (co-registered); for the seg-prediction training task
+    series_cls: object = None      # CPU numpy [D] FROZEN provenance series-CLS latent for this scan (latent-conditioning arm)
 
 
 def _thick_and_plane(affine_R: np.ndarray, thick_axis):
@@ -691,6 +692,11 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
             if id(sc) not in gid:
                 gid[id(sc)] = len(scan_list); scan_list.append(sc)
     nthick_arr = np.array([_native_thick(sc) for sc in scan_list], np.int64)   # native through-plane voxel axis per scan
+    has_cls = all(sc.series_cls is not None for sc in scan_list)               # latent-conditioning arm?
+    scan_cls_np = np.stack([np.asarray(sc.series_cls, np.float32) for sc in scan_list]) if has_cls else None  # [n_scans, D]
+    Dl = scan_cls_np.shape[1] if has_cls else 0
+    ser_lat_np = np.zeros((batch_size, nS_tok, Dl), np.float32) if has_cls else None   # per-source-token frozen CLS
+    mod_lat_np = np.zeros((batch_size, P, Dl), np.float32) if has_cls else None        # per-target frozen CLS (modality D scan)
     csrc_np = np.zeros((batch_size, nS_tok, 3), np.float32); ctgt_np = np.zeros((batch_size, P, 3), np.float32)
     ser_np = np.zeros((batch_size, nS_tok), np.int64); mod_np = np.zeros((batch_size, P), np.int64)
     zsrc_np = np.zeros((batch_size, nS_tok, 3), np.float32); ztgt_np = np.zeros((batch_size, P, 3), np.float32)
@@ -786,21 +792,25 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
                 zext = np.full((nS_tok, 3), ps, np.float32)                         # in-plane axes = ps
                 zext[np.arange(nS_tok), nthick_arr[bmap[smod]]] = slab_thin_mm      # thin on each token's native axis
                 csrc_np[i] = sctr - a_a[None]; ser_np[i] = smod; zsrc_np[i] = zext
+                if has_cls: ser_lat_np[i] = scan_cls_np[bmap[smod]]
                 S_ctr.append(sctr.astype(np.float32)); S_key.append(bmap[smod])
                 S_i.append(np.full(nS_tok, i, np.int64)); S_k.append(np.arange(nS_tok, dtype=np.int64))
                 S_sz.append(np.full(nS_tok, ps, np.float32))
             else:
                 csrc_np[i] = src_all - a_a[None]; ser_np[i] = mods; zsrc_np[i] = ps  # cube: isotropic extent = ps
+                if has_cls: ser_lat_np[i] = scan_cls_np[bmap[mods]]
                 S_ctr.append(src_all); S_key.append(bmap[mods])
                 S_i.append(np.full(nS, i, np.int64)); S_k.append(np.arange(nS, dtype=np.int64))
                 S_sz.append(np.full(nS, ps, np.float32))
             ctgt_np[i] = tgt_pos - a_a[None]; mod_np[i] = D; ztgt_np[i] = ps        # target: always cube, extent = ps
             tmods = np.full(n_tgt, D, np.int64)
+            if has_cls: mod_lat_np[i] = scan_cls_np[bmap[tmods]]
             T_ctr.append(tgt_pos.astype(np.float32)); T_key.append(bmap[tmods])
             T_i.append(np.full(n_tgt, i, np.int64)); T_k.append(np.arange(n_tgt, dtype=np.int64))
             T_sz.append(np.full(n_tgt, ps, np.float32))
 
     return dict(csrc_np=csrc_np, ctgt_np=ctgt_np, ser_np=ser_np, mod_np=mod_np, zsrc_np=zsrc_np, ztgt_np=ztgt_np,
+                ser_lat_np=ser_lat_np, mod_lat_np=mod_lat_np,
                 src_plan=_mk_scan_plan(S_ctr, S_key, S_i, S_k, S_sz),
                 tgt_plan=_mk_scan_plan(T_ctr, T_key, T_i, T_k, T_sz),
                 scan_list=scan_list, batch_size=batch_size, nS=nS_tok, P=P, V=V,
@@ -829,11 +839,15 @@ def _v5_gather(geom, device):
 
     Src = _run(geom["src_plan"], nS, (V, V, 1) if slab else (V, V, V), slab)
     Tgt = _run(geom["tgt_plan"], P, (V, V, V), False)
-    return dict(patches_src=Src, held=Tgt,                             # src [B,nS,V,V,1|V]; held [B,P,V,V,V]
-                coords_src=_h2d(geom["csrc_np"], device), coords_tgt=_h2d(geom["ctgt_np"], device),
-                sizes_src=_h2d(geom["zsrc_np"], device), sizes_tgt=_h2d(geom["ztgt_np"], device),
-                series_src=_h2d(geom["ser_np"], device), mod_tgt=_h2d(geom["mod_np"], device),
-                tumor_anchor_frac=geom["tumor_hits"] / B)
+    out = dict(patches_src=Src, held=Tgt,                              # src [B,nS,V,V,1|V]; held [B,P,V,V,V]
+               coords_src=_h2d(geom["csrc_np"], device), coords_tgt=_h2d(geom["ctgt_np"], device),
+               sizes_src=_h2d(geom["zsrc_np"], device), sizes_tgt=_h2d(geom["ztgt_np"], device),
+               series_src=_h2d(geom["ser_np"], device), mod_tgt=_h2d(geom["mod_np"], device),
+               tumor_anchor_frac=geom["tumor_hits"] / B)
+    if geom.get("ser_lat_np") is not None:                             # latent-conditioning arm: frozen per-scan CLS
+        out["series_latent_src"] = _h2d(geom["ser_lat_np"], device)
+        out["series_latent_tgt"] = _h2d(geom["mod_lat_np"], device)
+    return out
 
 
 def sample_v5_batch(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(32., 64.),
