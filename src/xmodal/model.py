@@ -207,7 +207,9 @@ class Phase0Encoder(nn.Module):
         B, n = patches.shape[:2]
         tok = self.stem(patches.reshape(B * n, 1, *patches.shape[2:])).reshape(B, n, self.cfg.width)
         tok = tok + self._size_emb(sizes).to(tok.dtype)
-        if series_latent is not None:
+        if self.cfg.series_latent_dim > 0:                # latent mode: MUST get a latent — never silently fall back to one-hot
+            assert series_latent is not None, ("encoder is in latent-conditioning mode (series_latent_dim>0) but embed() got no "
+                                               "series_latent — refusing to silently use the one-hot series_in_embed table")
             tok = tok + self.series_proj_in(series_latent).to(tok.dtype)
         elif series_ids is not None:
             tok = tok + self.series_in_embed(series_ids).to(tok.dtype)
@@ -407,7 +409,11 @@ class Phase0Encoder(nn.Module):
         ctx, cc = self._context([x[:, nreg:]], [cs], dev, B)
         hp, ct, zt, modt = batch["held"], batch["coords_tgt"], batch["sizes_tgt"], batch["mod_tgt"]
         m = hp.shape[1]
-        q_series = self.series_proj_q(tlat) if tlat is not None else self.series_q_embed(modt)
+        if self.cfg.series_latent_dim > 0:               # latent mode: query MUST get the frozen target-scan CLS, no fallback
+            assert tlat is not None, "latent-conditioning encoder: forward_v5 query got no series_latent_tgt (no one-hot fallback)"
+            q_series = self.series_proj_q(tlat)
+        else:
+            q_series = self.series_q_embed(modt)
         query = (self.query_seed[None, None, :] + self._size_emb(zt) + q_series).contiguous()
         query = self._decode(query, ctx, cc, ct)
         recon = self.dec_pixel_head(query)

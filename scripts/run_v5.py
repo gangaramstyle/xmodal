@@ -110,8 +110,10 @@ def main():
         import pickle
         cls_dict = pickle.load(open(os.path.expanduser(args.series_latent_cls), "rb"))
         series_latent_dim = int(next(iter(cls_dict.values())).shape[0])
-        _cov = sum(1 for p in train_pids for m in D.LOCAL_SUFFIX if (p, m) in cls_dict)
-        print(f"series-latent CLS: dim {series_latent_dim} | {len(cls_dict)} entries | train coverage {_cov}/{4*len(train_pids)}", flush=True)
+        missing = [(p, m) for p in (train_pids + val_pids[:args.val_patients]) for m in D.LOCAL_SUFFIX if (p, m) not in cls_dict]
+        assert not missing, (f"series-latent CLS is missing {len(missing)} (patient,modality) entries used in training/val, "
+                             f"e.g. {missing[:5]} — refusing to run (would leave scans without a latent). Re-run precompute for these.")
+        print(f"series-latent CLS: dim {series_latent_dim} | {len(cls_dict)} entries | FULL coverage of {len(train_pids)} train + {min(len(val_pids),args.val_patients)} val", flush=True)
 
     def _attach_cls(bundle):
         if cls_dict is not None:

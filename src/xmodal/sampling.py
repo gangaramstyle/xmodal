@@ -692,7 +692,9 @@ def _v5_geometry(bundles, *, batch_size, n_src, n_anchor, n_tgt, prism_choices=(
             if id(sc) not in gid:
                 gid[id(sc)] = len(scan_list); scan_list.append(sc)
     nthick_arr = np.array([_native_thick(sc) for sc in scan_list], np.int64)   # native through-plane voxel axis per scan
-    has_cls = all(sc.series_cls is not None for sc in scan_list)               # latent-conditioning arm?
+    _ncls = sum(sc.series_cls is not None for sc in scan_list)                  # latent-conditioning arm?
+    assert _ncls in (0, len(scan_list)), f"v5: {_ncls}/{len(scan_list)} resident scans have series_cls — must be all-or-none"
+    has_cls = _ncls == len(scan_list)
     scan_cls_np = np.stack([np.asarray(sc.series_cls, np.float32) for sc in scan_list]) if has_cls else None  # [n_scans, D]
     Dl = scan_cls_np.shape[1] if has_cls else 0
     ser_lat_np = np.zeros((batch_size, nS_tok, Dl), np.float32) if has_cls else None   # per-source-token frozen CLS
