@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import pickle
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -109,9 +110,19 @@ def main():
     ap.add_argument("--warmstart-seg", action="store_true", help="init seg-token+head from the ckpt's baked-in seg_query/seg_cls_head (in-distribution eval of seg-task arms; no-op for non-seg arms whose seg_query is untrained)")
     ap.add_argument("--unfreeze", type=int, default=12); ap.add_argument("--enc-width", type=int, default=384); ap.add_argument("--enc-heads", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--device", default="cuda")
+    ap.add_argument("--series-latent-cls", default=None,
+                    help="path to a {(patient_id, modality): np.float32[D]} pkl of FROZEN provenance series-CLS latents "
+                         "(same file used by run_v5 --series-latent-cls / precompute_brats_cls). REQUIRED when probing a "
+                         "latent-conditioning checkpoint (series_latent_dim>0): source patches then condition through "
+                         "E.series_proj_in instead of the one-hot series table, matching how the encoder was trained.")
     a = ap.parse_args()
     dev = a.device; V = a.voxels; unit = S._cube_unit(V, dev); rng = np.random.default_rng(a.seed)
     src_sizes = np.array([float(x) for x in a.src_sizes.split(",")]) if a.src_sizes else None
+    cls = None                                                                 # frozen per-scan series-CLS lookup (latent-conditioning arm)
+    if a.series_latent_cls:
+        cls = pickle.load(open(os.path.expanduser(a.series_latent_cls), "rb"))
+        print(f"loaded {len(cls)} series-CLS latents (dim {int(next(iter(cls.values())).shape[0])}) from {a.series_latent_cls}", flush=True)
+    inv_series = {v: k for k, v in D.LOCAL_SERIES.items()}                      # 0->t1, 1->t1c, 2->t2, 3->flair (sm id -> modality name)
 
     def build_prisms(dirs, npat, nprism, exclude, label):
         """Build tumor-anchored dense prisms from up to npat patients in dirs (skip exclude ids / no-seg / no-tumor)."""
@@ -167,7 +178,7 @@ def main():
                         sp[sel] = S._gather_cubes(b[m], torch.as_tensor(cs[sel], device=dev),
                                                   torch.as_tensor(ssz[sel], device=dev), unit, dev).half().cpu().numpy()
                 gt = seg_at(sc0, torch.as_tensor(gpts, device=dev), dev).cpu().numpy()   # class per query voxel
-                out.append(dict(sp=sp, sc=cs - anch, sm=sm, ssz=ssz, gpts=gpts - anch, gt=gt, gdim=gdim, pid=ctr))
+                out.append(dict(sp=sp, sc=cs - anch, sm=sm, ssz=ssz, gpts=gpts - anch, gt=gt, gdim=gdim, pid=ctr, pname=pid))
             ctr += 1; del b; torch.cuda.empty_cache()
         print(f"built {len(out)} {label} prisms over {ctr} patients (res={a.res}mm grid, head={a.head})", flush=True)
         return out
@@ -186,10 +197,34 @@ def main():
         train_prisms = build_prisms(tr_dirs, a.n_train_patients, a.n_train_prisms, test_ids, "TRAIN")
         assert train_prisms
 
-    def enc_src(E, sp, sc, sm, ssz=None):                                      # encode source bag ONCE (encoder frozen)
+    def build_src_latent(E, sm, pnames):
+        """Per-patch frozen series-CLS latent for a latent-conditioning encoder: lat[b,j] = cls[(pname[b], modality(sm[b,j]))],
+        shape [nb, n_src, D] matching sm. STRICT — no silent one-hot fallback: raises if --series-latent-cls was not given,
+        the patient ids were not threaded, or a needed (patient, modality) key is missing from the dict."""
+        if cls is None:
+            raise ValueError("encoder is in latent-conditioning mode (series_latent_dim>0) but --series-latent-cls was not given; "
+                             "refusing to run the dense-seg readout through the one-hot series table")
+        if pnames is None:
+            raise ValueError("latent-mode encoder: source patient ids were not threaded into the prism; cannot build series_latent")
+        nb, n = sm.shape; Dl = E.cfg.series_latent_dim
+        sm_np = sm.detach().cpu().numpy(); lat = np.zeros((nb, n, Dl), np.float32)
+        for bi in range(nb):
+            for j in range(n):
+                key = (pnames[bi], inv_series[int(sm_np[bi, j])])
+                if key not in cls:
+                    raise KeyError(f"--series-latent-cls is missing {key}; a latent-mode encoder cannot fall back to one-hot")
+                lat[bi, j] = cls[key]
+        return torch.as_tensor(lat, device=dev)
+
+    def enc_src(E, sp, sc, sm, ssz=None, pnames=None):                         # encode source bag ONCE (encoder frozen)
         nb = sp.shape[0]; nreg = 2 + E.registers.shape[0]
         zs = ssz[..., None].expand(-1, -1, 3) if ssz is not None else torch.full((nb, sp.shape[1], 3), a.size, device=dev)
-        with torch.no_grad():
+        if E.cfg.series_latent_dim > 0:                                        # latent-conditioning: probe via the SAME latent, never one-hot
+            lat = build_src_latent(E, sm, pnames)                             # [nb, n_src, D]; raises if cls / (patient,modality) missing
+            with torch.no_grad():
+                x = E.encode(*E._context([E.embed(sp, zs, sm, series_latent=lat)], [sc], dev, nb)); ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
+            return ctx, cc
+        with torch.no_grad():                                                  # baseline one-hot encoder: unchanged
             x = E.encode(*E._context([E.embed(sp, zs, sm)], [sc], dev, nb)); ctx, cc = E._context([x[:, nreg:]], [sc], dev, nb)
         return ctx, cc
 
@@ -200,7 +235,8 @@ def main():
 
     def prism_src(E, pr):
         return enc_src(E, torch.as_tensor(pr["sp"][None], device=dev).float(), torch.as_tensor(pr["sc"][None], device=dev).float(),
-                       torch.as_tensor(pr["sm"][None], device=dev).long(), torch.as_tensor(pr["ssz"][None], device=dev).float())
+                       torch.as_tensor(pr["sm"][None], device=dev).long(), torch.as_tensor(pr["ssz"][None], device=dev).float(),
+                       pnames=[pr["pname"]])
 
     def dense_slots(E, seg_tok, pr, src=None):                                 # decode EVERY grid voxel -> [G^3, W]
         ctx, cc = prism_src(E, pr) if src is None else src                     # encode source ONCE, reuse per chunk
@@ -304,8 +340,11 @@ def main():
         if not g:
             print(f"{nm} NO_CKPT {path}", flush=True); continue
         ck = torch.load(g[-1], map_location=dev); step = int(ck.get("step", -1))
+        sld = int(ck.get("cfg", {}).get("series_latent_dim", 0))               # latent-conditioning ckpts carry this in cfg
+        if sld == 0 and "series_proj_in.weight" in ck.get("model", {}):        # fallback: infer from weights if cfg absent
+            sld = int(ck["model"]["series_proj_in.weight"].shape[1])
         E = M.Phase0Encoder(M.EncoderConfig(width=a.enc_width, depth=12, heads=a.enc_heads, n_series=8,
-                                            patch_grid=(V, V, V))).to(dev)
+                                            patch_grid=(V, V, V), series_latent_dim=sld)).to(dev)
         E.load_state_dict(ck["model"], strict=False)
         for p in E.parameters():
             p.requires_grad_(False)
